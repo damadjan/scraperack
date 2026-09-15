@@ -10,7 +10,11 @@ WORKDIR /opt/scraperack
 COPY requirements.txt .
 RUN python -m pip install --no-cache-dir -r requirements.txt
 
+COPY pyproject.toml .
 COPY scraperack_platform ./scraperack_platform
+RUN python -m pip install --no-cache-dir --no-deps . \
+    && cd / \
+    && python -c "import scraperack_platform.runner"
 
 RUN useradd --create-home --uid 1000 scraperack
 USER scraperack
