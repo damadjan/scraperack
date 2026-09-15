@@ -1,0 +1,5 @@
+fastapi==0.133.0
+pydantic==2.12.3
+ray[default]==2.58.0
+starlette==1.0.1
+uvicorn==0.22.0
