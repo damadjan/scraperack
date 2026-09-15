@@ -1,0 +1,60 @@
+name: scraperack
+
+x-ray-common: &ray-common
+  image: ${SCRAPERACK_IMAGE:-scraperack:dev}
+  build:
+    context: platform
+  pull_policy: ${SCRAPERACK_PULL_POLICY:-build}
+  environment:
+    RAY_USAGE_STATS_ENABLED: "0"
+
+services:
+  entrypoint:
+    <<: *ray-common
+    shm_size: 256mb
+    command:
+      - ray
+      - start
+      - --head
+      - --port=6379
+      - --dashboard-host=0.0.0.0
+      - --ray-client-server-port=10001
+      - --num-cpus=0
+      - --object-store-memory=104857600
+      - --block
+    ports:
+      - ${RAY_DASHBOARD_BIND_ADDRESS:-127.0.0.1}:${RAY_DASHBOARD_PORT:-8265}:8265
+    healthcheck:
+      test: ["CMD", "ray", "status", "--address=127.0.0.1:6379"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  gateway:
+    <<: *ray-common
+    environment:
+      RAY_ADDRESS: ray://entrypoint:10001
+      RAY_USAGE_STATS_ENABLED: "0"
+    ports:
+      - ${SCRAPERACK_BIND_ADDRESS:-127.0.0.1}:${SCRAPERACK_PORT:-8080}:8080
+    depends_on:
+      entrypoint:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health')"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  node:
+    <<: *ray-common
+    shm_size: 256mb
+    command:
+      - ray
+      - start
+      - --address=entrypoint:6379
+      - --object-store-memory=104857600
+      - --block
+    depends_on:
+      entrypoint:
+        condition: service_healthy
