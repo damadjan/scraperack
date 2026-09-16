@@ -2,8 +2,8 @@ import os
 import unittest
 from unittest.mock import patch
 
+import cloudpickle
 from fastapi.testclient import TestClient
-from ray import cloudpickle
 from scraperack_platform.app import CONTENT_TYPE, app, get_ray
 
 

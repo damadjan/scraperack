@@ -1,6 +1,6 @@
 import traceback
 
-from ray import cloudpickle
+import cloudpickle
 
 
 def run(function, arguments):

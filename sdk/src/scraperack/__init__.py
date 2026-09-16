@@ -4,7 +4,7 @@ import urllib.error
 import urllib.request
 from functools import update_wrapper
 
-from ray import cloudpickle
+import cloudpickle
 
 CONTENT_TYPE = "application/vnd.scraperack.function"
 _address = os.getenv("SCRAPERACK_ADDRESS", "http://127.0.0.1:8080")
