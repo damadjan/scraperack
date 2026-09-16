@@ -23,7 +23,7 @@ services:
       - --object-store-memory=104857600
       - --block
     healthcheck:
-      test: ["CMD", "ray", "status", "--address=127.0.0.1:6379"]
+      test: ["CMD", "ray", "health-check", "--address=127.0.0.1:6379"]
       interval: 5s
       timeout: 5s
       retries: 12
