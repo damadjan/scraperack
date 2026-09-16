@@ -9,7 +9,7 @@ x-ray-common: &ray-common
     RAY_USAGE_STATS_ENABLED: "0"
 
 services:
-  entrypoint:
+  control-plane:
     <<: *ray-common
     shm_size: 256mb
     command:
@@ -22,8 +22,6 @@ services:
       - --num-cpus=0
       - --object-store-memory=104857600
       - --block
-    ports:
-      - ${RAY_DASHBOARD_BIND_ADDRESS:-127.0.0.1}:${RAY_DASHBOARD_PORT:-8265}:8265
     healthcheck:
       test: ["CMD", "ray", "status", "--address=127.0.0.1:6379"]
       interval: 5s
@@ -33,12 +31,12 @@ services:
   gateway:
     <<: *ray-common
     environment:
-      RAY_ADDRESS: ray://entrypoint:10001
+      RAY_ADDRESS: ray://control-plane:10001
       RAY_USAGE_STATS_ENABLED: "0"
     ports:
-      - ${SCRAPERACK_BIND_ADDRESS:-127.0.0.1}:${SCRAPERACK_PORT:-8080}:8080
+      - ${SCRAPERACK_BIND_ADDRESS:-127.0.0.1}:${SCRAPERACK_PORT:-42800}:8080
     depends_on:
-      entrypoint:
+      control-plane:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health')"]
@@ -52,9 +50,9 @@ services:
     command:
       - ray
       - start
-      - --address=entrypoint:6379
+      - --address=control-plane:6379
       - --object-store-memory=104857600
       - --block
     depends_on:
-      entrypoint:
+      control-plane:
         condition: service_healthy

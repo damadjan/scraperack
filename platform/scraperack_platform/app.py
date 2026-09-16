@@ -20,7 +20,7 @@ def get_ray():
 
     with connection_lock:
         if not ray.is_initialized():
-            ray.init(os.getenv("RAY_ADDRESS", "ray://entrypoint:10001"))
+            ray.init(os.getenv("RAY_ADDRESS", "ray://control-plane:10001"))
     return ray
 
 
