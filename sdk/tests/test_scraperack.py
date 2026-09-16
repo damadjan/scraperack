@@ -5,8 +5,8 @@ import urllib.error
 from email.message import Message
 from unittest.mock import patch
 
+import cloudpickle
 import scraperack
-from ray import cloudpickle
 
 
 def add(left, right=0):
@@ -29,6 +29,9 @@ class FakeResponse:
 
     def read(self):
         return self.body
+
+    def close(self):
+        pass
 
 
 class ScrapeRackTests(unittest.TestCase):
@@ -87,6 +90,9 @@ class ScrapeRackTests(unittest.TestCase):
 
         self.assertEqual(decorated.__name__, "add")
         self.assertIs(decorated.__wrapped__, add)
+
+    def test_import_does_not_import_ray(self):
+        self.assertNotIn("ray", sys.modules)
 
     def test_requirements_must_be_non_empty_strings(self):
         with self.assertRaisesRegex(TypeError, "requirements"):

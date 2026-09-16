@@ -4,8 +4,8 @@ from functools import cache
 from threading import Lock
 from typing import Annotated
 
+import cloudpickle
 from fastapi import Body, Depends, FastAPI, HTTPException, Response
-from ray import cloudpickle
 
 from scraperack_platform.runner import run
 
