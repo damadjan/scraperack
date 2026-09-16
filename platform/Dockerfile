@@ -16,7 +16,9 @@ RUN python -m pip install --no-cache-dir --no-deps . \
     && cd / \
     && python -c "import scraperack_platform.runner"
 
-RUN useradd --create-home --uid 1000 scraperack
+RUN useradd --create-home --uid 1000 scraperack \
+    && mkdir -p /home/scraperack/.cache/pip \
+    && chown -R scraperack:scraperack /home/scraperack/.cache
 USER scraperack
 
 CMD ["uvicorn", "scraperack_platform.app:app", "--host", "0.0.0.0", "--port", "8080"]

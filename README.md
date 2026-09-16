@@ -30,9 +30,12 @@ examples/   Example function invocations
 Start the gateway, control plane, and one node:
 
 ```powershell
+Copy-Item .env.example .env
 docker compose up -d
 docker compose ps
 ```
+
+Set `RAY_PIP_CACHING` in `.env` to either `true` or `false`. It defaults to `true`.
 
 Scale the execution capacity when the host has enough resources:
 
@@ -80,6 +83,8 @@ scraperack.configure("http://scraperack.example:42800")
 
 Requirements are explicit and belong to the function. Ray installs them in an isolated runtime environment on the node before deserializing the function. Identical requirement lists reuse Ray's per-node runtime-environment cache, so installation is normally a first-call cost on each node.
 
+When `RAY_PIP_CACHING=true`, pip downloads are reused across different runtime environments and stored in the persistent `pip-cache` volume. `false` preserves Ray's default behavior.
+
 Operating-system packages, browser binaries, and drivers still belong in the platform image.
 
 Stop the cluster when finished:
@@ -100,5 +105,6 @@ python -m unittest discover -s sdk/tests -v
 python -m unittest discover -s platform/tests -t platform -v
 ruff check sdk platform examples
 ruff format --check sdk platform examples
+$env:RAY_PIP_CACHING="true"
 docker compose config --quiet
 ```

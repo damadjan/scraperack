@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 import cloudpickle
 from fastapi.testclient import TestClient
-from scraperack_platform.app import CONTENT_TYPE, app, get_ray
+from scraperack_platform.app import CONTENT_TYPE, app, get_ray, pip_runtime_env
 
 
 def add(left, right=0):
@@ -47,12 +47,15 @@ class FakeRay:
 
 class PlatformTests(unittest.TestCase):
     def setUp(self):
+        self.environment = patch.dict(os.environ, {"RAY_PIP_CACHING": "false"})
+        self.environment.start()
         self.ray = FakeRay()
         app.dependency_overrides[get_ray] = lambda: self.ray
         self.client = TestClient(app)
 
     def tearDown(self):
         app.dependency_overrides.clear()
+        self.environment.stop()
 
     def invoke(self, function, *args, requirements=None, **kwargs):
         return self.client.post(
@@ -100,6 +103,40 @@ class PlatformTests(unittest.TestCase):
             self.ray.options,
             {"runtime_env": {"pip": ["requests==2.32.5", "beautifulsoup4==4.13.4"]}},
         )
+
+    @patch.dict(os.environ, {"RAY_PIP_CACHING": "true"})
+    def test_pip_cache_can_be_enabled(self):
+        response = self.invoke(add, 1, requirements=["requests==2.32.5"])
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            self.ray.options,
+            {
+                "runtime_env": {
+                    "pip": {
+                        "packages": ["requests==2.32.5"],
+                        "pip_install_options": ["--disable-pip-version-check"],
+                    }
+                }
+            },
+        )
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_pip_cache_is_enabled_by_default(self):
+        self.assertEqual(
+            pip_runtime_env(["requests==2.32.5"]),
+            {
+                "pip": {
+                    "packages": ["requests==2.32.5"],
+                    "pip_install_options": ["--disable-pip-version-check"],
+                }
+            },
+        )
+
+    @patch.dict(os.environ, {"RAY_PIP_CACHING": "maybe"})
+    def test_pip_cache_configuration_must_be_valid(self):
+        with self.assertRaisesRegex(RuntimeError, "must be set to true or false"):
+            self.client.get("/health")
 
     def test_invocation_returns_remote_traceback(self):
         response = self.invoke(fail)

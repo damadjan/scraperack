@@ -14,6 +14,23 @@ connection_lock = Lock()
 app = FastAPI(title="ScrapeRack", version="0.1.0")
 
 
+def pip_cache_enabled():
+    value = os.getenv("RAY_PIP_CACHING", "true").strip().lower()
+    if value not in {"true", "false"}:
+        raise RuntimeError("RAY_PIP_CACHING must be set to true or false")
+    return value == "true"
+
+
+def pip_runtime_env(requirements):
+    pip = requirements
+    if pip_cache_enabled():
+        pip = {
+            "packages": requirements,
+            "pip_install_options": ["--disable-pip-version-check"],
+        }
+    return {"pip": pip}
+
+
 @cache
 def get_ray():
     import ray
@@ -26,6 +43,7 @@ def get_ray():
 
 @app.get("/health")
 def health(ray: Annotated[object, Depends(get_ray)]):
+    pip_cache_enabled()
     ray.nodes()
     return {"status": "ok"}
 
@@ -60,7 +78,7 @@ def invoke(
     try:
         remote = ray.remote(run)
         if requirements:
-            remote = remote.options(runtime_env={"pip": requirements})
+            remote = remote.options(runtime_env=pip_runtime_env(requirements))
         result = ray.get(remote.remote(function, arguments))
         status_code = 200 if result["ok"] else 500
     except Exception:  # noqa: BLE001 - transport remote task failures to the caller

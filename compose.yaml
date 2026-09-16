@@ -33,6 +33,7 @@ services:
     environment:
       RAY_ADDRESS: ray://control-plane:10001
       RAY_USAGE_STATS_ENABLED: "0"
+      RAY_PIP_CACHING: ${RAY_PIP_CACHING:-true}
     ports:
       - ${SCRAPERACK_BIND_ADDRESS:-127.0.0.1}:${SCRAPERACK_PORT:-42800}:8080
     depends_on:
@@ -47,6 +48,11 @@ services:
   node:
     <<: *ray-common
     shm_size: 256mb
+    environment:
+      PIP_CACHE_DIR: /home/scraperack/.cache/pip
+      RAY_USAGE_STATS_ENABLED: "0"
+    volumes:
+      - pip-cache:/home/scraperack/.cache/pip
     command:
       - ray
       - start
@@ -56,3 +62,6 @@ services:
     depends_on:
       control-plane:
         condition: service_healthy
+
+volumes:
+  pip-cache:

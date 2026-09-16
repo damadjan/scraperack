@@ -22,6 +22,8 @@ jobs:
       - run: ruff check sdk platform examples
       - run: ruff format --check sdk platform examples
       - run: docker compose config --quiet
+        env:
+          RAY_PIP_CACHING: "true"
 
   image:
     needs: test
