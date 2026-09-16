@@ -1,5 +1,9 @@
+import hashlib
+import io
 import os
+import tempfile
 import unittest
+import zipfile
 from unittest.mock import patch
 
 import cloudpickle
@@ -47,7 +51,15 @@ class FakeRay:
 
 class PlatformTests(unittest.TestCase):
     def setUp(self):
-        self.environment = patch.dict(os.environ, {"RAY_PIP_CACHING": "false"})
+        self.cache = tempfile.TemporaryDirectory()
+        self.environment = patch.dict(
+            os.environ,
+            {
+                "RAY_PIP_CACHING": "false",
+                "SCRAPERACK_WORKING_DIR_CACHE": self.cache.name,
+                "SCRAPERACK_WORKING_DIR_BASE_URL": "http://gateway:8080/working-dirs",
+            },
+        )
         self.environment.start()
         self.ray = FakeRay()
         app.dependency_overrides[get_ray] = lambda: self.ray
@@ -56,8 +68,9 @@ class PlatformTests(unittest.TestCase):
     def tearDown(self):
         app.dependency_overrides.clear()
         self.environment.stop()
+        self.cache.cleanup()
 
-    def invoke(self, function, *args, requirements=None, **kwargs):
+    def invoke(self, function, *args, requirements=None, working_dir=None, **kwargs):
         return self.client.post(
             "/invoke",
             content=cloudpickle.dumps(
@@ -65,6 +78,7 @@ class PlatformTests(unittest.TestCase):
                     "function": cloudpickle.dumps(function),
                     "arguments": cloudpickle.dumps((args, kwargs)),
                     "requirements": requirements or [],
+                    "working_dir": working_dir,
                 }
             ),
             headers={"content-type": CONTENT_TYPE},
@@ -75,6 +89,26 @@ class PlatformTests(unittest.TestCase):
         if result["ok"]:
             result["value"] = cloudpickle.loads(result["value"])
         return result
+
+    def upload_working_dir(self, files):
+        body = io.BytesIO()
+        digest = hashlib.sha256()
+        with zipfile.ZipFile(body, "w", zipfile.ZIP_DEFLATED) as archive:
+            for name, content in sorted(files.items()):
+                data = content.encode()
+                encoded = name.encode()
+                digest.update(len(encoded).to_bytes(8, "big"))
+                digest.update(encoded)
+                digest.update(len(data).to_bytes(8, "big"))
+                digest.update(data)
+                archive.writestr(name, data)
+        value = digest.hexdigest()
+        response = self.client.put(
+            f"/working-dirs/{value}.zip",
+            content=body.getvalue(),
+            headers={"content-type": "application/zip"},
+        )
+        return value, body.getvalue(), response
 
     def test_health_checks_ray(self):
         response = self.client.get("/health")
@@ -103,6 +137,57 @@ class PlatformTests(unittest.TestCase):
             self.ray.options,
             {"runtime_env": {"pip": ["requests==2.32.5", "beautifulsoup4==4.13.4"]}},
         )
+
+    def test_working_dir_is_stored_and_passed_to_ray(self):
+        digest, archive, upload = self.upload_working_dir(
+            {"project/parser.py": "VALUE = 7"}
+        )
+
+        response = self.invoke(
+            add,
+            3,
+            right=4,
+            requirements=["example==1.2.3"],
+            working_dir=digest,
+        )
+
+        self.assertEqual(upload.status_code, 201)
+        self.assertEqual(
+            self.client.head(f"/working-dirs/{digest}.zip").status_code, 200
+        )
+        self.assertEqual(
+            self.client.get(f"/working-dirs/{digest}.zip").content, archive
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            self.ray.options,
+            {
+                "runtime_env": {
+                    "pip": ["example==1.2.3"],
+                    "working_dir": f"http://gateway:8080/working-dirs/{digest}.zip",
+                }
+            },
+        )
+
+    def test_working_dir_upload_is_idempotent(self):
+        digest, body, first = self.upload_working_dir({"module.py": "VALUE = 1"})
+
+        second = self.client.put(f"/working-dirs/{digest}.zip", content=body)
+
+        self.assertEqual(first.status_code, 201)
+        self.assertEqual(second.status_code, 204)
+
+    def test_working_dir_digest_is_verified(self):
+        response = self.client.put(
+            f"/working-dirs/{'0' * 64}.zip", content=b"not a zip"
+        )
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_missing_working_dir_is_rejected(self):
+        response = self.invoke(add, 1, working_dir="0" * 64)
+
+        self.assertEqual(response.status_code, 400)
 
     @patch.dict(os.environ, {"RAY_PIP_CACHING": "true"})
     def test_pip_cache_can_be_enabled(self):

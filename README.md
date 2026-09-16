@@ -81,9 +81,38 @@ Set `SCRAPERACK_ADDRESS` before importing the SDK when the gateway is not local,
 scraperack.configure("http://scraperack.example:42800")
 ```
 
+The SDK warns by default when the included `working_dir` files exceed 5 MiB. Configure or disable that warning centrally:
+
+```python
+scraperack.configure(
+    "http://scraperack.example:42800",
+    working_dir_warning=True,
+    working_dir_warning_bytes=10 * 1024 * 1024,
+)
+```
+
+Set `working_dir_warning=False` to disable it. The warning does not prevent execution.
+
 Requirements are explicit and belong to the function. Ray installs them in an isolated runtime environment on the node before deserializing the function. Identical requirement lists reuse Ray's per-node runtime-environment cache, so installation is normally a first-call cost on each node.
 
 When `RAY_PIP_CACHING=true`, pip downloads are reused across different runtime environments and stored in the persistent `pip-cache` volume. `false` preserves Ray's default behavior.
+
+Use `working_dir` when a function needs local project modules or files:
+
+```python
+@scraperack.function(
+    requirements=["requests==2.32.5"],
+    working_dir=".",
+)
+def scrape(url):
+    from project.parser import parse
+
+    return parse(url)
+```
+
+The SDK hashes the directory, uploads a ZIP only when that version is missing from the gateway, and references the resulting immutable artifact in Ray's `working_dir`. The gateway keeps uploaded artifacts in the persistent `working-dir-cache` volume, while each Ray node maintains its own extracted cache.
+
+The SDK skips symlinks and directories named `.git`, `.venv`, `venv`, `__pycache__`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, or `.tox`. It also skips `.env`, `credentials.txt`, and `AGENTS.md`. Point `working_dir` at a dedicated project directory rather than a directory containing unrelated data.
 
 Operating-system packages, browser binaries, and drivers still belong in the platform image.
 

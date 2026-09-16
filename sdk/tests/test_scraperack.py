@@ -1,12 +1,18 @@
+import io
 import sys
+import tempfile
 import types
 import unittest
 import urllib.error
+import warnings
+import zipfile
 from email.message import Message
+from pathlib import Path
 from unittest.mock import patch
 
 import cloudpickle
 import scraperack
+from scraperack import _working_dir
 
 
 def add(left, right=0):
@@ -37,6 +43,8 @@ class FakeResponse:
 class ScrapeRackTests(unittest.TestCase):
     def setUp(self):
         scraperack.configure("http://gateway.test/")
+        _working_dir._cache.clear()
+        _working_dir._directory_locks.clear()
 
     @patch("scraperack.urllib.request.urlopen")
     def test_decorated_function_sends_requirements_and_invocation(self, urlopen):
@@ -58,6 +66,89 @@ class ScrapeRackTests(unittest.TestCase):
         self.assertEqual(args, (3,))
         self.assertEqual(kwargs, {"right": 4})
         self.assertEqual(invocation["requirements"], ["example==1.2.3"])
+        self.assertIsNone(invocation["working_dir"])
+
+    @patch("scraperack.urllib.request.urlopen")
+    def test_working_dir_is_uploaded_and_referenced(self, urlopen):
+        uploaded = {}
+
+        def response(request):
+            if request.get_method() == "HEAD":
+                raise urllib.error.HTTPError(
+                    request.full_url, 404, "Not found", Message(), FakeResponse(b"")
+                )
+            if request.get_method() == "PUT":
+                uploaded["archive"] = request.data.read()
+                return FakeResponse(b"")
+            uploaded["invocation"] = request.data
+            return FakeResponse(
+                cloudpickle.dumps({"ok": True, "value": cloudpickle.dumps(3)})
+            )
+
+        urlopen.side_effect = response
+
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, "module.py").write_text("VALUE = 3")
+            Path(directory, "credentials.txt").write_text("secret")
+            remote_add = scraperack.function(working_dir=directory)(add)
+            result = remote_add(1, 2)
+
+        invocation = cloudpickle.loads(uploaded["invocation"])
+        self.assertEqual(result, 3)
+        self.assertRegex(invocation["working_dir"], r"^[0-9a-f]{64}$")
+        with zipfile.ZipFile(io.BytesIO(uploaded["archive"])) as archive:
+            self.assertEqual(archive.namelist(), ["module.py"])
+
+    def test_working_dir_must_be_a_directory(self):
+        with self.assertRaisesRegex(ValueError, "working_dir"):
+            scraperack.function(working_dir="missing-directory")(add)
+
+    @patch("scraperack.urllib.request.urlopen")
+    def test_large_working_dir_warns_by_default(self, urlopen):
+        def response(request):
+            if request.get_method() == "HEAD":
+                return FakeResponse(b"")
+            return FakeResponse(
+                cloudpickle.dumps({"ok": True, "value": cloudpickle.dumps(3)})
+            )
+
+        urlopen.side_effect = response
+        with tempfile.TemporaryDirectory() as directory:
+            with Path(directory, "large.bin").open("wb") as file:
+                file.truncate(5 * 1024 * 1024 + 1)
+            remote_add = scraperack.function(working_dir=directory)(add)
+
+            with self.assertWarnsRegex(UserWarning, "5.0 MiB"):
+                remote_add(1, 2)
+
+    @patch("scraperack.urllib.request.urlopen")
+    def test_working_dir_warning_is_configurable(self, urlopen):
+        def response(request):
+            if request.get_method() == "HEAD":
+                return FakeResponse(b"")
+            return FakeResponse(
+                cloudpickle.dumps({"ok": True, "value": cloudpickle.dumps(3)})
+            )
+
+        urlopen.side_effect = response
+        scraperack.configure(
+            "http://gateway.test",
+            working_dir_warning=False,
+            working_dir_warning_bytes=1,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, "file.txt").write_text("larger than one byte")
+            remote_add = scraperack.function(working_dir=directory)(add)
+
+            with warnings.catch_warnings():
+                warnings.simplefilter("error")
+                self.assertEqual(remote_add(1, 2), 3)
+
+    def test_working_dir_warning_configuration_is_validated(self):
+        with self.assertRaisesRegex(TypeError, "working_dir_warning"):
+            scraperack.configure("http://gateway.test", working_dir_warning="yes")
+        with self.assertRaisesRegex(TypeError, "working_dir_warning_bytes"):
+            scraperack.configure("http://gateway.test", working_dir_warning_bytes=-1)
 
     @patch("scraperack.urllib.request.urlopen")
     def test_remote_error_includes_remote_traceback(self, urlopen):

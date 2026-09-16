@@ -34,6 +34,10 @@ services:
       RAY_ADDRESS: ray://control-plane:10001
       RAY_USAGE_STATS_ENABLED: "0"
       RAY_PIP_CACHING: ${RAY_PIP_CACHING:-true}
+      SCRAPERACK_WORKING_DIR_CACHE: /home/scraperack/.cache/working-dirs
+      SCRAPERACK_WORKING_DIR_BASE_URL: http://gateway:8080/working-dirs
+    volumes:
+      - working-dir-cache:/home/scraperack/.cache/working-dirs
     ports:
       - ${SCRAPERACK_BIND_ADDRESS:-127.0.0.1}:${SCRAPERACK_PORT:-42800}:8080
     depends_on:
@@ -65,3 +69,4 @@ services:
 
 volumes:
   pip-cache:
+  working-dir-cache:
