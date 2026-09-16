@@ -7,10 +7,10 @@ ScrapeRack is a Docker-based convenience layer over Ray for one trusted owner. I
 ## Architecture
 
 ```text
-Python SDK -> HTTP gateway -> entrypoint (Ray head) -> nodes
+Python SDK -> HTTP gateway -> control plane (Ray head) -> nodes
 ```
 
-The SDK sends one function invocation per HTTP request. The gateway submits one real Ray task and holds the response open until the task returns or raises. The entrypoint advertises zero CPUs, so functions execute only on nodes.
+The SDK sends one function invocation per HTTP request. The gateway submits one real Ray task and holds the response open until the task returns or raises. The control plane advertises zero CPUs, so functions execute only on nodes.
 
 The PoC intentionally has no background jobs, batching, database, multi-tenancy, or Kubernetes integration.
 
@@ -27,7 +27,7 @@ examples/   Example function invocations
 
 ## Start the cluster
 
-Start the gateway, entrypoint, and one node:
+Start the gateway, control plane, and one node:
 
 ```powershell
 docker compose up -d
@@ -40,9 +40,9 @@ Scale the execution capacity when the host has enough resources:
 docker compose up -d --scale node=2
 ```
 
-The gateway listens on <http://127.0.0.1:8080>. The Ray dashboard is available at <http://127.0.0.1:8265> for inspection. Both bind to localhost by default.
+The gateway listens on <http://127.0.0.1:42800>. The Ray dashboard is not published to the host.
 
-Do not expose the gateway or Ray dashboard to the public internet. Function payloads use Python serialization and therefore grant arbitrary code execution by design.
+Do not expose the gateway to the public internet. Function payloads use Python serialization and therefore grant arbitrary code execution by design.
 
 ## Invoke a function
 
@@ -75,7 +75,7 @@ python examples/single_call.py
 Set `SCRAPERACK_ADDRESS` before importing the SDK when the gateway is not local, or configure it in code:
 
 ```python
-scraperack.configure("http://scraperack.example:8080")
+scraperack.configure("http://scraperack.example:42800")
 ```
 
 Requirements are explicit and belong to the function. Ray installs them in an isolated runtime environment on the node before deserializing the function. Identical requirement lists reuse Ray's per-node runtime-environment cache, so installation is normally a first-call cost on each node.
@@ -90,7 +90,7 @@ docker compose down
 
 ## Container image
 
-GitHub Actions builds the shared gateway, entrypoint, and node image for every change. The image starts from Python 3.10 and installs the pinned Ray version. Changes merged into `main` are published as `ghcr.io/damadjan/scraperack:main` and with an immutable commit tag.
+GitHub Actions builds the shared gateway, control-plane, and node image for every change. The image starts from Python 3.10 and installs the pinned Ray version. Changes merged into `main` are published as `ghcr.io/damadjan/scraperack:main` and with an immutable commit tag.
 
 ## Tests
 

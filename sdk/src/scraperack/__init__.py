@@ -7,7 +7,7 @@ from functools import update_wrapper
 import cloudpickle
 
 CONTENT_TYPE = "application/vnd.scraperack.function"
-_address = os.getenv("SCRAPERACK_ADDRESS", "http://127.0.0.1:8080")
+_address = os.getenv("SCRAPERACK_ADDRESS", "http://127.0.0.1:42800")
 
 
 class RemoteError(RuntimeError):
