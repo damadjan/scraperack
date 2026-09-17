@@ -182,8 +182,9 @@ class ScrapeRackTests(unittest.TestCase):
 
     def test_project_must_be_a_slug(self):
         for project in ("LinkedIn", "linkedin_jobs", "linkedin jobs", "a--b", "-a"):
-            with self.subTest(project=project), self.assertRaisesRegex(
-                ValueError, "lowercase letters"
+            with (
+                self.subTest(project=project),
+                self.assertRaisesRegex(ValueError, "lowercase letters"),
             ):
                 scraperack.configure("http://gateway.test", project=project)
         with self.assertRaisesRegex(TypeError, "project"):

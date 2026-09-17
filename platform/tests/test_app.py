@@ -123,7 +123,8 @@ class PlatformTests(unittest.TestCase):
                         if isinstance(function, str)
                         else cloudpickle.dumps(function)
                     ),
-                    "function_name": function_name or getattr(function, "__name__", None),
+                    "function_name": function_name
+                    or getattr(function, "__name__", None),
                     "project": project,
                     "arguments": cloudpickle.dumps((args, kwargs)),
                     "requirements": requirements or [],
@@ -269,9 +270,7 @@ class PlatformTests(unittest.TestCase):
             self.ray.options,
             {
                 "name": "add",
-                "runtime_env": {
-                    "pip": ["requests==2.32.5", "beautifulsoup4==4.13.4"]
-                },
+                "runtime_env": {"pip": ["requests==2.32.5", "beautifulsoup4==4.13.4"]},
             },
         )
 
@@ -303,7 +302,7 @@ class PlatformTests(unittest.TestCase):
                 "runtime_env": {
                     "pip": ["example==1.2.3"],
                     "working_dir": f"http://gateway:8080/working-dirs/{digest}.zip",
-                }
+                },
             },
         )
 
@@ -340,8 +339,8 @@ class PlatformTests(unittest.TestCase):
                     "pip": {
                         "packages": ["requests==2.32.5"],
                         "pip_install_options": ["--disable-pip-version-check"],
-                    }
-                }
+                    },
+                },
             },
         )
 
