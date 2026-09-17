@@ -470,7 +470,10 @@ def show_invocation(event):
         with ui.row().classes("modal-header w-full items-center flex-nowrap px-4 py-3"):
             with ui.row().classes("grow min-w-0 items-center gap-3 flex-nowrap"):
                 ui.label(
-                    task.get("name") or task.get("func_or_class_name") or "Invocation"
+                    task.get("function_name")
+                    or task.get("name")
+                    or task.get("func_or_class_name")
+                    or "Invocation"
                 ).classes("text-xl font-medium min-w-0 truncate")
                 if task.get("state"):
                     ui.badge(task["state"]).props("outline").classes("shrink-0")
@@ -496,7 +499,8 @@ def show_invocation(event):
                     task,
                     (
                         "task_id",
-                        "name",
+                        "function_name",
+                        "project",
                         "state",
                         "node",
                         "required_resources",

@@ -55,10 +55,16 @@ CACHE_RENDERER = """params => {
 }"""
 TABLE_COLUMNS = (
     {
-        "field": "name",
-        "headerName": "Invocation",
-        "flex": 1.5,
-        "minWidth": 160,
+        "field": "function_name",
+        "headerName": "Name",
+        "flex": 1.3,
+        "minWidth": 140,
+    },
+    {
+        "field": "project",
+        "headerName": "Project",
+        "flex": 1.3,
+        "minWidth": 140,
     },
     {
         "field": "state",
@@ -194,14 +200,29 @@ class RayLogClient:
 
 
 def add_cache_status(tasks, statuses):
-    return [
-        task
-        | statuses.get(
+    displayed = []
+    for task in tasks:
+        combined = task | statuses.get(
             task.get("task_id"),
             {"function_cache": "unknown", "working_dir_cache": "unknown"},
         )
-        for task in tasks
-    ]
+        function_name = combined.get("function_name")
+        project = combined.get("project")
+        ray_name = task.get("name") or task.get("func_or_class_name")
+        if not function_name and isinstance(ray_name, str):
+            if "/" in ray_name:
+                fallback_project, function_name = ray_name.split("/", 1)
+                project = project or fallback_project
+            else:
+                function_name = ray_name
+        displayed.append(
+            combined
+            | {
+                "function_name": function_name or "—",
+                "project": project or "—",
+            }
+        )
+    return displayed
 
 
 def task_transaction(previous, tasks):

@@ -1,5 +1,6 @@
 import inspect
 import os
+import re
 import urllib.error
 import urllib.request
 from functools import update_wrapper
@@ -11,8 +12,10 @@ from scraperack._working_dir import resolve, upload
 
 CONTENT_TYPE = "application/vnd.scraperack.function"
 _address = os.getenv("SCRAPERACK_ADDRESS", "http://127.0.0.1:42800")
+_project = None
 _working_dir_warning = True
 _working_dir_warning_bytes = 5 * 1024 * 1024
+PROJECT_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
 
 class RemoteError(RuntimeError):
@@ -22,9 +25,16 @@ class RemoteError(RuntimeError):
 def configure(
     address,
     *,
+    project=None,
     working_dir_warning=True,
     working_dir_warning_bytes=5 * 1024 * 1024,
 ):
+    if project is not None and not isinstance(project, str):
+        raise TypeError("project must be a string or None")
+    if project is not None and not PROJECT_PATTERN.fullmatch(project):
+        raise ValueError(
+            "project must contain only lowercase letters, numbers, and single dashes"
+        )
     if not isinstance(working_dir_warning, bool):
         raise TypeError("working_dir_warning must be true or false")
     if (
@@ -34,8 +44,9 @@ def configure(
     ):
         raise TypeError("working_dir_warning_bytes must be a non-negative integer")
 
-    global _address, _working_dir_warning, _working_dir_warning_bytes
+    global _address, _project, _working_dir_warning, _working_dir_warning_bytes
     _address = address.rstrip("/")
+    _project = project
     _working_dir_warning = working_dir_warning
     _working_dir_warning_bytes = working_dir_warning_bytes
 
@@ -52,6 +63,8 @@ def invoke(target, requirements, working_dir, *args, **kwargs):
     payload = cloudpickle.dumps(
         {
             "function": function,
+            "function_name": target.__name__,
+            "project": _project,
             "arguments": cloudpickle.dumps((args, kwargs)),
             "requirements": list(requirements),
             "working_dir": working_dir_digest,
