@@ -3,14 +3,13 @@ import time
 import unittest
 from pathlib import Path
 
+from cache_monitor import CacheEvents, CacheMonitor
 from watchdog.events import (
     DirDeletedEvent,
     FileCreatedEvent,
     FileDeletedEvent,
     FileMovedEvent,
 )
-
-from cache_monitor import CacheEvents, CacheMonitor
 
 
 class CacheMonitorTests(unittest.TestCase):

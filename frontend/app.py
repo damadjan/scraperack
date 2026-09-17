@@ -1,9 +1,8 @@
 import os
 from datetime import datetime
 
-from nicegui import run, ui
-
 from cache_monitor import CacheMonitor
+from nicegui import run, ui
 from ray_tasks import RayTaskClient, task_columns
 
 CACHES = {
