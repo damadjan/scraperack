@@ -1,7 +1,9 @@
 import os
+from datetime import datetime
 
 from cache_monitor import CacheMonitor
-from nicegui import ui
+from nicegui import run, ui
+from ray_tasks import RayTaskClient, task_columns
 
 CACHES = {
     "Working directories": CacheMonitor(
@@ -9,6 +11,7 @@ CACHES = {
     ),
     "Pip downloads": CacheMonitor(os.getenv("PIP_CACHE_DIR", "/cache/pip")),
 }
+TASKS = RayTaskClient(os.getenv("RAY_DASHBOARD_URL", "http://control-plane:8265"))
 
 
 def size(value):
@@ -44,6 +47,7 @@ with (
     ui.label("ScrapeRack").classes("text-lg font-medium")
     with ui.tabs().props("dense").classes("h-12") as tabs:
         overview_tab = ui.tab("Overview").props("no-caps")
+        tasks_tab = ui.tab("Tasks").props("no-caps")
     ui.space()
     with ui.row().classes("items-center gap-2"):
         ui.icon("circle", size="10px").classes("text-green-500")
@@ -52,31 +56,67 @@ with (
 labels = {}
 versions = {name: -1 for name in CACHES}
 
-with (
-    ui.tab_panels(tabs, value=overview_tab).classes("w-full bg-neutral-950"),
-    ui.tab_panel(overview_tab).classes("p-6"),
-    ui.column().classes("w-full max-w-6xl mx-auto gap-5"),
-):
-    with ui.column().classes("gap-1"):
-        ui.label("Caches").classes("text-2xl font-medium")
-        ui.label("Live storage used by ScrapeRack's persistent caches").classes(
-            "text-sm text-gray-400"
-        )
-    with ui.row().classes("w-full gap-4 items-stretch flex-wrap"):
-        for name in CACHES:
-            with ui.card().classes("cache-card grow basis-80 gap-3 p-5"):
-                with ui.row().classes("w-full items-center"):
-                    ui.label(name).classes("text-lg font-medium")
-                    ui.space()
-                    ui.icon("visibility", size="18px").classes(
-                        "text-green-500"
-                    ).tooltip("Watched through filesystem events")
-                total = ui.label("0 B").classes("text-3xl font-medium")
-                files = ui.label("0 files").classes("text-sm text-gray-300")
-                activity = ui.label("No changes observed").classes(
-                    "text-xs text-gray-500"
+with ui.tab_panels(tabs, value=overview_tab).classes("w-full bg-neutral-950"):
+    with (
+        ui.tab_panel(overview_tab).classes("p-6"),
+        ui.column().classes("w-full max-w-6xl mx-auto gap-5"),
+    ):
+        with ui.column().classes("gap-1"):
+            ui.label("Caches").classes("text-2xl font-medium")
+            ui.label("Live storage used by ScrapeRack's persistent caches").classes(
+                "text-sm text-gray-400"
+            )
+        with ui.row().classes("w-full gap-4 items-stretch flex-wrap"):
+            for name in CACHES:
+                with ui.card().classes("cache-card grow basis-80 gap-3 p-5"):
+                    with ui.row().classes("w-full items-center"):
+                        ui.label(name).classes("text-lg font-medium")
+                        ui.space()
+                        ui.icon("visibility", size="18px").classes(
+                            "text-green-500"
+                        ).tooltip("Watched through filesystem events")
+                    total = ui.label("0 B").classes("text-3xl font-medium")
+                    files = ui.label("0 files").classes("text-sm text-gray-300")
+                    activity = ui.label("No changes observed").classes(
+                        "text-xs text-gray-500"
+                    )
+                    labels[name] = (total, files, activity)
+
+    with (
+        ui.tab_panel(tasks_tab).classes("p-6"),
+        ui.column().classes("w-full gap-4"),
+    ):
+        with ui.row().classes("w-full items-end"):
+            with ui.column().classes("gap-1"):
+                ui.label("Tasks").classes("text-2xl font-medium")
+                ui.label("Ray task state, refreshed every second").classes(
+                    "text-sm text-gray-400"
                 )
-                labels[name] = (total, files, activity)
+            ui.space()
+            task_status = ui.label("Connecting to Ray").classes("text-xs text-gray-400")
+        task_error = ui.label().classes("text-sm text-red-400")
+        task_error.set_visibility(False)
+        task_grid = (
+            ui.aggrid(
+                {
+                    "columnDefs": task_columns([]),
+                    "rowData": [],
+                    "defaultColDef": {
+                        "sortable": True,
+                        "filter": True,
+                        "floatingFilter": True,
+                        "resizable": True,
+                    },
+                    "pagination": True,
+                    "paginationPageSize": 50,
+                    "paginationPageSizeSelector": [25, 50, 100],
+                    "animateRows": False,
+                    "enableCellTextSelection": True,
+                }
+            )
+            .classes("w-full")
+            .style("height: calc(100vh - 190px)")
+        )
 
 
 def refresh():
@@ -92,6 +132,36 @@ def refresh():
 
 
 ui.timer(0.5, refresh)
+
+
+async def refresh_tasks():
+    if tabs.value != tasks_tab:
+        return
+    try:
+        snapshot = await run.io_bound(TASKS.fetch)
+    except Exception as error:  # noqa: BLE001 - keep the dashboard alive if Ray is down
+        task_status.text = "Ray unavailable"
+        task_error.text = str(error)
+        task_error.set_visibility(True)
+        return
+
+    task_grid.options["columnDefs"] = task_columns(snapshot.tasks)
+    task_grid.options["rowData"] = snapshot.tasks
+    task_grid.update()
+    shown = len(snapshot.tasks)
+    task_status.text = (
+        f"{shown:,} task{'s' if shown != 1 else ''} · "
+        f"updated {datetime.now().astimezone().strftime('%H:%M:%S')}"
+    )
+    task_error.text = snapshot.warning or (
+        f"Ray returned {shown:,} of {snapshot.total:,} tasks"
+        if shown < snapshot.total
+        else ""
+    )
+    task_error.set_visibility(bool(task_error.text))
+
+
+ui.timer(1.0, refresh_tasks)
 
 if __name__ in {"__main__", "__mp_main__"}:
     for cache in CACHES.values():
