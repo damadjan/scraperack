@@ -1,3 +1,4 @@
+import hashlib
 import io
 import sys
 import tempfile
@@ -12,7 +13,7 @@ from unittest.mock import patch
 
 import cloudpickle
 import scraperack
-from scraperack import _working_dir
+from scraperack import _function_cache, _working_dir
 
 
 def add(left, right=0):
@@ -24,8 +25,9 @@ def multiply(left, right):
 
 
 class FakeResponse:
-    def __init__(self, body):
+    def __init__(self, body, status=200):
         self.body = body
+        self.status = status
 
     def __enter__(self):
         return self
@@ -43,8 +45,16 @@ class FakeResponse:
 class ScrapeRackTests(unittest.TestCase):
     def setUp(self):
         scraperack.configure("http://gateway.test/")
+        self.function_cache = patch(
+            "scraperack.prepare_function",
+            side_effect=lambda _, target: cloudpickle.dumps(target),
+        )
+        self.function_cache.start()
         _working_dir._cache.clear()
         _working_dir._directory_locks.clear()
+
+    def tearDown(self):
+        self.function_cache.stop()
 
     @patch("scraperack.urllib.request.urlopen")
     def test_decorated_function_sends_requirements_and_invocation(self, urlopen):
@@ -212,6 +222,47 @@ class ScrapeRackTests(unittest.TestCase):
         invocation = cloudpickle.loads(payload)
         target = cloudpickle.loads(invocation["function"])
         self.assertEqual(target(2, 3), 6)
+
+    @patch("scraperack._function_cache.urllib.request.urlopen")
+    def test_function_is_uploaded_and_referenced_by_digest(self, urlopen):
+        uploaded = {}
+
+        def response(request):
+            if request.get_method() == "HEAD":
+                raise urllib.error.HTTPError(
+                    request.full_url, 404, "Not found", Message(), FakeResponse(b"")
+                )
+            uploaded["function"] = request.data
+            return FakeResponse(b"")
+
+        urlopen.side_effect = response
+
+        reference = _function_cache.prepare("http://gateway.test", add)
+
+        self.assertEqual(reference, hashlib.sha256(uploaded["function"]).hexdigest())
+        self.assertEqual(
+            [call.args[0].get_method() for call in urlopen.call_args_list],
+            ["HEAD", "PUT"],
+        )
+
+    @patch("scraperack._function_cache.urllib.request.urlopen")
+    def test_cached_function_is_not_uploaded_again(self, urlopen):
+        urlopen.return_value = FakeResponse(b"")
+
+        reference = _function_cache.prepare("http://gateway.test", add)
+
+        self.assertRegex(reference, r"^[0-9a-f]{64}$")
+        self.assertEqual(urlopen.call_count, 1)
+        self.assertEqual(urlopen.call_args.args[0].get_method(), "HEAD")
+
+    @patch("scraperack._function_cache.urllib.request.urlopen")
+    def test_disabled_function_cache_sends_function_inline(self, urlopen):
+        urlopen.return_value = FakeResponse(b"", status=204)
+
+        reference = _function_cache.prepare("http://gateway.test", add)
+
+        self.assertEqual(cloudpickle.loads(reference)(2, 3), 5)
+        self.assertEqual(urlopen.call_count, 1)
 
 
 if __name__ == "__main__":

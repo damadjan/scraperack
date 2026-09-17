@@ -9,6 +9,9 @@ import cloudpickle
 from fastapi import Body, Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse
 
+from scraperack_platform.function_cache import enabled as function_cache_enabled
+from scraperack_platform.function_cache import path_for as function_path_for
+from scraperack_platform.function_cache import validate as validate_function
 from scraperack_platform.runner import run
 from scraperack_platform.working_dirs import path_for, url_for, validate
 
@@ -53,9 +56,47 @@ def get_ray():
 
 @app.get("/health")
 def health(ray: Annotated[object, Depends(get_ray)]):
+    function_cache_enabled()
     pip_cache_enabled()
     ray.nodes()
     return {"status": "ok"}
+
+
+@app.head("/functions/{digest}")
+def function_exists(digest: str):
+    if not function_cache_enabled():
+        return Response(status_code=204)
+    try:
+        function = function_path_for(digest)
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
+    if not function.is_file():
+        raise HTTPException(404, "function not found")
+    return Response(headers={"content-length": str(function.stat().st_size)})
+
+
+@app.put("/functions/{digest}", status_code=201)
+async def upload_function(digest: str, request: Request):
+    if not function_cache_enabled():
+        raise HTTPException(409, "function caching is disabled")
+    try:
+        function = function_path_for(digest)
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
+    if function.is_file():
+        return Response(status_code=204)
+
+    body = await request.body()
+    temporary = function.with_name(f".{digest}.{uuid.uuid4().hex}.tmp")
+    try:
+        validate_function(body, digest)
+        temporary.write_bytes(body)
+        os.replace(temporary, function)
+    except (OSError, ValueError) as error:
+        raise HTTPException(400, str(error)) from error
+    finally:
+        temporary.unlink(missing_ok=True)
+    return Response(status_code=201)
 
 
 @app.head("/working-dirs/{digest}.zip")
@@ -121,7 +162,7 @@ def invoke(
         requirements = invocation["requirements"]
         working_dir = invocation.get("working_dir")
         if (
-            not isinstance(function, bytes)
+            not isinstance(function, (bytes, str))
             or not isinstance(arguments, bytes)
             or not isinstance(requirements, list)
             or any(
@@ -131,6 +172,10 @@ def invoke(
             or (working_dir is not None and not isinstance(working_dir, str))
         ):
             raise TypeError
+        if isinstance(function, str):
+            if not function_cache_enabled():
+                raise ValueError("function caching is disabled")
+            function = function_path_for(function).read_bytes()
         if working_dir and not path_for(working_dir).is_file():
             raise ValueError("working_dir has not been uploaded")
     except Exception as error:

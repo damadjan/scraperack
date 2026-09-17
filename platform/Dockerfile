@@ -17,7 +17,7 @@ RUN python -m pip install --no-cache-dir --no-deps . \
     && python -c "import scraperack_platform.runner"
 
 RUN useradd --create-home --uid 1000 scraperack \
-    && mkdir -p /home/scraperack/.cache/pip /home/scraperack/.cache/working-dirs \
+    && mkdir -p /home/scraperack/.cache/functions /home/scraperack/.cache/pip /home/scraperack/.cache/working-dirs \
     && chown -R scraperack:scraperack /home/scraperack/.cache
 USER scraperack
 
