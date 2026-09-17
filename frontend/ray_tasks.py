@@ -37,6 +37,7 @@ TASK_FIELDS = (
     "label_selector",
 )
 TIME_FIELDS = {"creation_time_ms", "start_time_ms", "end_time_ms"}
+TERMINAL_STATES = {"FINISHED", "FAILED"}
 CACHE_RENDERER = """params => {
     const badge = document.createElement('span');
     const value = (params.value || 'unknown').toUpperCase();
@@ -103,10 +104,23 @@ TABLE_COLUMNS = (
         "cellStyle": {"display": "flex", "alignItems": "center"},
     },
     {
-        "field": "started",
-        "headerName": "Started",
+        "field": "duration",
+        "headerName": "Duration",
+        "width": 130,
+        "maxWidth": 130,
+        ":comparator": """(a, b, nodeA, nodeB) =>
+            (nodeA.data.duration_ms || 0) - (nodeB.data.duration_ms || 0)""",
+    },
+    {
+        "field": "created",
+        "headerName": "Created",
         "flex": 1.5,
         "minWidth": 180,
+        "sort": "desc",
+        "sortIndex": 0,
+        ":comparator": """(a, b, nodeA, nodeB) =>
+            Date.parse(nodeA.data.creation_time_ms) -
+            Date.parse(nodeB.data.creation_time_ms)""",
     },
 )
 
@@ -124,11 +138,28 @@ class RayTaskClient:
         self.limit = limit
         self.timeout = timeout
 
-    def fetch(self):
-        query = urlencode({"detail": 1, "limit": self.limit})
-        request = Request(f"{self.url}?{query}", headers={"Accept": "application/json"})
+    def fetch(self, filters=(), limit=None):
+        query = [("detail", 1), ("limit", limit or self.limit)]
+        for key, predicate, value in filters:
+            query.extend(
+                (
+                    ("filter_keys", key),
+                    ("filter_predicates", predicate),
+                    ("filter_values", value),
+                )
+            )
+        request = Request(
+            f"{self.url}?{urlencode(query)}", headers={"Accept": "application/json"}
+        )
         with urlopen(request, timeout=self.timeout) as response:
             return parse_task_response(json.load(response))
+
+    def fetch_active(self):
+        return self.fetch((("state", "!=", "FINISHED"), ("state", "!=", "FAILED")))
+
+    def fetch_task(self, task_id):
+        tasks = self.fetch((("task_id", "=", task_id),), limit=1).tasks
+        return tasks[0] if tasks else None
 
 
 class CacheStatusClient:
@@ -142,6 +173,24 @@ class CacheStatusClient:
         if not isinstance(result, dict):
             raise TypeError("ScrapeRack returned unexpected cache status data")
         return result
+
+
+class RayLogClient:
+    def __init__(self, dashboard_url, timeout=5):
+        self.url = dashboard_url.rstrip("/") + "/api/v0/logs/file"
+        self.timeout = timeout
+
+    def fetch(self, task_id, attempt_number=0, suffix="out", lines=1000):
+        query = urlencode(
+            {
+                "task_id": task_id,
+                "attempt_number": attempt_number,
+                "suffix": suffix,
+                "lines": lines,
+            }
+        )
+        with urlopen(f"{self.url}?{query}", timeout=self.timeout) as response:
+            return response.read().decode(errors="replace")
 
 
 def add_cache_status(tasks, statuses):
@@ -168,6 +217,16 @@ def task_transaction(previous, tasks):
             task for task_id, task in previous.items() if task_id not in current
         ],
     }
+
+
+def limit_task_history(tasks, limit):
+    active = [task for task in tasks if task.get("state") not in TERMINAL_STATES]
+    terminal = sorted(
+        (task for task in tasks if task.get("state") in TERMINAL_STATES),
+        key=lambda task: task.get("creation_time_ms") or "",
+        reverse=True,
+    )
+    return active + terminal[: max(0, limit - len(active))]
 
 
 def parse_task_response(payload):
@@ -214,8 +273,6 @@ def display_task(task):
             value = datetime.fromtimestamp(value / 1000, timezone.utc).isoformat(
                 timespec="milliseconds"
             )
-        elif isinstance(value, (dict, list)):
-            value = json.dumps(value, sort_keys=True, separators=(",", ":"))
         displayed[field] = value
     return displayed
 
@@ -228,6 +285,33 @@ def time_ago(value):
         return human(datetime.now(timezone.utc) - timestamp, precision=1)
     except (AttributeError, ValueError):
         return value
+
+
+def task_duration(start, end=None, now=None):
+    if not start:
+        return None, "—"
+    try:
+        started = datetime.fromisoformat(start.replace("Z", "+00:00"))
+        finished = (
+            datetime.fromisoformat(end.replace("Z", "+00:00"))
+            if end
+            else now or datetime.now(timezone.utc)
+        )
+        milliseconds = max(0, round((finished - started).total_seconds() * 1000))
+    except (AttributeError, ValueError):
+        return None, "—"
+
+    seconds = milliseconds / 1000
+    if seconds < 1:
+        return milliseconds, f"{milliseconds} ms"
+    if seconds < 60:
+        return milliseconds, f"{seconds:.1f} s"
+    if seconds < 3600:
+        minutes, seconds = divmod(round(seconds), 60)
+        return milliseconds, f"{minutes}m {seconds}s"
+    hours, remainder = divmod(round(seconds), 3600)
+    minutes = remainder // 60
+    return milliseconds, f"{hours}h {minutes}m"
 
 
 def task_columns():
