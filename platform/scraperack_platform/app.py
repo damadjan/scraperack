@@ -1,6 +1,7 @@
 import os
 import traceback
 import uuid
+from collections import OrderedDict
 from functools import cache
 from threading import Lock
 from typing import Annotated
@@ -17,7 +18,17 @@ from scraperack_platform.working_dirs import path_for, url_for, validate
 
 CONTENT_TYPE = "application/vnd.scraperack.function"
 connection_lock = Lock()
+invocation_lock = Lock()
+invocation_cache_status = OrderedDict()
 app = FastAPI(title="ScrapeRack", version="0.1.0")
+
+
+def remember_cache_status(task_id, status):
+    with invocation_lock:
+        invocation_cache_status[task_id] = status
+        invocation_cache_status.move_to_end(task_id)
+        if len(invocation_cache_status) > 10_000:
+            invocation_cache_status.popitem(last=False)
 
 
 def pip_cache_enabled():
@@ -60,6 +71,12 @@ def health(ray: Annotated[object, Depends(get_ray)]):
     pip_cache_enabled()
     ray.nodes()
     return {"status": "ok"}
+
+
+@app.get("/invocations/cache-status")
+def cache_statuses():
+    with invocation_lock:
+        return dict(invocation_cache_status)
 
 
 @app.head("/functions/{digest}")
@@ -161,6 +178,7 @@ def invoke(
         arguments = invocation["arguments"]
         requirements = invocation["requirements"]
         working_dir = invocation.get("working_dir")
+        cache_status = invocation.get("cache", {})
         if (
             not isinstance(function, (bytes, str))
             or not isinstance(arguments, bytes)
@@ -170,8 +188,29 @@ def invoke(
                 for requirement in requirements
             )
             or (working_dir is not None and not isinstance(working_dir, str))
+            or not isinstance(cache_status, dict)
         ):
             raise TypeError
+        cache_status = {
+            "function_cache": cache_status.get("function", "unknown"),
+            "working_dir_cache": cache_status.get(
+                "working_dir", "none" if working_dir is None else "unknown"
+            ),
+        }
+        if cache_status["function_cache"] not in {
+            "hit",
+            "miss",
+            "disabled",
+            "unknown",
+        }:
+            raise ValueError("invalid function cache status")
+        if cache_status["working_dir_cache"] not in {
+            "hit",
+            "miss",
+            "none",
+            "unknown",
+        }:
+            raise ValueError("invalid working_dir cache status")
         if isinstance(function, str):
             if not function_cache_enabled():
                 raise ValueError("function caching is disabled")
@@ -186,7 +225,9 @@ def invoke(
         environment = runtime_env(requirements, working_dir)
         if environment:
             remote = remote.options(runtime_env=environment)
-        result = ray.get(remote.remote(function, arguments))
+        reference = remote.remote(function, arguments)
+        remember_cache_status(reference.task_id().hex(), cache_status)
+        result = ray.get(reference)
         status_code = 200 if result["ok"] else 500
     except Exception:  # noqa: BLE001 - transport remote task failures to the caller
         result = {"ok": False, "traceback": traceback.format_exc()}
