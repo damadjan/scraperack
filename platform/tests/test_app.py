@@ -61,6 +61,7 @@ class FakeReference:
 
 class FakeRay:
     def __init__(self):
+        self.failed_tasks = 0
         self.health_checks = 0
         self.options = None
         self.task_count = 0
@@ -74,7 +75,11 @@ class FakeRay:
 
     def get(self, reference):
         function, args, kwargs = reference.value
-        return function(*args, **kwargs)
+        try:
+            return function(*args, **kwargs)
+        except Exception:
+            self.failed_tasks += 1
+            raise
 
 
 class PlatformTests(unittest.TestCase):
@@ -345,6 +350,7 @@ class PlatformTests(unittest.TestCase):
         self.assertEqual(response.status_code, 500)
         self.assertFalse(result["ok"])
         self.assertIn("ValueError: broken remotely", result["traceback"])
+        self.assertEqual(self.ray.failed_tasks, 1)
 
     def test_invalid_payload_is_rejected(self):
         response = self.client.post(
