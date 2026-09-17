@@ -3,7 +3,7 @@ import json
 import unittest
 from unittest.mock import patch
 
-from ray_tasks import RayTaskClient, parse_task_response, task_columns
+from ray_tasks import RayTaskClient, parse_task_response, task_columns, time_ago
 
 
 class Response(io.BytesIO):
@@ -68,13 +68,31 @@ class RayTaskClientTests(unittest.TestCase):
         self.assertIn("detail=1", request.full_url)
         self.assertIn("limit=10000", request.full_url)
 
-    def test_columns_include_every_returned_field(self):
-        columns = task_columns([{"task_id": "one", "future_ray_field": "value"}])
+    def test_columns_only_include_compact_invocation_summary(self):
+        started = "1970-01-01T00:00:00.000+00:00"
+        columns = task_columns(
+            [
+                {
+                    "task_id": "one",
+                    "future_ray_field": "value",
+                    "start_time_ms": started,
+                }
+            ]
+        )
 
         self.assertEqual(
             [column["field"] for column in columns],
-            ["task_id", "future_ray_field"],
+            [
+                "name",
+                "state",
+                "node",
+                "start_time_ms",
+            ],
         )
+        self.assertEqual(columns[-1]["refData"][started], time_ago(started))
+
+    def test_time_ago_preserves_unexpected_values(self):
+        self.assertEqual(time_ago("unknown"), "unknown")
 
 
 if __name__ == "__main__":
