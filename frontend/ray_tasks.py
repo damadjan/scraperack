@@ -4,6 +4,8 @@ from datetime import datetime, timezone
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+from ago import human
+
 TASK_FIELDS = (
     "task_id",
     "name",
@@ -35,6 +37,47 @@ TASK_FIELDS = (
     "label_selector",
 )
 TIME_FIELDS = {"creation_time_ms", "start_time_ms", "end_time_ms"}
+TABLE_COLUMNS = (
+    {
+        "field": "name",
+        "headerName": "Invocation",
+        "flex": 1.5,
+        "minWidth": 160,
+    },
+    {
+        "field": "state",
+        "headerName": "State",
+        "width": 140,
+        "maxWidth": 140,
+        ":cellRenderer": """params => {
+            const badge = document.createElement('span');
+            const colors = {
+                FINISHED: '#22c55e',
+                RUNNING: '#38bdf8',
+                FAILED: '#ef4444',
+                PENDING: '#f59e0b',
+            };
+            badge.className = 'invocation-state';
+            badge.style.color = colors[params.value] || '#a3a3a3';
+            badge.textContent = params.value || 'UNKNOWN';
+            return badge;
+        }""",
+        "cellStyle": {"display": "flex", "alignItems": "center"},
+    },
+    {
+        "field": "node",
+        "headerName": "Node",
+        "flex": 1.2,
+        "minWidth": 220,
+        "tooltipField": "node_id",
+    },
+    {
+        "field": "start_time_ms",
+        "headerName": "Started",
+        "flex": 1.5,
+        "minWidth": 180,
+    },
+)
 
 
 @dataclass(frozen=True)
@@ -107,15 +150,21 @@ def display_task(task):
     return displayed
 
 
+def time_ago(value):
+    try:
+        timestamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+        return human(datetime.now(timezone.utc) - timestamp, precision=1)
+    except (AttributeError, ValueError):
+        return value
+
+
 def task_columns(tasks):
-    fields = set().union(*(task.keys() for task in tasks)) if tasks else set()
-    ordered = [field for field in TASK_FIELDS if field in fields or not tasks]
-    ordered.extend(sorted(fields - set(ordered)))
-    return [
-        {
-            "field": field,
-            "headerName": field.replace("_", " ").title(),
-            "minWidth": 130,
-        }
-        for field in ordered
-    ]
+    columns = [column.copy() for column in TABLE_COLUMNS]
+    columns[-1]["refData"] = {
+        task["start_time_ms"]: time_ago(task["start_time_ms"])
+        for task in tasks
+        if task.get("start_time_ms")
+    }
+    return columns

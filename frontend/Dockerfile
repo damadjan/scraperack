@@ -8,7 +8,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN python -m pip install --no-cache-dir -r requirements.txt
 
-COPY app.py cache_monitor.py ray_tasks.py ./
+COPY app.py cache_monitor.py ray_nodes.py ray_tasks.py ./
 
 RUN useradd --create-home --uid 1000 scraperack
 USER scraperack

@@ -1,9 +1,10 @@
 import os
-from datetime import datetime
+from time import monotonic
 
 from cache_monitor import CacheMonitor
 from nicegui import run, ui
-from ray_tasks import RayTaskClient, task_columns
+from ray_nodes import RayNodeClient, node_columns
+from ray_tasks import TASK_FIELDS, RayTaskClient, task_columns
 
 CACHES = {
     "Working directories": CacheMonitor(
@@ -12,6 +13,9 @@ CACHES = {
     "Pip downloads": CacheMonitor(os.getenv("PIP_CACHE_DIR", "/cache/pip")),
 }
 TASKS = RayTaskClient(os.getenv("RAY_DASHBOARD_URL", "http://control-plane:8265"))
+NODES = RayNodeClient(os.getenv("RAY_DASHBOARD_URL", "http://control-plane:8265"))
+node_names = {}
+node_names_updated_at = 0.0
 
 
 def size(value):
@@ -34,6 +38,39 @@ ui.colors(primary="#22c55e")
 ui.add_css("""
 .nicegui-content { padding: 0 !important; }
 .cache-card { background: #171717; border: 1px solid #303030; box-shadow: none; }
+.invocation-state {
+    display: inline-flex;
+    align-items: center;
+    border: 1px solid currentColor;
+    border-radius: 9999px;
+    padding: 2px 8px;
+    font-size: 12px;
+    font-weight: 500;
+    line-height: 1.25;
+}
+.node-meter {
+    position: relative;
+    flex: 1 1 auto;
+    min-width: 0;
+    width: 100%;
+    height: 22px;
+    overflow: hidden;
+    border: 1px solid #2563a9;
+    border-radius: 4px;
+    background: #262626;
+}
+.node-meter-fill { height: 100%; background: #0f4c8a; }
+.node-meter-label {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #f5f5f5;
+    font-size: 12px;
+}
+.node-meter-cell .ag-cell-wrapper,
+.node-meter-cell .ag-cell-value { width: 100%; min-width: 0; }
 """)
 
 with (
@@ -46,8 +83,9 @@ with (
 ):
     ui.label("ScrapeRack").classes("text-lg font-medium")
     with ui.tabs().props("dense").classes("h-12") as tabs:
-        overview_tab = ui.tab("Overview").props("no-caps")
-        tasks_tab = ui.tab("Tasks").props("no-caps")
+        invocations_tab = ui.tab("Invocations").props("no-caps")
+        cluster_tab = ui.tab("Cluster").props("no-caps")
+        caches_tab = ui.tab("Caches").props("no-caps")
     ui.space()
     with ui.row().classes("items-center gap-2"):
         ui.icon("circle", size="10px").classes("text-green-500")
@@ -56,9 +94,21 @@ with (
 labels = {}
 versions = {name: -1 for name in CACHES}
 
-with ui.tab_panels(tabs, value=overview_tab).classes("w-full bg-neutral-950"):
+with (
+    ui.dialog() as invocation_dialog,
+    ui.card().classes("w-[90vw] max-w-5xl h-[80vh] overflow-hidden"),
+):
+    invocation_content = ui.column().classes(
+        "w-full h-full min-h-0 gap-4 overflow-y-auto overflow-x-hidden"
+    )
+
+with (
+    ui.tab_panels(tabs, value=invocations_tab)
+    .classes("w-full bg-neutral-950")
+    .style("height: calc(100vh - 48px)")
+):
     with (
-        ui.tab_panel(overview_tab).classes("p-6"),
+        ui.tab_panel(caches_tab).classes("p-6"),
         ui.column().classes("w-full max-w-6xl mx-auto gap-5"),
     ):
         with ui.column().classes("gap-1"):
@@ -82,19 +132,10 @@ with ui.tab_panels(tabs, value=overview_tab).classes("w-full bg-neutral-950"):
                     )
                     labels[name] = (total, files, activity)
 
-    with (
-        ui.tab_panel(tasks_tab).classes("p-6"),
-        ui.column().classes("w-full gap-4"),
-    ):
-        with ui.row().classes("w-full items-end"):
-            with ui.column().classes("gap-1"):
-                ui.label("Tasks").classes("text-2xl font-medium")
-                ui.label("Ray task state, refreshed every second").classes(
-                    "text-sm text-gray-400"
-                )
-            ui.space()
-            task_status = ui.label("Connecting to Ray").classes("text-xs text-gray-400")
-        task_error = ui.label().classes("text-sm text-red-400")
+    with ui.tab_panel(invocations_tab).classes("p-0 h-full relative"):
+        task_error = ui.label().classes(
+            "absolute z-10 m-4 rounded bg-red-950 px-3 py-2 text-sm text-red-300"
+        )
         task_error.set_visibility(False)
         task_grid = (
             ui.aggrid(
@@ -114,9 +155,73 @@ with ui.tab_panels(tabs, value=overview_tab).classes("w-full bg-neutral-950"):
                     "enableCellTextSelection": True,
                 }
             )
-            .classes("w-full")
-            .style("height: calc(100vh - 190px)")
+            .classes("w-full h-full")
+            .style("height: 100%")
         )
+
+    with ui.tab_panel(cluster_tab).classes("p-0 h-full relative"):
+        with ui.row().classes(
+            "w-full h-[52px] items-center gap-3 border-b border-neutral-800 px-4"
+        ):
+            cluster_status = ui.label("Connecting").classes(
+                "invocation-state text-gray-400"
+            )
+            cluster_nodes = ui.label().classes("text-sm text-gray-400")
+            ui.space()
+            cluster_error = ui.label().classes("text-sm text-red-400")
+        cluster_grid = (
+            ui.aggrid(
+                {
+                    "columnDefs": node_columns(),
+                    "rowData": [],
+                    "defaultColDef": {
+                        "sortable": True,
+                        "filter": True,
+                        "resizable": True,
+                    },
+                    "animateRows": False,
+                    "enableCellTextSelection": True,
+                }
+            )
+            .classes("w-full")
+            .style("height: calc(100% - 52px)")
+        )
+
+
+def show_invocation(event):
+    task = event.args.get("data") or {}
+    if not task:
+        return
+    fields = [field for field in TASK_FIELDS if field in task]
+    fields.extend(sorted(set(task) - set(fields)))
+    invocation_content.clear()
+    with invocation_content:
+        with ui.row().classes("w-full items-center flex-nowrap"):
+            ui.label(
+                task.get("name") or task.get("func_or_class_name") or "Invocation"
+            ).classes("text-xl font-medium grow min-w-0 truncate")
+            if task.get("state"):
+                ui.badge(task["state"]).props("outline")
+            ui.button(icon="close", on_click=invocation_dialog.close).props(
+                "flat round dense"
+            )
+        for field in fields:
+            value = task[field]
+            if value in (None, ""):
+                continue
+            with ui.row().classes(
+                "w-full items-start gap-4 border-b border-neutral-800 py-2 flex-nowrap"
+            ):
+                ui.label(field.replace("_", " ").title()).classes(
+                    "w-48 shrink-0 text-sm text-gray-400"
+                )
+                ui.label(str(value)).classes(
+                    "grow min-w-0 whitespace-pre-wrap break-all text-sm"
+                )
+    invocation_dialog.open()
+
+
+task_grid.on("cellClicked", show_invocation, ["data"])
 
 
 def refresh():
@@ -133,26 +238,37 @@ def refresh():
 
 ui.timer(0.5, refresh)
 
+task_refresh_running = False
+cluster_refresh_running = False
+
 
 async def refresh_tasks():
-    if tabs.value != tasks_tab:
+    global task_refresh_running
+    if task_refresh_running:
         return
+    task_refresh_running = True
+    await refresh_node_names()
     try:
         snapshot = await run.io_bound(TASKS.fetch)
     except Exception as error:  # noqa: BLE001 - keep the dashboard alive if Ray is down
-        task_status.text = "Ray unavailable"
         task_error.text = str(error)
         task_error.set_visibility(True)
         return
+    finally:
+        task_refresh_running = False
 
-    task_grid.options["columnDefs"] = task_columns(snapshot.tasks)
-    task_grid.options["rowData"] = snapshot.tasks
-    task_grid.update()
+    tasks = [
+        task | {"node": node_label(task.get("node_id"))} for task in snapshot.tasks
+    ]
+    columns = task_columns(tasks)
+    if (
+        task_grid.options["columnDefs"] != columns
+        or task_grid.options["rowData"] != tasks
+    ):
+        task_grid.options["columnDefs"] = columns
+        task_grid.options["rowData"] = tasks
+        task_grid.update()
     shown = len(snapshot.tasks)
-    task_status.text = (
-        f"{shown:,} task{'s' if shown != 1 else ''} · "
-        f"updated {datetime.now().astimezone().strftime('%H:%M:%S')}"
-    )
     task_error.text = snapshot.warning or (
         f"Ray returned {shown:,} of {snapshot.total:,} tasks"
         if shown < snapshot.total
@@ -161,7 +277,67 @@ async def refresh_tasks():
     task_error.set_visibility(bool(task_error.text))
 
 
-ui.timer(1.0, refresh_tasks)
+def remember_nodes(snapshot):
+    global node_names_updated_at
+    node_names.clear()
+    node_names.update(
+        {node["node_id"]: node["node"] for node in snapshot.nodes if node["node_id"]}
+    )
+    node_names_updated_at = monotonic()
+
+
+async def refresh_node_names():
+    if monotonic() - node_names_updated_at < 30:
+        return
+    try:
+        remember_nodes(await run.io_bound(NODES.fetch))
+    except Exception:  # noqa: BLE001, S110 - names are optional display metadata
+        pass
+
+
+def node_label(node_id):
+    if not node_id:
+        return "Unassigned"
+    name = node_names.get(node_id)
+    return name or node_id[:12]
+
+
+async def refresh_cluster():
+    global cluster_refresh_running
+    if cluster_refresh_running:
+        return
+    cluster_refresh_running = True
+    try:
+        snapshot = await run.io_bound(NODES.fetch)
+    except Exception as error:  # noqa: BLE001 - keep the dashboard alive if Ray is down
+        cluster_status.text = "Unavailable"
+        cluster_status.style("color: #ef4444")
+        cluster_error.text = str(error)
+        return
+    finally:
+        cluster_refresh_running = False
+
+    remember_nodes(snapshot)
+    total = len(snapshot.nodes)
+    healthy = bool(total) and snapshot.alive == total
+    cluster_status.text = "Healthy" if healthy else "Degraded"
+    cluster_status.style(f"color: {'#22c55e' if healthy else '#f59e0b'}")
+    cluster_nodes.text = f"{snapshot.alive} / {total} nodes alive"
+    cluster_error.text = ""
+    if cluster_grid.options["rowData"] != snapshot.nodes:
+        cluster_grid.options["rowData"] = snapshot.nodes
+        cluster_grid.update()
+
+
+async def refresh_visible_data():
+    if tabs.value in (invocations_tab, invocations_tab._props["name"]):
+        await refresh_tasks()
+    elif tabs.value in (cluster_tab, cluster_tab._props["name"]):
+        await refresh_cluster()
+
+
+tabs.on_value_change(lambda _: refresh_visible_data())
+ui.timer(1.0, refresh_visible_data)
 
 if __name__ in {"__main__", "__mp_main__"}:
     for cache in CACHES.values():
