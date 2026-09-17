@@ -8,6 +8,7 @@ ScrapeRack is a Docker-based convenience layer over Ray for one trusted owner. I
 
 ```text
 Python SDK -> HTTP gateway -> control plane (Ray head) -> nodes
+NiceGUI dashboard -> persistent cache volumes (read-only)
 ```
 
 The SDK sends one function invocation per HTTP request. The gateway submits one real Ray task and holds the response open until the task returns or raises. The control plane advertises zero CPUs, so functions execute only on nodes.
@@ -17,6 +18,7 @@ The PoC intentionally has no background jobs, batching, database, multi-tenancy,
 ```text
 sdk/        Installable Python SDK
 platform/   Shared Docker image, gateway, and platform tests
+frontend/   NiceGUI dashboard
 examples/   Example function invocations
 ```
 
@@ -27,7 +29,7 @@ examples/   Example function invocations
 
 ## Start the cluster
 
-Start the gateway, control plane, and one node:
+Start the gateway, control plane, one node, and the dashboard:
 
 ```powershell
 Copy-Item .env.example .env
@@ -44,6 +46,8 @@ docker compose up -d --scale node=2
 ```
 
 The gateway listens on <http://127.0.0.1:42800>. The Ray dashboard is not published to the host.
+
+The ScrapeRack dashboard listens on <http://127.0.0.1:9987>. Its first view shows live storage usage for the persistent pip and working-directory caches. It performs one initial scan, then uses filesystem events instead of repeatedly scanning the volumes.
 
 Do not expose the gateway to the public internet. Function payloads use Python serialization and therefore grant arbitrary code execution by design.
 
@@ -124,16 +128,17 @@ docker compose down
 
 ## Container image
 
-GitHub Actions builds the shared gateway, control-plane, and node image for every change. The image starts from Python 3.10 and installs the pinned Ray version. Changes merged into `main` are published as `ghcr.io/damadjan/scraperack:main` and with an immutable commit tag.
+GitHub Actions builds the shared gateway, control-plane, and node image and the separate dashboard image for every change. Changes merged into `main` are published as `ghcr.io/damadjan/scraperack:main` and `ghcr.io/damadjan/scraperack-dashboard:main`, along with immutable commit tags.
 
 ## Tests
 
 ```powershell
-python -m pip install -r platform/requirements-dev.txt -e sdk
+python -m pip install -r platform/requirements-dev.txt -r frontend/requirements.txt -e sdk
 python -m unittest discover -s sdk/tests -v
 python -m unittest discover -s platform/tests -t platform -v
-ruff check sdk platform examples
-ruff format --check sdk platform examples
+python -m unittest discover -s frontend/tests -t frontend -v
+ruff check sdk platform frontend examples
+ruff format --check sdk platform frontend examples
 $env:RAY_PIP_CACHING="true"
 docker compose config --quiet
 ```
