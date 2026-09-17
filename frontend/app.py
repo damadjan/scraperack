@@ -1,15 +1,21 @@
+import json
 import os
+from asyncio import gather
+from datetime import datetime, timezone
 from time import monotonic
 
 from cache_monitor import CacheMonitor
 from nicegui import run, ui
 from ray_nodes import RayNodeClient, node_columns
 from ray_tasks import (
-    TASK_FIELDS,
+    TERMINAL_STATES,
     CacheStatusClient,
+    RayLogClient,
     RayTaskClient,
     add_cache_status,
+    limit_task_history,
     task_columns,
+    task_duration,
     task_transaction,
     time_ago,
 )
@@ -20,14 +26,18 @@ CACHES = {
     ),
     "Pip downloads": CacheMonitor(os.getenv("PIP_CACHE_DIR", "/cache/pip")),
 }
-TASKS = RayTaskClient(os.getenv("RAY_DASHBOARD_URL", "http://control-plane:8265"))
+RAY_DASHBOARD_URL = os.getenv("RAY_DASHBOARD_URL", "http://control-plane:8265")
+TASKS = RayTaskClient(RAY_DASHBOARD_URL)
+LOGS = RayLogClient(RAY_DASHBOARD_URL)
 CACHE_STATUS = CacheStatusClient(
     os.getenv("SCRAPERACK_GATEWAY_URL", "http://127.0.0.1:42800")
 )
-NODES = RayNodeClient(os.getenv("RAY_DASHBOARD_URL", "http://control-plane:8265"))
+NODES = RayNodeClient(RAY_DASHBOARD_URL)
 node_names = {}
 node_names_updated_at = 0.0
 task_rows = {}
+last_full_task_refresh = 0.0
+FULL_TASK_REFRESH_SECONDS = 60
 
 
 def size(value):
@@ -93,6 +103,37 @@ ui.add_css("""
 }
 .node-meter-cell .ag-cell-wrapper,
 .node-meter-cell .ag-cell-value { width: 100%; min-width: 0; }
+.log-panel {
+    min-height: 220px;
+    max-height: 420px;
+    overflow: auto;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    border: 1px solid #303030;
+    border-radius: 6px;
+    background: #0f0f0f;
+    padding: 16px;
+    color: #e5e5e5;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 13px;
+}
+.data-panel {
+    overflow: auto;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    border: 1px solid #303030;
+    border-radius: 6px;
+    background: #0f0f0f;
+    padding: 12px;
+    color: #d4d4d4;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px;
+}
+.detail-card { background: #171717; border: 1px solid #303030; box-shadow: none; }
+.modal-header {
+    background: #262626;
+    border-bottom: 1px solid #404040;
+}
 """)
 
 with (
@@ -118,10 +159,10 @@ versions = {name: -1 for name in CACHES}
 
 with (
     ui.dialog() as invocation_dialog,
-    ui.card().classes("w-[90vw] max-w-5xl h-[80vh] overflow-hidden"),
+    ui.card().classes("w-[90vw] max-w-5xl h-[80vh] overflow-hidden p-0"),
 ):
     invocation_content = ui.column().classes(
-        "w-full h-full min-h-0 gap-4 overflow-y-auto overflow-x-hidden"
+        "w-full h-full min-h-0 gap-3 overflow-hidden"
     )
 
 with (
@@ -211,36 +252,334 @@ with (
         )
 
 
+def decoded(value):
+    if not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return value
+
+
+def displayed(value):
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, indent=2, sort_keys=True, default=str)
+    return str(value)
+
+
+def millisecond_time(value):
+    try:
+        return datetime.fromtimestamp(float(value) / 1000, timezone.utc).isoformat(
+            timespec="milliseconds"
+        )
+    except (TypeError, ValueError, OSError):
+        return str(value)
+
+
+def elapsed(milliseconds):
+    try:
+        milliseconds = max(0, float(milliseconds))
+    except (TypeError, ValueError):
+        return "—"
+    if milliseconds < 1:
+        return f"{milliseconds:.3f} ms"
+    if milliseconds < 1000:
+        return f"{milliseconds:.2f} ms"
+    return f"{milliseconds / 1000:.2f} s"
+
+
+def modal_fields(task, fields):
+    shown = False
+    for field in fields:
+        value = task.get(field)
+        if value in (None, ""):
+            continue
+        shown = True
+        with ui.row().classes(
+            "w-full items-start gap-4 border-b border-neutral-800 py-2 flex-nowrap"
+        ):
+            ui.label(field.replace("_", " ").title()).classes(
+                "w-48 shrink-0 text-sm text-gray-400"
+            )
+            ui.label(displayed(value)).classes(
+                "grow min-w-0 whitespace-pre-wrap break-all text-sm"
+            )
+    if not shown:
+        ui.label("No data available").classes("text-sm text-gray-500")
+
+
+def detail_card(title, value, caption=None):
+    with ui.card().classes("detail-card grow min-w-40 gap-1 p-3"):
+        ui.label(title).classes("text-xs uppercase tracking-wide text-gray-500")
+        ui.label(str(value)).classes("text-base font-medium break-all")
+        if caption:
+            ui.label(caption).classes("text-xs text-gray-500 break-all")
+
+
+def environment_panel(task):
+    info = decoded(task.get("runtime_env_info"))
+    info = info if isinstance(info, dict) else {}
+    config = decoded(info.get("runtime_env_config"))
+    config = config if isinstance(config, dict) else {}
+    environment = decoded(info.get("serialized_runtime_env"))
+    environment = environment if isinstance(environment, dict) else {}
+    uris = decoded(info.get("uris"))
+    uris = uris if isinstance(uris, dict) else {}
+    pip = decoded(environment.get("pip"))
+    pip = pip if isinstance(pip, dict) else {}
+    packages = pip.get("packages") or []
+    working_dir = environment.get("working_dir") or uris.get("working_dir_uri")
+
+    with ui.row().classes("w-full gap-3 mb-2"):
+        detail_card("Function cache", task.get("function_cache", "—"))
+        detail_card("Working dir cache", task.get("working_dir_cache", "—"))
+
+    ui.label("Python packages").classes("text-xs uppercase tracking-wide text-gray-500")
+    with ui.row().classes("w-full gap-2"):
+        if packages:
+            for package in packages:
+                ui.badge(str(package)).props("outline color=blue-grey-4")
+        else:
+            ui.label("No pip packages requested").classes("text-sm text-gray-500")
+
+    ui.separator().classes("my-2")
+    ui.label("Working directory").classes(
+        "text-xs uppercase tracking-wide text-gray-500"
+    )
+    if working_dir:
+        archive = str(working_dir).rsplit("/", 1)[-1]
+        detail_card("Archive", archive, str(working_dir))
+    else:
+        ui.label("No working directory").classes("text-sm text-gray-500")
+
+    with ui.row().classes("w-full gap-3 mt-2"):
+        detail_card("Eager install", config.get("eager_install", "—"))
+        timeout = config.get("setup_timeout_seconds")
+        detail_card("Setup timeout", f"{timeout} s" if timeout is not None else "—")
+        detail_card("Pip check", pip.get("pip_check", "—"))
+    with ui.row().classes("w-full gap-3"):
+        detail_card("Ray commit", environment.get("_ray_commit", "—"))
+        options = ", ".join(map(str, pip.get("pip_install_options") or []))
+        detail_card("Pip options", options or "None")
+        detail_card("Python modules", len(uris.get("py_modules_uris") or []))
+
+    remaining = {
+        key: value
+        for key, value in info.items()
+        if key not in {"runtime_env_config", "serialized_runtime_env", "uris"}
+    }
+    if remaining:
+        ui.label("Additional environment data").classes(
+            "text-xs uppercase tracking-wide text-gray-500 mt-2"
+        )
+        ui.label(displayed(remaining)).classes("data-panel w-full")
+    with ui.expansion("Complete environment data", icon="data_object").classes(
+        "w-full mt-2"
+    ):
+        ui.label(displayed(info)).classes("data-panel w-full")
+
+
+def timeline_panel(task):
+    events = decoded(task.get("events"))
+    if not isinstance(events, list) or not events:
+        ui.label("No state timeline available").classes("text-sm text-gray-500")
+        return
+    for index, event in enumerate(events):
+        if not isinstance(event, dict):
+            ui.label(displayed(event)).classes("data-panel w-full")
+            continue
+        created = event.get("created_ms")
+        next_created = (
+            events[index + 1].get("created_ms")
+            if index + 1 < len(events) and isinstance(events[index + 1], dict)
+            else None
+        )
+        with ui.row().classes("w-full items-center gap-3 flex-nowrap py-2"):
+            ui.icon("circle", size="11px").classes(
+                "text-green-500" if index == len(events) - 1 else "text-blue-400"
+            )
+            ui.badge(event.get("state") or "UNKNOWN").props("outline")
+            ui.label(millisecond_time(created)).classes("grow text-sm text-gray-300")
+            ui.label(
+                elapsed(next_created - created)
+                if next_created is not None and created is not None
+                else "—"
+            ).classes("w-24 text-right text-sm text-gray-400")
+
+
+def profiling_panel(task):
+    with ui.row().classes("w-full gap-3 mb-3"):
+        detail_card(
+            "Created",
+            task.get("created", "—"),
+            task.get("creation_time_ms"),
+        )
+        detail_card("Started", task.get("start_time_ms", "—"))
+        detail_card("Finished", task.get("end_time_ms", "—"))
+        detail_card("Duration", task.get("duration", "—"))
+
+    ui.label("State timeline").classes("text-xs uppercase tracking-wide text-gray-500")
+    timeline_panel(task)
+    ui.separator().classes("my-3")
+    ui.label("Worker profiling").classes(
+        "text-xs uppercase tracking-wide text-gray-500"
+    )
+    profile = decoded(task.get("profiling_data"))
+    if not isinstance(profile, dict):
+        ui.label("No profiling information available").classes("text-sm text-gray-500")
+        return
+    modal_fields(profile, ("component_type", "component_id", "node_ip_address"))
+    events = profile.get("events") or []
+    durations = [
+        max(0, event.get("end_time", 0) - event.get("start_time", 0))
+        for event in events
+        if isinstance(event, dict)
+    ]
+    maximum = max(durations, default=1)
+    ui.label("Execution phases").classes(
+        "text-xs uppercase tracking-wide text-gray-500 mt-3"
+    )
+    if not events:
+        ui.label("No profiling events available").classes("text-sm text-gray-500")
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        duration = max(0, event.get("end_time", 0) - event.get("start_time", 0))
+        with ui.card().classes("detail-card w-full gap-2 p-3"):
+            with ui.row().classes("w-full items-center gap-3"):
+                ui.label(event.get("event_name") or "Unnamed event").classes(
+                    "grow font-medium"
+                )
+                ui.label(elapsed(duration)).classes("text-sm text-gray-400")
+            ui.linear_progress(value=duration / maximum).props("rounded size=6px")
+            ui.label(
+                f"{millisecond_time(event.get('start_time'))} → "
+                f"{millisecond_time(event.get('end_time'))}"
+            ).classes("text-xs text-gray-500")
+            extra = event.get("extra_data")
+            if extra:
+                ui.label(displayed(extra)).classes("data-panel w-full")
+
+
 def show_invocation(event):
     task = event.args.get("data") or {}
     if not task:
         return
-    fields = [field for field in TASK_FIELDS if field in task]
-    fields.extend(sorted(set(task) - set(fields)))
     invocation_content.clear()
     with invocation_content:
-        with ui.row().classes("w-full items-center flex-nowrap"):
-            ui.label(
-                task.get("name") or task.get("func_or_class_name") or "Invocation"
-            ).classes("text-xl font-medium grow min-w-0 truncate")
-            if task.get("state"):
-                ui.badge(task["state"]).props("outline")
+        with ui.row().classes("modal-header w-full items-center flex-nowrap px-4 py-3"):
+            with ui.row().classes("grow min-w-0 items-center gap-3 flex-nowrap"):
+                ui.label(
+                    task.get("name") or task.get("func_or_class_name") or "Invocation"
+                ).classes("text-xl font-medium min-w-0 truncate")
+                if task.get("state"):
+                    ui.badge(task["state"]).props("outline").classes("shrink-0")
             ui.button(icon="close", on_click=invocation_dialog.close).props(
                 "flat round dense"
             )
-        for field in fields:
-            value = task[field]
-            if value in (None, ""):
-                continue
-            with ui.row().classes(
-                "w-full items-start gap-4 border-b border-neutral-800 py-2 flex-nowrap"
-            ):
-                ui.label(field.replace("_", " ").title()).classes(
-                    "w-48 shrink-0 text-sm text-gray-400"
+        with (
+            ui.tabs()
+            .props("dense")
+            .classes("w-full border-b border-neutral-800") as tabs
+        ):
+            overview_tab = ui.tab("Overview").props("no-caps")
+            environment_tab = ui.tab("Environment").props("no-caps")
+            profiling_tab = ui.tab("Profiling").props("no-caps")
+            logs_tab = ui.tab("Logs").props("no-caps")
+            result_tab = ui.tab("Result").props("no-caps")
+            exception_tab = ui.tab("Exception").props("no-caps")
+        with ui.tab_panels(tabs, value=overview_tab).classes(
+            "w-full grow min-h-0 bg-transparent"
+        ):
+            with ui.tab_panel(overview_tab).classes("p-2 h-full overflow-y-auto"):
+                modal_fields(
+                    task,
+                    (
+                        "task_id",
+                        "name",
+                        "state",
+                        "node",
+                        "required_resources",
+                        "actor_id",
+                        "placement_group_id",
+                        "is_debugger_paused",
+                        "call_site",
+                    ),
                 )
-                ui.label(str(value)).classes(
-                    "grow min-w-0 whitespace-pre-wrap break-all text-sm"
-                )
+            with ui.tab_panel(environment_tab).classes("p-2 h-full overflow-y-auto"):
+                environment_panel(task)
+            with ui.tab_panel(profiling_tab).classes("p-2 h-full overflow-y-auto"):
+                profiling_panel(task)
+            with ui.tab_panel(logs_tab).classes("p-2 h-full overflow-y-auto"):
+                with ui.row().classes("w-full items-center"):
+                    log_status = ui.label("Open this tab to load task logs").classes(
+                        "text-sm text-gray-400"
+                    )
+                    ui.space()
+                    refresh_logs = ui.button("Refresh", icon="refresh").props(
+                        "flat dense no-caps"
+                    )
+                ui.label("stdout").classes("text-sm font-medium text-gray-300")
+                stdout = ui.label().classes("log-panel w-full")
+                ui.label("stderr").classes("text-sm font-medium text-gray-300 mt-2")
+                stderr = ui.label().classes("log-panel w-full")
+                with ui.expansion("Log metadata", icon="description").classes(
+                    "w-full mt-2"
+                ):
+                    modal_fields(task, ("task_log_info",))
+            with ui.tab_panel(result_tab).classes("p-6 h-full"):
+                ui.icon("info", size="32px").classes("text-blue-400")
+                ui.label("Results are not retained").classes("text-lg font-medium")
+                ui.label(
+                    "Return values are delivered directly to the SDK and are not stored "
+                    "by ScrapeRack."
+                ).classes("max-w-2xl text-sm text-gray-400")
+            with ui.tab_panel(exception_tab).classes("p-2 h-full overflow-y-auto"):
+                modal_fields(task, ("error_type", "error_message"))
+
+        logs_loaded = False
+
+        async def load_logs(force=False):
+            nonlocal logs_loaded
+            if logs_loaded and not force:
+                return
+            log_status.text = "Loading logs..."
+            results = await gather(
+                run.io_bound(
+                    LOGS.fetch,
+                    task["task_id"],
+                    task.get("attempt_number") or 0,
+                    "out",
+                ),
+                run.io_bound(
+                    LOGS.fetch,
+                    task["task_id"],
+                    task.get("attempt_number") or 0,
+                    "err",
+                ),
+                return_exceptions=True,
+            )
+            messages = []
+            for label, result in zip((stdout, stderr), results, strict=True):
+                if isinstance(result, BaseException):
+                    label.text = str(result)
+                    label.classes(add="text-red-300")
+                    messages.append("Some logs could not be loaded")
+                else:
+                    label.text = result.rstrip() or "No output"
+                    label.classes(remove="text-red-300")
+            logs_loaded = True
+            log_status.text = messages[0] if messages else "Logs loaded"
+
+        async def load_selected_tab(event):
+            if event.value in (logs_tab, logs_tab._props["name"]):
+                await load_logs()
+
+        async def reload_logs():
+            await load_logs(force=True)
+
+        tabs.on_value_change(load_selected_tab)
+        refresh_logs.on_click(reload_logs)
     invocation_dialog.open()
 
 
@@ -266,19 +605,58 @@ cluster_refresh_running = False
 
 
 async def refresh_tasks():
-    global task_refresh_running, task_rows
+    global task_refresh_running
     if task_refresh_running:
         return
     task_refresh_running = True
-    await refresh_node_names()
     try:
-        snapshot = await run.io_bound(TASKS.fetch)
+        await update_tasks()
+    finally:
+        task_refresh_running = False
+
+
+async def update_tasks():
+    global last_full_task_refresh, task_rows
+    await refresh_node_names()
+    full_refresh = (
+        not last_full_task_refresh
+        or monotonic() - last_full_task_refresh >= FULL_TASK_REFRESH_SECONDS
+    )
+    try:
+        snapshot = await run.io_bound(
+            TASKS.fetch if full_refresh else TASKS.fetch_active
+        )
     except Exception as error:  # noqa: BLE001 - keep the dashboard alive if Ray is down
         task_error.text = str(error)
         task_error.set_visibility(True)
         return
-    finally:
-        task_refresh_running = False
+    if full_refresh:
+        last_full_task_refresh = monotonic()
+
+    incoming = list(snapshot.tasks)
+    final_warning = ""
+    if (
+        not full_refresh
+        and not snapshot.warning
+        and len(snapshot.tasks) >= snapshot.total
+    ):
+        previous_active = {
+            task_id
+            for task_id, task in task_rows.items()
+            if task.get("state") not in TERMINAL_STATES
+        }
+        active_ids = {task["task_id"] for task in incoming}
+        ended = previous_active - active_ids
+        if ended:
+            results = await gather(
+                *(run.io_bound(TASKS.fetch_task, task_id) for task_id in ended),
+                return_exceptions=True,
+            )
+            for result in results:
+                if isinstance(result, BaseException):
+                    final_warning = f"Final task state unavailable: {result}"
+                elif result:
+                    incoming.append(result)
 
     cache_warning = ""
     try:
@@ -287,28 +665,36 @@ async def refresh_tasks():
         statuses = {}
         cache_warning = f"Cache status unavailable: {error}"
 
-    tasks = add_cache_status(
-        [
+    displayed = []
+    for task in incoming:
+        duration_ms, duration = task_duration(
+            task.get("start_time_ms"), task.get("end_time_ms")
+        )
+        displayed.append(
             task
             | {
                 "node": node_label(task.get("node_id")),
-                "started": time_ago(task.get("start_time_ms")),
+                "duration_ms": duration_ms,
+                "duration": duration,
+                "created": time_ago(task.get("creation_time_ms")),
             }
-            for task in snapshot.tasks
-        ],
-        statuses,
-    )
+        )
+    incoming = add_cache_status(displayed, statuses)
+    merged = task_rows | {task["task_id"]: task for task in incoming}
+    tasks = limit_task_history(merged.values(), TASKS.limit)
     task_rows, transaction = task_transaction(task_rows, tasks)
     with task_grid.props.suspend_updates():
         task_grid.options["rowData"] = list(task_rows.values())
     if any(transaction.values()):
         task_grid.run_grid_method("applyTransaction", transaction)
     shown = len(snapshot.tasks)
+    scope = "tasks" if full_refresh else "active tasks"
     task_error.text = (
         snapshot.warning
+        or final_warning
         or cache_warning
         or (
-            f"Ray returned {shown:,} of {snapshot.total:,} tasks"
+            f"Ray returned {shown:,} of {snapshot.total:,} {scope}"
             if shown < snapshot.total
             else ""
         )
