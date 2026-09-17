@@ -103,7 +103,7 @@ TABLE_COLUMNS = (
         "cellStyle": {"display": "flex", "alignItems": "center"},
     },
     {
-        "field": "start_time_ms",
+        "field": "started",
         "headerName": "Started",
         "flex": 1.5,
         "minWidth": 180,
@@ -153,6 +153,21 @@ def add_cache_status(tasks, statuses):
         )
         for task in tasks
     ]
+
+
+def task_transaction(previous, tasks):
+    current = {task["task_id"]: task for task in tasks}
+    return current, {
+        "add": [task for task_id, task in current.items() if task_id not in previous],
+        "update": [
+            task
+            for task_id, task in current.items()
+            if task_id in previous and task != previous[task_id]
+        ],
+        "remove": [
+            task for task_id, task in previous.items() if task_id not in current
+        ],
+    }
 
 
 def parse_task_response(payload):
@@ -215,11 +230,5 @@ def time_ago(value):
         return value
 
 
-def task_columns(tasks):
-    columns = [column.copy() for column in TABLE_COLUMNS]
-    columns[-1]["refData"] = {
-        task["start_time_ms"]: time_ago(task["start_time_ms"])
-        for task in tasks
-        if task.get("start_time_ms")
-    }
-    return columns
+def task_columns():
+    return [column.copy() for column in TABLE_COLUMNS]

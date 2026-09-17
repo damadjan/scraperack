@@ -10,6 +10,8 @@ from ray_tasks import (
     RayTaskClient,
     add_cache_status,
     task_columns,
+    task_transaction,
+    time_ago,
 )
 
 CACHES = {
@@ -25,6 +27,7 @@ CACHE_STATUS = CacheStatusClient(
 NODES = RayNodeClient(os.getenv("RAY_DASHBOARD_URL", "http://control-plane:8265"))
 node_names = {}
 node_names_updated_at = 0.0
+task_rows = {}
 
 
 def size(value):
@@ -159,7 +162,8 @@ with (
         task_grid = (
             ui.aggrid(
                 {
-                    "columnDefs": task_columns([]),
+                    ":getRowId": "params => params.data.task_id",
+                    "columnDefs": task_columns(),
                     "rowData": [],
                     "defaultColDef": {
                         "sortable": True,
@@ -262,7 +266,7 @@ cluster_refresh_running = False
 
 
 async def refresh_tasks():
-    global task_refresh_running
+    global task_refresh_running, task_rows
     if task_refresh_running:
         return
     task_refresh_running = True
@@ -284,17 +288,21 @@ async def refresh_tasks():
         cache_warning = f"Cache status unavailable: {error}"
 
     tasks = add_cache_status(
-        [task | {"node": node_label(task.get("node_id"))} for task in snapshot.tasks],
+        [
+            task
+            | {
+                "node": node_label(task.get("node_id")),
+                "started": time_ago(task.get("start_time_ms")),
+            }
+            for task in snapshot.tasks
+        ],
         statuses,
     )
-    columns = task_columns(tasks)
-    if (
-        task_grid.options["columnDefs"] != columns
-        or task_grid.options["rowData"] != tasks
-    ):
-        task_grid.options["columnDefs"] = columns
-        task_grid.options["rowData"] = tasks
-        task_grid.update()
+    task_rows, transaction = task_transaction(task_rows, tasks)
+    with task_grid.props.suspend_updates():
+        task_grid.options["rowData"] = list(task_rows.values())
+    if any(transaction.values()):
+        task_grid.run_grid_method("applyTransaction", transaction)
     shown = len(snapshot.tasks)
     task_error.text = (
         snapshot.warning

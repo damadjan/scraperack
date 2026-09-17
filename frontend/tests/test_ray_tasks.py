@@ -9,6 +9,7 @@ from ray_tasks import (
     add_cache_status,
     parse_task_response,
     task_columns,
+    task_transaction,
     time_ago,
 )
 
@@ -112,16 +113,7 @@ class RayTaskClientTests(unittest.TestCase):
         self.assertEqual(tasks[1]["function_cache"], "unknown")
 
     def test_columns_only_include_compact_invocation_summary(self):
-        started = "1970-01-01T00:00:00.000+00:00"
-        columns = task_columns(
-            [
-                {
-                    "task_id": "one",
-                    "future_ray_field": "value",
-                    "start_time_ms": started,
-                }
-            ]
-        )
+        columns = task_columns()
 
         self.assertEqual(
             [column["field"] for column in columns],
@@ -131,10 +123,29 @@ class RayTaskClientTests(unittest.TestCase):
                 "node",
                 "function_cache",
                 "working_dir_cache",
-                "start_time_ms",
+                "started",
             ],
         )
-        self.assertEqual(columns[-1]["refData"][started], time_ago(started))
+
+    def test_transaction_only_contains_changed_rows(self):
+        unchanged = {"task_id": "one", "state": "FINISHED"}
+        changed = {"task_id": "two", "state": "RUNNING"}
+        removed = {"task_id": "three", "state": "FINISHED"}
+        added = {"task_id": "four", "state": "PENDING"}
+
+        current, transaction = task_transaction(
+            {
+                "one": unchanged,
+                "two": {"task_id": "two", "state": "PENDING"},
+                "three": removed,
+            },
+            [unchanged, changed, added],
+        )
+
+        self.assertEqual(set(current), {"one", "two", "four"})
+        self.assertEqual(transaction["add"], [added])
+        self.assertEqual(transaction["update"], [changed])
+        self.assertEqual(transaction["remove"], [removed])
 
     def test_time_ago_preserves_unexpected_values(self):
         self.assertEqual(time_ago("unknown"), "unknown")
