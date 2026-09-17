@@ -37,6 +37,21 @@ TASK_FIELDS = (
     "label_selector",
 )
 TIME_FIELDS = {"creation_time_ms", "start_time_ms", "end_time_ms"}
+CACHE_RENDERER = """params => {
+    const badge = document.createElement('span');
+    const value = (params.value || 'unknown').toUpperCase();
+    const colors = {
+        HIT: '#22c55e',
+        MISS: '#f59e0b',
+        DISABLED: '#a3a3a3',
+        NONE: '#a3a3a3',
+        UNKNOWN: '#a3a3a3',
+    };
+    badge.className = 'cache-status';
+    badge.style.color = colors[value];
+    badge.textContent = value === 'NONE' ? '—' : value;
+    return badge;
+}"""
 TABLE_COLUMNS = (
     {
         "field": "name",
@@ -72,6 +87,22 @@ TABLE_COLUMNS = (
         "tooltipField": "node_id",
     },
     {
+        "field": "function_cache",
+        "headerName": "Function Cache",
+        "width": 160,
+        "maxWidth": 160,
+        ":cellRenderer": CACHE_RENDERER,
+        "cellStyle": {"display": "flex", "alignItems": "center"},
+    },
+    {
+        "field": "working_dir_cache",
+        "headerName": "Working Dir Cache",
+        "width": 180,
+        "maxWidth": 180,
+        ":cellRenderer": CACHE_RENDERER,
+        "cellStyle": {"display": "flex", "alignItems": "center"},
+    },
+    {
         "field": "start_time_ms",
         "headerName": "Started",
         "flex": 1.5,
@@ -98,6 +129,30 @@ class RayTaskClient:
         request = Request(f"{self.url}?{query}", headers={"Accept": "application/json"})
         with urlopen(request, timeout=self.timeout) as response:
             return parse_task_response(json.load(response))
+
+
+class CacheStatusClient:
+    def __init__(self, gateway_url, timeout=5):
+        self.url = gateway_url.rstrip("/") + "/invocations/cache-status"
+        self.timeout = timeout
+
+    def fetch(self):
+        with urlopen(self.url, timeout=self.timeout) as response:
+            result = json.load(response)
+        if not isinstance(result, dict):
+            raise TypeError("ScrapeRack returned unexpected cache status data")
+        return result
+
+
+def add_cache_status(tasks, statuses):
+    return [
+        task
+        | statuses.get(
+            task.get("task_id"),
+            {"function_cache": "unknown", "working_dir_cache": "unknown"},
+        )
+        for task in tasks
+    ]
 
 
 def parse_task_response(payload):

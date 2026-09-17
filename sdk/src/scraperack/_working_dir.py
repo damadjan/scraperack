@@ -69,6 +69,7 @@ def _upload(address, directory, warning_bytes):
 
     try:
         urllib.request.urlopen(urllib.request.Request(url, method="HEAD")).close()
+        status = "hit"
     except urllib.error.HTTPError as error:
         if error.code != 404:
             raise RuntimeError(
@@ -87,6 +88,7 @@ def _upload(address, directory, warning_bytes):
                     method="PUT",
                 )
                 urllib.request.urlopen(request).close()
+                status = "miss"
         except urllib.error.HTTPError as upload_error:
             raise RuntimeError(
                 f"Cannot upload working_dir: HTTP {upload_error.code}"
@@ -104,7 +106,7 @@ def _upload(address, directory, warning_bytes):
 
     with _cache_lock:
         _cache[directory] = (snapshot, digest)
-    return digest
+    return digest, status
 
 
 def _files(directory):

@@ -8,7 +8,13 @@ from unittest.mock import patch
 
 import cloudpickle
 from fastapi.testclient import TestClient
-from scraperack_platform.app import CONTENT_TYPE, app, get_ray, pip_runtime_env
+from scraperack_platform.app import (
+    CONTENT_TYPE,
+    app,
+    get_ray,
+    invocation_cache_status,
+    pip_runtime_env,
+)
 from scraperack_platform.function_cache import enabled as function_cache_enabled
 
 
@@ -30,13 +36,34 @@ class RemoteFunction:
         return self
 
     def remote(self, *args, **kwargs):
-        return self.function, args, kwargs
+        self.ray.task_count += 1
+        return FakeReference(
+            (self.function, args, kwargs), f"{self.ray.task_count:064x}"
+        )
+
+
+class FakeTaskID:
+    def __init__(self, value):
+        self.value = value
+
+    def hex(self):
+        return self.value
+
+
+class FakeReference:
+    def __init__(self, value, task_id):
+        self.value = value
+        self._task_id = FakeTaskID(task_id)
+
+    def task_id(self):
+        return self._task_id
 
 
 class FakeRay:
     def __init__(self):
         self.health_checks = 0
         self.options = None
+        self.task_count = 0
 
     def nodes(self):
         self.health_checks += 1
@@ -46,7 +73,7 @@ class FakeRay:
         return RemoteFunction(function, self)
 
     def get(self, reference):
-        function, args, kwargs = reference
+        function, args, kwargs = reference.value
         return function(*args, **kwargs)
 
 
@@ -67,6 +94,7 @@ class PlatformTests(unittest.TestCase):
         )
         self.environment.start()
         self.ray = FakeRay()
+        invocation_cache_status.clear()
         app.dependency_overrides[get_ray] = lambda: self.ray
         self.client = TestClient(app)
 
@@ -75,7 +103,15 @@ class PlatformTests(unittest.TestCase):
         self.environment.stop()
         self.cache.cleanup()
 
-    def invoke(self, function, *args, requirements=None, working_dir=None, **kwargs):
+    def invoke(
+        self,
+        function,
+        *args,
+        requirements=None,
+        working_dir=None,
+        cache=None,
+        **kwargs,
+    ):
         return self.client.post(
             "/invoke",
             content=cloudpickle.dumps(
@@ -88,6 +124,7 @@ class PlatformTests(unittest.TestCase):
                     "arguments": cloudpickle.dumps((args, kwargs)),
                     "requirements": requirements or [],
                     "working_dir": working_dir,
+                    "cache": cache or {},
                 }
             ),
             headers={"content-type": CONTENT_TYPE},
@@ -138,6 +175,30 @@ class PlatformTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(self.result(response), {"ok": True, "value": 7})
         self.assertIsNone(self.ray.options)
+
+    def test_invocation_cache_status_is_exposed_by_ray_task_id(self):
+        response = self.invoke(
+            add,
+            1,
+            2,
+            cache={"function": "disabled", "working_dir": "none"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            self.client.get("/invocations/cache-status").json(),
+            {
+                f"{1:064x}": {
+                    "function_cache": "disabled",
+                    "working_dir_cache": "none",
+                }
+            },
+        )
+
+    def test_invalid_invocation_cache_status_is_rejected(self):
+        response = self.invoke(add, 1, cache={"function": "maybe"})
+
+        self.assertEqual(response.status_code, 400)
 
     def test_function_is_cached_and_invoked_by_digest(self):
         digest, body, first = self.upload_function(add)

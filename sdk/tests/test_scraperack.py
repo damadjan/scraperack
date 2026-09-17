@@ -47,7 +47,7 @@ class ScrapeRackTests(unittest.TestCase):
         scraperack.configure("http://gateway.test/")
         self.function_cache = patch(
             "scraperack.prepare_function",
-            side_effect=lambda _, target: cloudpickle.dumps(target),
+            side_effect=lambda _, target: (cloudpickle.dumps(target), "disabled"),
         )
         self.function_cache.start()
         _working_dir._cache.clear()
@@ -77,6 +77,10 @@ class ScrapeRackTests(unittest.TestCase):
         self.assertEqual(kwargs, {"right": 4})
         self.assertEqual(invocation["requirements"], ["example==1.2.3"])
         self.assertIsNone(invocation["working_dir"])
+        self.assertEqual(
+            invocation["cache"],
+            {"function": "disabled", "working_dir": "none"},
+        )
 
     @patch("scraperack.urllib.request.urlopen")
     def test_working_dir_is_uploaded_and_referenced(self, urlopen):
@@ -106,6 +110,7 @@ class ScrapeRackTests(unittest.TestCase):
         invocation = cloudpickle.loads(uploaded["invocation"])
         self.assertEqual(result, 3)
         self.assertRegex(invocation["working_dir"], r"^[0-9a-f]{64}$")
+        self.assertEqual(invocation["cache"]["working_dir"], "miss")
         with zipfile.ZipFile(io.BytesIO(uploaded["archive"])) as archive:
             self.assertEqual(archive.namelist(), ["module.py"])
 
@@ -237,9 +242,10 @@ class ScrapeRackTests(unittest.TestCase):
 
         urlopen.side_effect = response
 
-        reference = _function_cache.prepare("http://gateway.test", add)
+        reference, status = _function_cache.prepare("http://gateway.test", add)
 
         self.assertEqual(reference, hashlib.sha256(uploaded["function"]).hexdigest())
+        self.assertEqual(status, "miss")
         self.assertEqual(
             [call.args[0].get_method() for call in urlopen.call_args_list],
             ["HEAD", "PUT"],
@@ -249,9 +255,10 @@ class ScrapeRackTests(unittest.TestCase):
     def test_cached_function_is_not_uploaded_again(self, urlopen):
         urlopen.return_value = FakeResponse(b"")
 
-        reference = _function_cache.prepare("http://gateway.test", add)
+        reference, status = _function_cache.prepare("http://gateway.test", add)
 
         self.assertRegex(reference, r"^[0-9a-f]{64}$")
+        self.assertEqual(status, "hit")
         self.assertEqual(urlopen.call_count, 1)
         self.assertEqual(urlopen.call_args.args[0].get_method(), "HEAD")
 
@@ -259,9 +266,10 @@ class ScrapeRackTests(unittest.TestCase):
     def test_disabled_function_cache_sends_function_inline(self, urlopen):
         urlopen.return_value = FakeResponse(b"", status=204)
 
-        reference = _function_cache.prepare("http://gateway.test", add)
+        reference, status = _function_cache.prepare("http://gateway.test", add)
 
         self.assertEqual(cloudpickle.loads(reference)(2, 3), 5)
+        self.assertEqual(status, "disabled")
         self.assertEqual(urlopen.call_count, 1)
 
 

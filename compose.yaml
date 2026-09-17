@@ -80,6 +80,7 @@ services:
     environment:
       PIP_CACHE_DIR: /cache/pip
       RAY_DASHBOARD_URL: http://control-plane:8265
+      SCRAPERACK_GATEWAY_URL: http://gateway:8080
       SCRAPERACK_WORKING_DIR_CACHE: /cache/working-dirs
     volumes:
       - pip-cache:/cache/pip:ro
@@ -88,6 +89,8 @@ services:
       - ${SCRAPERACK_BIND_ADDRESS:-127.0.0.1}:${SCRAPERACK_DASHBOARD_PORT:-9987}:9987
     depends_on:
       control-plane:
+        condition: service_healthy
+      gateway:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9987/')"]

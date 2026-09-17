@@ -4,7 +4,13 @@ from time import monotonic
 from cache_monitor import CacheMonitor
 from nicegui import run, ui
 from ray_nodes import RayNodeClient, node_columns
-from ray_tasks import TASK_FIELDS, RayTaskClient, task_columns
+from ray_tasks import (
+    TASK_FIELDS,
+    CacheStatusClient,
+    RayTaskClient,
+    add_cache_status,
+    task_columns,
+)
 
 CACHES = {
     "Working directories": CacheMonitor(
@@ -13,6 +19,9 @@ CACHES = {
     "Pip downloads": CacheMonitor(os.getenv("PIP_CACHE_DIR", "/cache/pip")),
 }
 TASKS = RayTaskClient(os.getenv("RAY_DASHBOARD_URL", "http://control-plane:8265"))
+CACHE_STATUS = CacheStatusClient(
+    os.getenv("SCRAPERACK_GATEWAY_URL", "http://127.0.0.1:42800")
+)
 NODES = RayNodeClient(os.getenv("RAY_DASHBOARD_URL", "http://control-plane:8265"))
 node_names = {}
 node_names_updated_at = 0.0
@@ -39,6 +48,16 @@ ui.add_css("""
 .nicegui-content { padding: 0 !important; }
 .cache-card { background: #171717; border: 1px solid #303030; box-shadow: none; }
 .invocation-state {
+    display: inline-flex;
+    align-items: center;
+    border: 1px solid currentColor;
+    border-radius: 9999px;
+    padding: 2px 8px;
+    font-size: 12px;
+    font-weight: 500;
+    line-height: 1.25;
+}
+.cache-status {
     display: inline-flex;
     align-items: center;
     border: 1px solid currentColor;
@@ -257,9 +276,17 @@ async def refresh_tasks():
     finally:
         task_refresh_running = False
 
-    tasks = [
-        task | {"node": node_label(task.get("node_id"))} for task in snapshot.tasks
-    ]
+    cache_warning = ""
+    try:
+        statuses = await run.io_bound(CACHE_STATUS.fetch)
+    except Exception as error:  # noqa: BLE001 - Ray data remains useful without it
+        statuses = {}
+        cache_warning = f"Cache status unavailable: {error}"
+
+    tasks = add_cache_status(
+        [task | {"node": node_label(task.get("node_id"))} for task in snapshot.tasks],
+        statuses,
+    )
     columns = task_columns(tasks)
     if (
         task_grid.options["columnDefs"] != columns
@@ -269,10 +296,14 @@ async def refresh_tasks():
         task_grid.options["rowData"] = tasks
         task_grid.update()
     shown = len(snapshot.tasks)
-    task_error.text = snapshot.warning or (
-        f"Ray returned {shown:,} of {snapshot.total:,} tasks"
-        if shown < snapshot.total
-        else ""
+    task_error.text = (
+        snapshot.warning
+        or cache_warning
+        or (
+            f"Ray returned {shown:,} of {snapshot.total:,} tasks"
+            if shown < snapshot.total
+            else ""
+        )
     )
     task_error.set_visibility(bool(task_error.text))
 

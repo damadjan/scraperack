@@ -15,7 +15,7 @@ def prepare(address, target):
             urllib.request.Request(url, method="HEAD")
         ) as response:
             if response.status == 204:
-                return function
+                return function, "disabled"
     except urllib.error.HTTPError as error:
         if error.code != 404:
             raise RuntimeError(
@@ -38,9 +38,10 @@ def prepare(address, target):
             raise RuntimeError(
                 f"Cannot reach ScrapeRack at {address}: {upload_error.reason}"
             ) from upload_error
+        return digest, "miss"
     except urllib.error.URLError as error:
         raise RuntimeError(
             f"Cannot reach ScrapeRack at {address}: {error.reason}"
         ) from error
 
-    return digest
+    return digest, "hit"

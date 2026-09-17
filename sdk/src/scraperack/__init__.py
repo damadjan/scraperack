@@ -41,10 +41,13 @@ def configure(
 
 
 def invoke(target, requirements, working_dir, *args, **kwargs):
-    function = prepare_function(_address, target)
+    function, function_cache = prepare_function(_address, target)
     warning_bytes = _working_dir_warning_bytes if _working_dir_warning else None
-    working_dir_digest = (
+    prepared_working_dir = (
         upload(_address, working_dir, warning_bytes) if working_dir else None
+    )
+    working_dir_digest, working_dir_cache = (
+        prepared_working_dir if prepared_working_dir else (None, "none")
     )
     payload = cloudpickle.dumps(
         {
@@ -52,6 +55,10 @@ def invoke(target, requirements, working_dir, *args, **kwargs):
             "arguments": cloudpickle.dumps((args, kwargs)),
             "requirements": list(requirements),
             "working_dir": working_dir_digest,
+            "cache": {
+                "function": function_cache,
+                "working_dir": working_dir_cache,
+            },
         }
     )
     request = urllib.request.Request(

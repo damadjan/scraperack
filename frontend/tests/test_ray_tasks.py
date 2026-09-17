@@ -3,7 +3,14 @@ import json
 import unittest
 from unittest.mock import patch
 
-from ray_tasks import RayTaskClient, parse_task_response, task_columns, time_ago
+from ray_tasks import (
+    CacheStatusClient,
+    RayTaskClient,
+    add_cache_status,
+    parse_task_response,
+    task_columns,
+    time_ago,
+)
 
 
 class Response(io.BytesIO):
@@ -68,6 +75,42 @@ class RayTaskClientTests(unittest.TestCase):
         self.assertIn("detail=1", request.full_url)
         self.assertIn("limit=10000", request.full_url)
 
+    @patch("ray_tasks.urlopen")
+    def test_fetches_cache_statuses_in_one_request(self, urlopen):
+        urlopen.return_value = Response(
+            json.dumps(
+                {
+                    "task-1": {
+                        "function_cache": "hit",
+                        "working_dir_cache": "miss",
+                    }
+                }
+            ).encode()
+        )
+
+        statuses = CacheStatusClient("http://gateway:8080/").fetch()
+
+        self.assertEqual(statuses["task-1"]["function_cache"], "hit")
+        self.assertEqual(
+            urlopen.call_args.args[0],
+            "http://gateway:8080/invocations/cache-status",
+        )
+
+    def test_adds_cache_statuses_to_matching_tasks(self):
+        tasks = add_cache_status(
+            [{"task_id": "task-1"}, {"task_id": "older-task"}],
+            {
+                "task-1": {
+                    "function_cache": "hit",
+                    "working_dir_cache": "miss",
+                }
+            },
+        )
+
+        self.assertEqual(tasks[0]["function_cache"], "hit")
+        self.assertEqual(tasks[0]["working_dir_cache"], "miss")
+        self.assertEqual(tasks[1]["function_cache"], "unknown")
+
     def test_columns_only_include_compact_invocation_summary(self):
         started = "1970-01-01T00:00:00.000+00:00"
         columns = task_columns(
@@ -86,6 +129,8 @@ class RayTaskClientTests(unittest.TestCase):
                 "name",
                 "state",
                 "node",
+                "function_cache",
+                "working_dir_cache",
                 "start_time_ms",
             ],
         )
