@@ -6,6 +6,7 @@ from functools import update_wrapper
 
 import cloudpickle
 
+from scraperack._function_cache import prepare as prepare_function
 from scraperack._working_dir import resolve, upload
 
 CONTENT_TYPE = "application/vnd.scraperack.function"
@@ -40,13 +41,14 @@ def configure(
 
 
 def invoke(target, requirements, working_dir, *args, **kwargs):
+    function = prepare_function(_address, target)
     warning_bytes = _working_dir_warning_bytes if _working_dir_warning else None
     working_dir_digest = (
         upload(_address, working_dir, warning_bytes) if working_dir else None
     )
     payload = cloudpickle.dumps(
         {
-            "function": cloudpickle.dumps(target),
+            "function": function,
             "arguments": cloudpickle.dumps((args, kwargs)),
             "requirements": list(requirements),
             "working_dir": working_dir_digest,

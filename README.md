@@ -79,6 +79,8 @@ The call is synchronous. ScrapeRack opens one HTTP request, runs one Ray task on
 python examples/single_call.py
 ```
 
+The SDK hashes each serialized function and uploads it only when that version is missing from the gateway. Cached functions are stored in the persistent `function-cache` volume. Set `SCRAPERACK_FUNCTION_CACHING=false` on the gateway to send functions inline instead; caching is enabled by default.
+
 Set `SCRAPERACK_ADDRESS` before importing the SDK when the gateway is not local, or configure it in code:
 
 ```python

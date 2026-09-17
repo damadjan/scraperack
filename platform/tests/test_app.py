@@ -9,6 +9,7 @@ from unittest.mock import patch
 import cloudpickle
 from fastapi.testclient import TestClient
 from scraperack_platform.app import CONTENT_TYPE, app, get_ray, pip_runtime_env
+from scraperack_platform.function_cache import enabled as function_cache_enabled
 
 
 def add(left, right=0):
@@ -56,7 +57,11 @@ class PlatformTests(unittest.TestCase):
             os.environ,
             {
                 "RAY_PIP_CACHING": "false",
-                "SCRAPERACK_WORKING_DIR_CACHE": self.cache.name,
+                "SCRAPERACK_FUNCTION_CACHING": "true",
+                "SCRAPERACK_FUNCTION_CACHE": os.path.join(self.cache.name, "functions"),
+                "SCRAPERACK_WORKING_DIR_CACHE": os.path.join(
+                    self.cache.name, "working-dirs"
+                ),
                 "SCRAPERACK_WORKING_DIR_BASE_URL": "http://gateway:8080/working-dirs",
             },
         )
@@ -75,7 +80,11 @@ class PlatformTests(unittest.TestCase):
             "/invoke",
             content=cloudpickle.dumps(
                 {
-                    "function": cloudpickle.dumps(function),
+                    "function": (
+                        function
+                        if isinstance(function, str)
+                        else cloudpickle.dumps(function)
+                    ),
                     "arguments": cloudpickle.dumps((args, kwargs)),
                     "requirements": requirements or [],
                     "working_dir": working_dir,
@@ -110,6 +119,12 @@ class PlatformTests(unittest.TestCase):
         )
         return value, body.getvalue(), response
 
+    def upload_function(self, function):
+        body = cloudpickle.dumps(function)
+        digest = hashlib.sha256(body).hexdigest()
+        response = self.client.put(f"/functions/{digest}", content=body)
+        return digest, body, response
+
     def test_health_checks_ray(self):
         response = self.client.get("/health")
 
@@ -123,6 +138,45 @@ class PlatformTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(self.result(response), {"ok": True, "value": 7})
         self.assertIsNone(self.ray.options)
+
+    def test_function_is_cached_and_invoked_by_digest(self):
+        digest, body, first = self.upload_function(add)
+
+        second = self.client.put(f"/functions/{digest}", content=body)
+        response = self.invoke(digest, 3, right=4)
+
+        self.assertEqual(first.status_code, 201)
+        self.assertEqual(second.status_code, 204)
+        self.assertEqual(self.client.head(f"/functions/{digest}").status_code, 200)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.result(response), {"ok": True, "value": 7})
+
+    def test_function_digest_is_verified(self):
+        response = self.client.put(f"/functions/{'0' * 64}", content=b"wrong")
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_missing_cached_function_is_rejected(self):
+        response = self.invoke("0" * 64, 1)
+
+        self.assertEqual(response.status_code, 400)
+
+    @patch.dict(os.environ, {"SCRAPERACK_FUNCTION_CACHING": "false"})
+    def test_function_cache_can_be_disabled(self):
+        digest = "0" * 64
+
+        self.assertEqual(self.client.head(f"/functions/{digest}").status_code, 204)
+        self.assertEqual(self.client.put(f"/functions/{digest}").status_code, 409)
+        self.assertEqual(self.invoke(add, 1, 2).status_code, 200)
+
+    @patch.dict(os.environ, {"SCRAPERACK_FUNCTION_CACHING": "maybe"})
+    def test_function_cache_configuration_must_be_valid(self):
+        with self.assertRaisesRegex(RuntimeError, "must be set to true or false"):
+            self.client.get("/health")
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_function_cache_is_enabled_by_default(self):
+        self.assertTrue(function_cache_enabled())
 
     def test_requirements_are_passed_to_ray_runtime_environment(self):
         response = self.invoke(
