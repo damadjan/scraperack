@@ -67,6 +67,25 @@ services:
       control-plane:
         condition: service_healthy
 
+  dashboard:
+    image: ${SCRAPERACK_DASHBOARD_IMAGE:-scraperack-dashboard:dev}
+    build:
+      context: frontend
+    pull_policy: ${SCRAPERACK_PULL_POLICY:-build}
+    environment:
+      PIP_CACHE_DIR: /cache/pip
+      SCRAPERACK_WORKING_DIR_CACHE: /cache/working-dirs
+    volumes:
+      - pip-cache:/cache/pip:ro
+      - working-dir-cache:/cache/working-dirs:ro
+    ports:
+      - ${SCRAPERACK_BIND_ADDRESS:-127.0.0.1}:${SCRAPERACK_DASHBOARD_PORT:-9987}:9987
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9987/')"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
 volumes:
   pip-cache:
   working-dir-cache:
