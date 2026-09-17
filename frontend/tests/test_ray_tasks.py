@@ -158,18 +158,36 @@ class RayTaskClientTests(unittest.TestCase):
 
     def test_adds_cache_statuses_to_matching_tasks(self):
         tasks = add_cache_status(
-            [{"task_id": "task-1"}, {"task_id": "older-task"}],
+            [
+                {"task_id": "task-1", "name": "linkedin-jobs/scrape_profile"},
+                {"task_id": "older-task", "name": "old_function"},
+            ],
             {
                 "task-1": {
                     "function_cache": "hit",
                     "working_dir_cache": "miss",
+                    "function_name": "scrape_profile",
+                    "project": "linkedin-jobs",
                 }
             },
         )
 
         self.assertEqual(tasks[0]["function_cache"], "hit")
         self.assertEqual(tasks[0]["working_dir_cache"], "miss")
+        self.assertEqual(tasks[0]["function_name"], "scrape_profile")
+        self.assertEqual(tasks[0]["project"], "linkedin-jobs")
         self.assertEqual(tasks[1]["function_cache"], "unknown")
+        self.assertEqual(tasks[1]["function_name"], "old_function")
+        self.assertEqual(tasks[1]["project"], "—")
+
+    def test_recovers_project_and_function_from_ray_name(self):
+        tasks = add_cache_status(
+            [{"task_id": "task-1", "name": "linkedin-jobs/scrape_profile"}],
+            {},
+        )
+
+        self.assertEqual(tasks[0]["project"], "linkedin-jobs")
+        self.assertEqual(tasks[0]["function_name"], "scrape_profile")
 
     def test_columns_only_include_compact_invocation_summary(self):
         columns = task_columns()
@@ -177,7 +195,8 @@ class RayTaskClientTests(unittest.TestCase):
         self.assertEqual(
             [column["field"] for column in columns],
             [
-                "name",
+                "function_name",
+                "project",
                 "state",
                 "node",
                 "function_cache",

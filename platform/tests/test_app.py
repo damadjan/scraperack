@@ -110,6 +110,8 @@ class PlatformTests(unittest.TestCase):
         requirements=None,
         working_dir=None,
         cache=None,
+        project=None,
+        function_name=None,
         **kwargs,
     ):
         return self.client.post(
@@ -121,6 +123,8 @@ class PlatformTests(unittest.TestCase):
                         if isinstance(function, str)
                         else cloudpickle.dumps(function)
                     ),
+                    "function_name": function_name or getattr(function, "__name__", None),
+                    "project": project,
                     "arguments": cloudpickle.dumps((args, kwargs)),
                     "requirements": requirements or [],
                     "working_dir": working_dir,
@@ -174,7 +178,7 @@ class PlatformTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(self.result(response), {"ok": True, "value": 7})
-        self.assertIsNone(self.ray.options)
+        self.assertEqual(self.ray.options, {"name": "add"})
 
     def test_invocation_cache_status_is_exposed_by_ray_task_id(self):
         response = self.invoke(
@@ -191,9 +195,22 @@ class PlatformTests(unittest.TestCase):
                 f"{1:064x}": {
                     "function_cache": "disabled",
                     "working_dir_cache": "none",
+                    "function_name": "add",
+                    "project": None,
                 }
             },
         )
+
+    def test_project_and_function_name_set_ray_task_name(self):
+        response = self.invoke(add, 1, 2, project="linkedin-jobs")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.ray.options, {"name": "linkedin-jobs/add"})
+
+    def test_invalid_project_is_rejected(self):
+        response = self.invoke(add, 1, project="LinkedIn_Jobs")
+
+        self.assertEqual(response.status_code, 400)
 
     def test_invalid_invocation_cache_status_is_rejected(self):
         response = self.invoke(add, 1, cache={"function": "maybe"})
@@ -250,7 +267,12 @@ class PlatformTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(
             self.ray.options,
-            {"runtime_env": {"pip": ["requests==2.32.5", "beautifulsoup4==4.13.4"]}},
+            {
+                "name": "add",
+                "runtime_env": {
+                    "pip": ["requests==2.32.5", "beautifulsoup4==4.13.4"]
+                },
+            },
         )
 
     def test_working_dir_is_stored_and_passed_to_ray(self):
@@ -277,6 +299,7 @@ class PlatformTests(unittest.TestCase):
         self.assertEqual(
             self.ray.options,
             {
+                "name": "add",
                 "runtime_env": {
                     "pip": ["example==1.2.3"],
                     "working_dir": f"http://gateway:8080/working-dirs/{digest}.zip",
@@ -312,6 +335,7 @@ class PlatformTests(unittest.TestCase):
         self.assertEqual(
             self.ray.options,
             {
+                "name": "add",
                 "runtime_env": {
                     "pip": {
                         "packages": ["requests==2.32.5"],

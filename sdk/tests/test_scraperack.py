@@ -76,6 +76,8 @@ class ScrapeRackTests(unittest.TestCase):
         self.assertEqual(args, (3,))
         self.assertEqual(kwargs, {"right": 4})
         self.assertEqual(invocation["requirements"], ["example==1.2.3"])
+        self.assertEqual(invocation["function_name"], "add")
+        self.assertIsNone(invocation["project"])
         self.assertIsNone(invocation["working_dir"])
         self.assertEqual(
             invocation["cache"],
@@ -164,6 +166,28 @@ class ScrapeRackTests(unittest.TestCase):
             scraperack.configure("http://gateway.test", working_dir_warning="yes")
         with self.assertRaisesRegex(TypeError, "working_dir_warning_bytes"):
             scraperack.configure("http://gateway.test", working_dir_warning_bytes=-1)
+
+    @patch("scraperack.urllib.request.urlopen")
+    def test_project_is_sent_with_python_function_name(self, urlopen):
+        urlopen.return_value = FakeResponse(
+            cloudpickle.dumps({"ok": True, "value": cloudpickle.dumps(5)})
+        )
+        scraperack.configure("http://gateway.test", project="linkedin-jobs")
+
+        scraperack.function(add)(2, 3)
+
+        invocation = cloudpickle.loads(urlopen.call_args.args[0].data)
+        self.assertEqual(invocation["project"], "linkedin-jobs")
+        self.assertEqual(invocation["function_name"], "add")
+
+    def test_project_must_be_a_slug(self):
+        for project in ("LinkedIn", "linkedin_jobs", "linkedin jobs", "a--b", "-a"):
+            with self.subTest(project=project), self.assertRaisesRegex(
+                ValueError, "lowercase letters"
+            ):
+                scraperack.configure("http://gateway.test", project=project)
+        with self.assertRaisesRegex(TypeError, "project"):
+            scraperack.configure("http://gateway.test", project=1)
 
     @patch("scraperack.urllib.request.urlopen")
     def test_remote_error_includes_remote_traceback(self, urlopen):

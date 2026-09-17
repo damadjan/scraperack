@@ -1,4 +1,5 @@
 import os
+import re
 import traceback
 import uuid
 from collections import OrderedDict
@@ -17,6 +18,7 @@ from scraperack_platform.runner import run
 from scraperack_platform.working_dirs import path_for, url_for, validate
 
 CONTENT_TYPE = "application/vnd.scraperack.function"
+PROJECT_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 connection_lock = Lock()
 invocation_lock = Lock()
 invocation_cache_status = OrderedDict()
@@ -175,12 +177,24 @@ def invoke(
     try:
         invocation = cloudpickle.loads(payload)
         function = invocation["function"]
+        function_name = invocation.get("function_name")
+        project = invocation.get("project")
         arguments = invocation["arguments"]
         requirements = invocation["requirements"]
         working_dir = invocation.get("working_dir")
         cache_status = invocation.get("cache", {})
         if (
             not isinstance(function, (bytes, str))
+            or (
+                function_name is not None
+                and (
+                    not isinstance(function_name, str)
+                    or not function_name
+                    or "/" in function_name
+                )
+            )
+            or (project is not None and not PROJECT_PATTERN.fullmatch(project))
+            or (project is not None and function_name is None)
             or not isinstance(arguments, bytes)
             or not isinstance(requirements, list)
             or any(
@@ -196,6 +210,8 @@ def invoke(
             "working_dir_cache": cache_status.get(
                 "working_dir", "none" if working_dir is None else "unknown"
             ),
+            "function_name": function_name,
+            "project": project,
         }
         if cache_status["function_cache"] not in {
             "hit",
@@ -223,8 +239,15 @@ def invoke(
     try:
         remote = ray.remote(run)
         environment = runtime_env(requirements, working_dir)
+        options = {}
+        if function_name:
+            options["name"] = (
+                f"{project}/{function_name}" if project else function_name
+            )
         if environment:
-            remote = remote.options(runtime_env=environment)
+            options["runtime_env"] = environment
+        if options:
+            remote = remote.options(**options)
         reference = remote.remote(function, arguments)
         remember_cache_status(reference.task_id().hex(), cache_status)
         result = ray.get(reference)

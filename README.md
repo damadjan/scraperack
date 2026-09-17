@@ -87,6 +87,17 @@ Set `SCRAPERACK_ADDRESS` before importing the SDK when the gateway is not local,
 scraperack.configure("http://scraperack.example:42800")
 ```
 
+Optionally organize invocations by project. Project names may contain lowercase
+English letters, numbers, and single dashes. ScrapeRack uses the decorated Python
+function's name automatically.
+
+```python
+scraperack.configure(
+    "http://scraperack.example:42800",
+    project="linkedin-jobs",
+)
+```
+
 The SDK warns by default when the included `working_dir` files exceed 5 MiB. Configure or disable that warning centrally:
 
 ```python
