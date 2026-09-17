@@ -241,9 +241,7 @@ def invoke(
         environment = runtime_env(requirements, working_dir)
         options = {}
         if function_name:
-            options["name"] = (
-                f"{project}/{function_name}" if project else function_name
-            )
+            options["name"] = f"{project}/{function_name}" if project else function_name
         if environment:
             options["runtime_env"] = environment
         if options:
