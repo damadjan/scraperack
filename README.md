@@ -133,12 +133,21 @@ GitHub Actions builds the shared gateway, control-plane, and node image and the 
 ## Tests
 
 ```powershell
-python -m pip install -r platform/requirements-dev.txt -r frontend/requirements.txt -e sdk
-python -m unittest discover -s sdk/tests -v
-python -m unittest discover -s platform/tests -t platform -v
-python -m unittest discover -s frontend/tests -t frontend -v
-ruff check sdk platform frontend examples
-ruff format --check sdk platform frontend examples
+.venv\Scripts\python -m pip install -r platform/requirements-dev.txt -e sdk
+.venv\Scripts\python -m unittest discover -s sdk/tests -v
+.venv\Scripts\python -m unittest discover -s platform/tests -t platform -v
+.venv\Scripts\ruff check sdk platform examples
+.venv\Scripts\ruff format --check sdk platform examples
 $env:RAY_PIP_CACHING="true"
 docker compose config --quiet
+```
+
+The dashboard uses a separate environment because it is deployed in a separate image:
+
+```powershell
+python -m venv .venv-dashboard
+.venv-dashboard\Scripts\python -m pip install -r frontend/requirements-dev.txt
+.venv-dashboard\Scripts\python -m unittest discover -s frontend/tests -t frontend -v
+.venv-dashboard\Scripts\ruff check frontend
+.venv-dashboard\Scripts\ruff format --check frontend
 ```
