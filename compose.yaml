@@ -22,6 +22,8 @@ services:
       - --num-cpus=0
       - --object-store-memory=104857600
       - --block
+    ports:
+      - ${SCRAPERACK_BIND_ADDRESS:-127.0.0.1}:${RAY_DASHBOARD_PORT:-8265}:8265
     healthcheck:
       test: ["CMD", "ray", "health-check", "--address=127.0.0.1:6379"]
       interval: 5s
@@ -74,12 +76,16 @@ services:
     pull_policy: ${SCRAPERACK_PULL_POLICY:-build}
     environment:
       PIP_CACHE_DIR: /cache/pip
+      RAY_DASHBOARD_URL: http://control-plane:8265
       SCRAPERACK_WORKING_DIR_CACHE: /cache/working-dirs
     volumes:
       - pip-cache:/cache/pip:ro
       - working-dir-cache:/cache/working-dirs:ro
     ports:
       - ${SCRAPERACK_BIND_ADDRESS:-127.0.0.1}:${SCRAPERACK_DASHBOARD_PORT:-9987}:9987
+    depends_on:
+      control-plane:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9987/')"]
       interval: 5s
