@@ -1,0 +1,201 @@
+#!/usr/bin/python3
+import fcntl
+import json
+import os
+import socket
+import struct
+import subprocess
+import time
+import traceback
+from pathlib import Path
+
+EXECUTOR = Path("/opt/scraperack/executors/python")
+EXECUTOR_SOCKET = Path("/tmp/scraperack-executor.sock")
+ENVIRONMENT_PYTHON = Path("/tmp/environment/bin/python")
+SERVICE = Path("/etc/scraperack-service.json")
+
+
+def configure_network(payload):
+    interface = b"eth0"
+    control = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    ifreq = struct.pack("16sh22x", interface, 0)
+    flags = struct.unpack("16sh22x", fcntl.ioctl(control, 0x8913, ifreq))[1]
+    fcntl.ioctl(control, 0x8914, struct.pack("16sh22x", interface, flags | 1))
+    for operation, address in ((0x8916, payload["address"]),
+                               (0x891c, str(ipv4_mask(payload["prefix"])))):
+        request = struct.pack(
+            "16sH2s4s16s",
+            interface,
+            socket.AF_INET,
+            b"\0\0",
+            socket.inet_aton(address),
+            b"\0" * 16,
+        )
+        fcntl.ioctl(control, operation, request)
+    route = struct.pack("BBBBBBBBI", socket.AF_INET, 0, 0, 0, 254, 4, 0, 1, 0)
+    route += netlink_attr(5, socket.inet_aton(payload["gateway"]))
+    route += netlink_attr(4, struct.pack("I", socket.if_nametoindex("eth0")))
+    message = struct.pack("IHHII", 16 + len(route), 24, 0x505, 1, 0) + route
+    with socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, socket.NETLINK_ROUTE) as netlink:
+        netlink.send(message)
+        response = netlink.recv(4096)
+    _, kind, _, _, _ = struct.unpack("IHHII", response[:16])
+    if kind == 2:
+        error = struct.unpack("i", response[16:20])[0]
+        if error:
+            raise OSError(-error, os.strerror(-error))
+    resolv = Path("/tmp/resolv.conf")
+    resolv.write_text("".join(f"nameserver {server}\n" for server in payload["dns"]))
+    subprocess.run(["mount", "--bind", resolv, "/etc/resolv.conf"], check=True)
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+        probe.sendto(b"\0", (payload["gateway"], 9))
+        for server in payload["dns"]:
+            probe.sendto(b"\0", (server, 53))
+    time.sleep(.05)
+
+
+def ipv4_mask(prefix):
+    return socket.inet_ntoa(struct.pack("!I", (0xffffffff << (32 - prefix)) & 0xffffffff))
+
+
+def netlink_attr(kind, value):
+    length = 4 + len(value)
+    return struct.pack("HH", length, kind) + value + b"\0" * ((-length) % 4)
+
+
+def start_executor():
+    global executor_connection, executor_process
+    if not EXECUTOR.is_file() or not os.access(EXECUTOR, os.X_OK):
+        return None
+    EXECUTOR_SOCKET.unlink(missing_ok=True)
+    command = [ENVIRONMENT_PYTHON, EXECUTOR] if ENVIRONMENT_PYTHON.is_file() else [EXECUTOR]
+    executor_process = subprocess.Popen(command, stdin=subprocess.DEVNULL,
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    executor_connection = None
+    return executor_process
+
+
+def receive(connection, size):
+    data = b""
+    while len(data) < size:
+        chunk = connection.recv(size - len(data))
+        if not chunk:
+            raise RuntimeError("executor closed the connection")
+        data += chunk
+    return data
+
+
+def connect_executor():
+    global executor_connection
+    if executor_process is None or executor_process.poll() is not None:
+        start_executor()
+    if executor_process is None:
+        raise RuntimeError("image has no executor")
+    deadline = time.monotonic() + 10
+    while True:
+        try:
+            executor_connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            executor_connection.connect(str(EXECUTOR_SOCKET))
+            return executor_connection
+        except OSError:
+            executor_connection.close()
+            executor_connection = None
+            if executor_process.poll() is not None:
+                raise RuntimeError(f"executor exited {executor_process.returncode}")
+            if time.monotonic() >= deadline:
+                raise TimeoutError("executor did not become ready")
+            time.sleep(.01)
+
+
+def executor_request(payload):
+    global executor_connection
+    data = json.dumps(payload).encode()
+    for attempt in range(2):
+        try:
+            connection = executor_connection or connect_executor()
+            connection.sendall(len(data).to_bytes(4, "big") + data)
+            return json.loads(receive(connection, int.from_bytes(receive(connection, 4), "big")))
+        except (OSError, RuntimeError):
+            if executor_connection:
+                executor_connection.close()
+            executor_connection = None
+            if attempt:
+                raise
+
+
+def execute(payload):
+    return executor_request(payload)
+
+
+def executor_description():
+    if not EXECUTOR.is_file() or not os.access(EXECUTOR, os.X_OK):
+        return None
+    response = executor_request({"encoding": "scraperack-describe"})
+    return response["result"]["value"]["data"] if not response["error"] else None
+
+
+def start_service():
+    if not SERVICE.is_file():
+        return None
+    config = json.loads(SERVICE.read_text())
+    command = config.get("entrypoint", []) + config.get("command", [])
+    if not command:
+        return None
+    env = os.environ.copy()
+    env.update(item.split("=", 1) for item in config.get("env", []) if "=" in item)
+    return subprocess.Popen(command, cwd=config.get("working_dir") or "/", env=env)
+
+
+def handle(connection):
+    for line in connection.makefile():
+        try:
+            payload = json.loads(line)
+            if payload["encoding"] == "scraperack-snapshot":
+                if service and service.poll() not in (None, 0):
+                    raise RuntimeError(f"service exited {service.returncode}")
+                if payload.get("preload"):
+                    preloaded = executor_request({
+                        "encoding": "scraperack-preload",
+                        "modules": payload["preload"],
+                    })
+                    if preloaded["error"]:
+                        raise RuntimeError(preloaded["error"])
+                response = {
+                    "result": {"value": {"encoding": "json", "data": {
+                        "compatible": True,
+                        "executor": executor_description(),
+                    }}, "stdout": "", "stderr": ""},
+                    "error": None,
+                    "timed_out": False,
+                }
+            elif payload["encoding"] == "scraperack-network":
+                configure_network(payload)
+                response = {"result": None, "error": None, "timed_out": False}
+            else:
+                response = execute(payload)
+        except BaseException:
+            response = {
+                "result": {"stdout": "", "stderr": ""},
+                "error": traceback.format_exc(),
+                "timed_out": False,
+            }
+        connection.sendall(json.dumps(response).encode() + b"\n")
+
+
+subprocess.run(["mount", "-t", "tmpfs", "-o", "mode=1777", "tmpfs", "/tmp"], check=True)
+if Path("/dev/vdb").exists():
+    Path("/tmp/environment").mkdir()
+    subprocess.run(["mount", "-t", "ext4", "-o", "ro", "/dev/vdb", "/tmp/environment"], check=True)
+os.environ.update(HOME="/tmp", TMPDIR="/tmp", PYTHONDONTWRITEBYTECODE="1")
+os.chdir("/tmp")
+executor_process = None
+executor_connection = None
+start_executor()
+service = start_service()
+server = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+server.bind((socket.VMADDR_CID_ANY, 5000))
+server.listen(1)
+while True:
+    connection, _ = server.accept()
+    handle(connection)
+    connection.close()

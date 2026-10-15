@@ -1,0 +1,161 @@
+#!/usr/bin/python3
+import base64
+import hashlib
+import importlib
+import json
+import os
+import socket
+import subprocess
+import sys
+import tempfile
+import traceback
+from pathlib import Path
+
+import cloudpickle
+
+SOCKET = Path("/tmp/scraperack-executor.sock")
+FUNCTIONS = {}
+STDOUT = tempfile.TemporaryFile(mode="w+")
+STDERR = tempfile.TemporaryFile(mode="w+")
+
+
+def encode(value):
+    try:
+        json.dumps(value)
+        return {"encoding": "json", "data": value}
+    except TypeError:
+        return {
+            "encoding": "cloudpickle",
+            "data": base64.b64encode(cloudpickle.dumps(value)).decode(),
+        }
+
+
+def execute(payload):
+    encoding = payload["encoding"]
+    if encoding == "scraperack-preload":
+        for module in payload.get("modules", []):
+            loaded = importlib.import_module(module)
+            if module == "requests":
+                try:
+                    loaded.get(payload.get("url", "http://127.0.0.1:1"), timeout=1)
+                except loaded.RequestException:
+                    pass
+        return payload.get("modules", [])
+    if encoding == "python-function":
+        key = payload["hash"]
+        if key not in FUNCTIONS:
+            data = base64.b64decode(payload["function"])
+            if hashlib.sha256(data).hexdigest() != key:
+                raise ValueError("function hash does not match payload")
+            FUNCTIONS[key] = cloudpickle.loads(data)
+        params = cloudpickle.loads(base64.b64decode(payload["params"]))
+        return FUNCTIONS[key](*params)
+    if encoding == "cloudpickle":
+        function, params = cloudpickle.loads(base64.b64decode(payload["data"]))
+        return function(*params)
+    if encoding == "python-source":
+        namespace = {}
+        exec(payload["source"], namespace)
+        function = namespace.get("main")
+        if not callable(function):
+            raise ValueError("python-source must define main(...)")
+        return function(*payload.get("params", []))
+    if encoding == "files":
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name, data in payload["files"].items():
+                path = Path(name)
+                if path.is_absolute() or ".." in path.parts:
+                    raise ValueError(f"invalid file path: {name}")
+                target = root / path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(base64.b64decode(data))
+            command = payload["command"]
+            process = subprocess.run(
+                command, cwd=root, shell=isinstance(command, str), capture_output=True, text=True
+            )
+            if process.returncode:
+                raise RuntimeError(f"command exited {process.returncode}\n{process.stderr}")
+            return {
+                "returncode": process.returncode,
+                "stdout": process.stdout,
+                "stderr": process.stderr,
+            }
+    if encoding == "json":
+        return payload.get("data")
+    raise ValueError(f"unknown payload encoding: {encoding}")
+
+
+def handle(payload):
+    if payload["encoding"] == "scraperack-describe":
+        return {
+            "result": {
+                "value": {"encoding": "json", "data": f"Python {sys.version.split()[0]}"},
+                "stdout": "",
+                "stderr": "",
+            },
+            "error": None,
+            "timed_out": False,
+        }
+    stdout, stderr = STDOUT, STDERR
+    stdout.seek(0)
+    stdout.truncate()
+    stderr.seek(0)
+    stderr.truncate()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    saved_stdout, saved_stderr = os.dup(1), os.dup(2)
+    try:
+        os.dup2(stdout.fileno(), 1)
+        os.dup2(stderr.fileno(), 2)
+        try:
+            value, error = encode(execute(payload)), None
+        except BaseException:
+            value, error = None, traceback.format_exc()
+        sys.stdout.flush()
+        sys.stderr.flush()
+    finally:
+        os.dup2(saved_stdout, 1)
+        os.dup2(saved_stderr, 2)
+        os.close(saved_stdout)
+        os.close(saved_stderr)
+    stdout.seek(0)
+    stderr.seek(0)
+    return {
+        "result": {"value": value, "stdout": stdout.read(), "stderr": stderr.read()},
+        "error": error,
+        "timed_out": False,
+    }
+
+
+SOCKET.unlink(missing_ok=True)
+server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+server.bind(str(SOCKET))
+server.listen(1)
+
+
+def receive(connection, size):
+    data = b""
+    while len(data) < size:
+        chunk = connection.recv(size - len(data))
+        if not chunk:
+            return None
+        data += chunk
+    return data
+
+
+while True:
+    connection, _ = server.accept()
+    with connection:
+        while header := receive(connection, 4):
+            try:
+                payload = json.loads(receive(connection, int.from_bytes(header, "big")))
+                response = handle(payload)
+            except BaseException:
+                response = {
+                    "result": {"value": None, "stdout": "", "stderr": ""},
+                    "error": traceback.format_exc(),
+                    "timed_out": False,
+                }
+            data = json.dumps(response).encode()
+            connection.sendall(len(data).to_bytes(4, "big") + data)

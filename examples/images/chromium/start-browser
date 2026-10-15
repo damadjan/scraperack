@@ -1,0 +1,21 @@
+#!/bin/sh
+set -eu
+
+mkdir -p "$HOME" /tmp/.X11-unix
+chmod 1777 /tmp/.X11-unix
+Xvfb "$DISPLAY" -screen 0 1280x720x24 -nolisten tcp &
+sleep 0.5
+x11vnc -display "$DISPLAY" -forever -shared -nopw -rfbport 5900 &
+websockify --web=/usr/share/novnc 0.0.0.0:6080 localhost:5900 &
+
+exec chromium \
+    --no-sandbox \
+    --disable-dev-shm-usage \
+    --no-first-run \
+    --no-default-browser-check \
+    --remote-allow-origins='*' \
+    --remote-debugging-address=0.0.0.0 \
+    --remote-debugging-port=9222 \
+    --user-data-dir="$HOME/profile" \
+    --window-size=1280,720 \
+    about:blank
