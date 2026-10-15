@@ -2,6 +2,15 @@
 
 PoC control plane for dense, short-lived Firecracker workloads.
 
+## Repository layout
+
+```text
+platform/      Rust controller and node, guest agents, GUI, and deployment files
+sdk/           Installable Python SDK
+images/        Docker build contexts imported as VM and runtime images
+verification/  Local execution checks and benchmarks
+```
+
 ## Current vertical slice
 
 - One Rust binary with controller and node modes
@@ -51,11 +60,13 @@ result = cluster.wait(execution["id"])
 ## Development
 
 ```text
+cd platform
 cargo run -- controller
 cargo run -- node --controller http://127.0.0.1:7070 --name node-1 --kernel /path/to/vmlinux
-pip install -e python
-pip install -e gui
-python gui/app.py
+cd ..
+pip install -e sdk
+pip install -e platform/gui
+python platform/gui/app.py
 ```
 
 The GUI listens on port `8080` and reads the controller address from `SCRAPERACK_URL`.
@@ -65,8 +76,8 @@ Firecracker nodes require Linux, KVM access, and a compatible CPU. The controlle
 ## Prepare an Ubuntu node
 
 ```text
-sudo ./deploy/install-firecracker.sh
-sudo ./deploy/build-rootfs.sh python.ext4
+sudo ./platform/deploy/install-firecracker.sh
+sudo ./platform/deploy/build-rootfs.sh python.ext4
 ```
 
 `install-firecracker.sh` installs the latest official Firecracker release and current Firecracker CI kernel. `build-rootfs.sh` creates a minimal Ubuntu 24.04 golden image with CPython 3.10.11 and cloudpickle 3.1.2, without Docker.
