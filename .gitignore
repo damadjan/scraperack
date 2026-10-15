@@ -1,11 +1,8 @@
+/target
+/.venv
 __pycache__/
-*.py[cod]
-.venv/
-.venv-dashboard/
-.pytest_cache/
-.coverage
-htmlcov/
-build/
-dist/
+*.pyc
 *.egg-info/
-.env
+/data
+/.pytest_cache
+/examples/v/

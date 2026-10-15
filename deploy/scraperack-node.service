@@ -1,0 +1,23 @@
+[Unit]
+Description=Scraperack worker node
+After=network-online.target scraperack-controller.service
+Wants=network-online.target
+
+[Service]
+User=todor
+SupplementaryGroups=kvm
+Environment=RUST_LOG=info
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+Environment=XTABLES_LOCKFILE=/var/lib/scraperack-node/xtables.lock
+ExecStartPre=+/usr/sbin/sysctl -w net.ipv4.ip_forward=1
+ExecStart=/usr/local/bin/scraperack node --controller http://127.0.0.1:7070 --name node-1 --cpu-millis 8000 --memory-mib 14336 --data-dir /var/lib/scraperack-node --firecracker /usr/local/bin/firecracker --kernel /var/lib/scraperack-node/vmlinux
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+Restart=on-failure
+RestartSec=1
+LimitNOFILE=1048576
+StateDirectory=scraperack-node
+Delegate=yes
+
+[Install]
+WantedBy=multi-user.target

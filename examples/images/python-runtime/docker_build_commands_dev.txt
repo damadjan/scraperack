@@ -1,0 +1,2 @@
+docker build -t 192.168.2.3:8080/scraperack/python-runtime-3-10:dev .
+docker push 192.168.2.3:8080/scraperack/python-runtime-3-10:dev

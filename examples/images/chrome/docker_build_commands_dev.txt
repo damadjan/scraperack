@@ -1,0 +1,2 @@
+docker build -t 192.168.2.3:8080/scraperack/chrome:dev .
+docker push 192.168.2.3:8080/scraperack/chrome:dev
