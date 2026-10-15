@@ -15,12 +15,13 @@ tar -xzf "$work/firecracker.tgz" -C "$work"
 install -m 0755 "$work/release-$version-$arch/firecracker-$version-$arch" /usr/local/bin/firecracker
 
 store=/var/lib/scraperack-node
-owner=${SUDO_USER:-root}
-install -d -o "$owner" -g "$owner" "$store"
+owner=${SCRAPERACK_USER:-${SUDO_USER:-root}}
+group=${SCRAPERACK_GROUP:-$(id -gn "$owner")}
+install -d -o "$owner" -g "$group" "$store"
 s3=https://s3.amazonaws.com/spec.ccfc.min
 prefix=$(curl -fsSL "$s3?list-type=2&prefix=firecracker-ci/&delimiter=/" | grep -oP '(?<=<Prefix>)firecracker-ci/[0-9]{8}-[^/]+/(?=</Prefix>)' | sort | tail -1)
 kernel=$(curl -fsSL "$s3?list-type=2&prefix=$prefix$arch/vmlinux-" | grep -oP "(?<=<Key>)($prefix$arch/vmlinux-[0-9]+\.[0-9]+\.[0-9]{1,3})(?=</Key>)" | sort -V | tail -1)
 curl -fsSL "$s3/$kernel" -o "$store/vmlinux"
-chown "$owner:$owner" "$store/vmlinux"
+chown "$owner:$group" "$store/vmlinux"
 chmod 0644 "$store/vmlinux"
 /usr/local/bin/firecracker --version
