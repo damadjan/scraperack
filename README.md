@@ -81,3 +81,7 @@ sudo ./platform/deploy/build-rootfs.sh python.ext4
 ```
 
 `install-firecracker.sh` installs the latest official Firecracker release and current Firecracker CI kernel. `build-rootfs.sh` creates a minimal Ubuntu 24.04 golden image with CPython 3.10.11 and cloudpickle 3.1.2, without Docker.
+
+## License
+
+ScrapeRack is licensed under the [Apache License 2.0](LICENSE). Rust dependencies compiled into the platform binary are documented in [THIRD_PARTY_LICENSES.txt](THIRD_PARTY_LICENSES.txt). Components installed from their publishers are documented in [docs/third-party-components.md](docs/third-party-components.md).

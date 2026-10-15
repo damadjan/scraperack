@@ -1,0 +1,15 @@
+accepted = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "BSL-1.0",
+    "Unlicense",
+    "CDLA-Permissive-2.0",
+]
+targets = ["x86_64-unknown-linux-gnu"]
+ignore-dev-dependencies = true
+workarounds = ["ring", "rustls"]
+private = { ignore = true }
