@@ -1,0 +1,14 @@
+ScrapeRack third-party licenses
+
+This file lists the licenses selected for Rust crates included in the ScrapeRack platform binary.
+{{#each licenses}}
+
+================================================================================
+{{{name}}}
+
+Used by:
+{{#each used_by}}
+- {{crate.name}} {{crate.version}} ({{#if crate.repository}}{{crate.repository}}{{else}}https://crates.io/crates/{{crate.name}}{{/if}})
+{{/each}}
+
+{{{text}}}{{/each}}

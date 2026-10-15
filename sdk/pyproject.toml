@@ -1,12 +1,15 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "scraperack"
 version = "0.1.0"
+readme = "README.md"
 requires-python = ">=3.10"
 dependencies = ["cloudpickle>=3", "httpx>=0.27"]
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 
 [tool.setuptools.package-data]
 scraperack = ["py.typed"]
