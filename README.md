@@ -2,6 +2,16 @@
 
 PoC control plane for dense, short-lived Firecracker workloads.
 
+## Install
+
+ScrapeRack currently supports fresh Ubuntu 24.04 x86_64 hosts with KVM:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/damadjan/scraperack/main/install.sh | sudo sh
+```
+
+The installer builds the current `main` branch, installs the controller, node, and GUI as systemd services, and preserves `/var/lib/scraperack-controller` and `/var/lib/scraperack-node` when rerun.
+
 ## Repository layout
 
 ```text

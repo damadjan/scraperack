@@ -5,10 +5,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=todor
-WorkingDirectory=/home/todor/scraperack
-Environment=SCRAPERACK_URL=http://127.0.0.1:7070
-ExecStart=/home/todor/scraperack/.venv-gui/bin/python /home/todor/scraperack/platform/gui/app.py
+User=scraperack
+WorkingDirectory=/opt/scraperack/platform/gui
+EnvironmentFile=/etc/scraperack/gui.env
+ExecStart=/opt/scraperack/gui-venv/bin/python /opt/scraperack/platform/gui/app.py
 Restart=on-failure
 RestartSec=2
 

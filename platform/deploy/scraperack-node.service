@@ -4,13 +4,14 @@ After=network-online.target scraperack-controller.service
 Wants=network-online.target
 
 [Service]
-User=todor
+User=scraperack
 SupplementaryGroups=kvm
+EnvironmentFile=/etc/scraperack/node.env
 Environment=RUST_LOG=info
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
 Environment=XTABLES_LOCKFILE=/var/lib/scraperack-node/xtables.lock
 ExecStartPre=+/usr/sbin/sysctl -w net.ipv4.ip_forward=1
-ExecStart=/usr/local/bin/scraperack node --controller http://127.0.0.1:7070 --name node-1 --cpu-millis 8000 --memory-mib 14336 --data-dir /var/lib/scraperack-node --firecracker /usr/local/bin/firecracker --kernel /var/lib/scraperack-node/vmlinux
+ExecStart=/usr/local/bin/scraperack node --controller ${SCRAPERACK_CONTROLLER} --name ${SCRAPERACK_NODE_NAME} --cpu-millis ${SCRAPERACK_NODE_CPU_MILLIS} --memory-mib ${SCRAPERACK_NODE_MEMORY_MIB} --data-dir /var/lib/scraperack-node --firecracker /usr/local/bin/firecracker --kernel /var/lib/scraperack-node/vmlinux
 AmbientCapabilities=CAP_NET_ADMIN
 CapabilityBoundingSet=CAP_NET_ADMIN
 Restart=on-failure
