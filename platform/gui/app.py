@@ -18,11 +18,6 @@ client = httpx.AsyncClient(base_url=CONTROLLER, timeout=10)
 app.on_shutdown(client.aclose)
 ui.add_css(Path(__file__).with_name("style.css").read_text(), shared=True)
 ui.add_head_html('''<script>
-function capacityRenderer(params) {
-  const value = params.value || {label: '—', percent: 0}
-  const percent = Math.max(0, Math.min(100, value.percent))
-  return `<div class="cell-progress"><span>${value.label}</span><div><i style="width:${percent}%"></i></div></div>`
-}
 function statusRenderer(params) {
   const status = params.value || 'unknown'
   return `<span class="status-pill status-${status}">${status.replaceAll('_', ' ')}</span>`
@@ -265,13 +260,11 @@ async def dashboard():
             run_value, run_detail = summary("terminal", "Executions", "—", "Loading")
         with ui.card().classes("panel"):
             with ui.row().classes("items-center w-full"):
-                ui.label("Cluster capacity").classes("section-title")
+                ui.label("Cluster allocation").classes("section-title")
                 ui.space()
                 capacity = ui.label().classes("text-sm muted")
-            cpu = ui.linear_progress(value=0, show_value=False).props("rounded color=teal")
-            cpu_text = ui.label().classes("text-xs muted")
-            memory = ui.linear_progress(value=0, show_value=False).props("rounded color=cyan")
-            memory_text = ui.label().classes("text-xs muted")
+            cpu_text = ui.label().classes("text-sm")
+            memory_text = ui.label().classes("text-sm")
     async def refresh():
         try:
             nodes, images, environments, executions = await asyncio.gather(
@@ -292,10 +285,10 @@ async def dashboard():
             used_cpu = sum(node["used_cpu_millis"] for node in nodes)
             total_mem = sum(node["memory_mib"] for node in nodes)
             used_mem = sum(node["used_memory_mib"] for node in nodes)
-            cpu.value = used_cpu / total_cpu if total_cpu else 0
-            memory.value = used_mem / total_mem if total_mem else 0
-            cpu_text.text = f"CPU  {used_cpu / 1000:g} / {total_cpu / 1000:g} cores"
-            memory_text.text = f"Memory  {used_mem} / {total_mem} MiB"
+            cpu_percent = used_cpu / total_cpu * 100 if total_cpu else 0
+            memory_percent = used_mem / total_mem * 100 if total_mem else 0
+            cpu_text.text = f"CPU  {used_cpu / 1000:g} / {total_cpu / 1000:g} cores · {cpu_percent:.0f}%"
+            memory_text.text = f"RAM  {used_mem} / {total_mem} MiB · {memory_percent:.0f}%"
             capacity.text = f"{len(nodes)} node{'s' if len(nodes) != 1 else ''}"
         except Exception as error:
             node_detail.text = f"Unavailable: {error}"
@@ -316,8 +309,8 @@ async def nodes_page():
         nodes = table([
             {"headerName": "Name", "field": "name"},
             {"headerName": "Status", "field": "status", "maxWidth": 120, ":cellRenderer": "statusRenderer"},
-            {"headerName": "CPU", "field": "cpu", "minWidth": 210, ":cellRenderer": "capacityRenderer"},
-            {"headerName": "Memory", "field": "memory", "minWidth": 230, ":cellRenderer": "capacityRenderer"},
+            {"headerName": "CPU allocation", "field": "cpu", "minWidth": 210},
+            {"headerName": "RAM allocation", "field": "memory", "minWidth": 230},
             {"headerName": "Images", "field": "image_count", "maxWidth": 100},
             {"headerName": "Env caches", "field": "environment_count", "maxWidth": 120},
             {"headerName": "Idle VMs", "field": "idle_count", "maxWidth": 110},
@@ -329,10 +322,10 @@ async def nodes_page():
             data = await request("GET", "/v1/nodes")
             set_rows(nodes, [
                 {**node,
-                 "cpu": {"label": f'{node["used_cpu_millis"] / 1000:g} / {node["cpu_millis"] / 1000:g} cores',
-                         "percent": node["used_cpu_millis"] / node["cpu_millis"] * 100 if node["cpu_millis"] else 0},
-                 "memory": {"label": f'{node["used_memory_mib"]} / {node["memory_mib"]} MiB',
-                            "percent": node["used_memory_mib"] / node["memory_mib"] * 100 if node["memory_mib"] else 0},
+                 "cpu": f'{node["used_cpu_millis"] / 1000:g} / {node["cpu_millis"] / 1000:g} cores · '
+                        f'{(node["used_cpu_millis"] / node["cpu_millis"] * 100 if node["cpu_millis"] else 0):.0f}%',
+                 "memory": f'{node["used_memory_mib"]} / {node["memory_mib"]} MiB · '
+                           f'{(node["used_memory_mib"] / node["memory_mib"] * 100 if node["memory_mib"] else 0):.0f}%',
                  "image_count": len(node["images"]),
                  "environment_count": len(node.get("environments", [])),
                  "idle_count": sum(node.get("idle_instances", {}).values()),
