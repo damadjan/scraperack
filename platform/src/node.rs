@@ -426,6 +426,7 @@ where
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     controller: String,
     name: String,
@@ -990,6 +991,7 @@ async fn sync_snapshots(
     Ok(ready)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn maintain_vms(
     client: &Client,
     controller: &str,

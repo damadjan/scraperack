@@ -1825,7 +1825,7 @@ async fn list_executions(
         .values()
         .cloned()
         .collect::<Vec<_>>();
-    executions.sort_unstable_by(|a, b| b.created_at_ms.cmp(&a.created_at_ms));
+    executions.sort_unstable_by_key(|execution| std::cmp::Reverse(execution.created_at_ms));
     if let Some(limit) = query.limit {
         executions.truncate(limit);
     }
