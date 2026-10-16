@@ -12,7 +12,7 @@ curl -fsSL https://raw.githubusercontent.com/damadjan/scraperack/main/install.sh
 
 GitHub Actions verifies every pull request and publishes a checksum-verified rolling Linux build from `main`. The installer downloads that build, installs the controller, node, and GUI as systemd services, and preserves `/var/lib/scraperack-controller` and `/var/lib/scraperack-node` when rerun. It skips unchanged host dependencies, Firecracker, the kernel, and the GUI environment on node-only machines, so the same command also performs fast updates.
 
-Additional installed machines can join the cluster from **Settings → Join nodes** in the GUI. Set the controller URL, optionally set a node name, generate the ten-minute single-use command, and run it on the other machine. Joining disables its local controller and GUI, keeps their data, and authenticates the node with a persistent per-node credential. Re-running the installer preserves its node-only role.
+Additional installed machines can join the cluster from **Settings → Join nodes** in the GUI. Set the controller URL, optionally set a node name, generate the ten-minute single-use command, and run it on the other machine. The command refuses to run on that controller itself. Joining disables the other machine's local controller and GUI, keeps their data, and authenticates the node with a persistent per-node credential. Re-running the installer preserves its node-only role.
 
 ## Repository layout
 

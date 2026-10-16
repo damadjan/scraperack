@@ -1,4 +1,8 @@
-use std::{os::unix::fs::PermissionsExt, path::PathBuf, process::Stdio};
+use std::{
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
+    process::Stdio,
+};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -36,12 +40,21 @@ async fn systemctl(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
+async fn is_local_controller(data_dir: &Path, target: Uuid) -> Result<bool> {
+    match fs::read_to_string(data_dir.join("controller-id")).await {
+        Ok(id) => Ok(Uuid::parse_str(id.trim())? == target),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
 pub async fn run(
     controller: String,
     token: String,
     name: Option<String>,
     config_path: PathBuf,
     data_dir: PathBuf,
+    controller_data_dir: PathBuf,
 ) -> Result<()> {
     if !controller.starts_with("http://") && !controller.starts_with("https://") {
         bail!("controller must be an http or https URL");
@@ -59,11 +72,21 @@ pub async fn run(
         .context("SCRAPERACK_NODE_CPU_MILLIS is missing from the node configuration")?;
     let memory = value(&current, "SCRAPERACK_NODE_MEMORY_MIB")
         .context("SCRAPERACK_NODE_MEMORY_MIB is missing from the node configuration")?;
-    let response = reqwest::Client::new()
-        .post(format!(
-            "{}/internal/join",
-            controller.trim_end_matches('/')
-        ))
+    let controller = controller.trim_end_matches('/');
+    let client = reqwest::Client::new();
+    let target_id = client
+        .get(format!("{controller}/internal/identity"))
+        .send()
+        .await?
+        .error_for_status()
+        .context("controller identity check failed")?
+        .json::<Uuid>()
+        .await?;
+    if is_local_controller(&controller_data_dir, target_id).await? {
+        bail!("refusing to join the local controller");
+    }
+    let response = client
+        .post(format!("{controller}/internal/join"))
         .json(&JoinRequest { token: &token })
         .send()
         .await?
@@ -73,11 +96,7 @@ pub async fn run(
         .await?;
     let config = format!(
         "SCRAPERACK_CONTROLLER={}\nSCRAPERACK_NODE_CREDENTIAL={}\nSCRAPERACK_NODE_NAME={}\nSCRAPERACK_NODE_CPU_MILLIS={}\nSCRAPERACK_NODE_MEMORY_MIB={}",
-        controller.trim_end_matches('/'),
-        response.credential,
-        name,
-        cpu,
-        memory
+        controller, response.credential, name, cpu, memory
     );
 
     systemctl(&["stop", "scraperack-node"]).await?;
@@ -96,4 +115,27 @@ pub async fn run(
     systemctl(&["enable", "--now", "scraperack-node"]).await?;
     println!("Joined {controller} as {name}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn identifies_local_controller() {
+        let id = Uuid::new_v4();
+        let directory = std::env::temp_dir().join(format!("scraperack-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).await.unwrap();
+        fs::write(directory.join("controller-id"), id.to_string())
+            .await
+            .unwrap();
+
+        assert!(is_local_controller(&directory, id).await.unwrap());
+        assert!(
+            !is_local_controller(&directory, Uuid::new_v4())
+                .await
+                .unwrap()
+        );
+        fs::remove_dir_all(directory).await.unwrap();
+    }
 }

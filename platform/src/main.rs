@@ -55,6 +55,8 @@ enum Command {
         config: PathBuf,
         #[arg(long, default_value = "/var/lib/scraperack-node")]
         data_dir: PathBuf,
+        #[arg(long, default_value = "/var/lib/scraperack-controller")]
+        controller_data_dir: PathBuf,
     },
 }
 
@@ -95,6 +97,17 @@ async fn main() -> Result<()> {
             name,
             config,
             data_dir,
-        } => join::run(controller, token, name, config, data_dir).await,
+            controller_data_dir,
+        } => {
+            join::run(
+                controller,
+                token,
+                name,
+                config,
+                data_dir,
+                controller_data_dir,
+            )
+            .await
+        }
     }
 }
