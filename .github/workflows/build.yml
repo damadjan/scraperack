@@ -1,0 +1,109 @@
+name: Build
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: rolling-build-${{ github.ref }}
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Rust
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin/cargo-about
+            platform/target
+          key: ${{ runner.os }}-cargo-about-0.9.2-${{ hashFiles('platform/Cargo.lock') }}
+
+      - name: Check Rust formatting
+        run: cargo fmt --manifest-path platform/Cargo.toml --all -- --check
+
+      - name: Lint Rust
+        run: cargo clippy --manifest-path platform/Cargo.toml --all-targets --locked -- -D warnings
+
+      - name: Test Rust
+        run: cargo test --manifest-path platform/Cargo.toml --locked
+
+      - name: Check dependency licenses
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses
+          arguments: --config platform/deny.toml --all-features
+          manifest-path: platform/Cargo.toml
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check Python
+        run: |
+          pip install ruff
+          ruff check platform/gui sdk verification
+          python -m compileall -q platform/gui sdk verification
+
+      - name: Check shell scripts
+        run: sh -n install.sh platform/deploy/*.sh
+
+      - name: Build release binary
+        run: cargo build --release --locked --manifest-path platform/Cargo.toml
+
+      - name: Package
+        run: |
+          mkdir -p dist/scraperack/bin dist/scraperack/platform
+          install -m 0755 platform/target/release/scraperack dist/scraperack/bin/scraperack
+          cp -a platform/gui platform/deploy dist/scraperack/platform/
+          cp LICENSE dist/scraperack/
+          command -v cargo-about >/dev/null || cargo install --locked cargo-about --version 0.9.2
+          (cd platform && cargo about generate about.hbs) > dist/scraperack/THIRD_PARTY_LICENSES.txt
+          printf '%s\n' "$GITHUB_SHA" > dist/scraperack/BUILD_COMMIT
+          tar -czf dist/scraperack-linux-x86_64.tar.gz -C dist scraperack
+          cd dist
+          sha256sum scraperack-linux-x86_64.tar.gz > scraperack-linux-x86_64.tar.gz.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: scraperack-linux-x86_64
+          path: |
+            dist/scraperack-linux-x86_64.tar.gz
+            dist/scraperack-linux-x86_64.tar.gz.sha256
+
+  publish:
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: verify
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: scraperack-linux-x86_64
+          path: dist
+
+      - name: Publish rolling release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view rolling >/dev/null 2>&1; then
+            git tag --force rolling "$GITHUB_SHA"
+            git push --force origin refs/tags/rolling
+            gh release upload rolling dist/* --clobber
+            gh release edit rolling --title "Rolling main build" --notes "Built from $GITHUB_SHA" --latest
+          else
+            gh release create rolling dist/* --target "$GITHUB_SHA" --title "Rolling main build" --notes "Built from $GITHUB_SHA" --latest
+          fi

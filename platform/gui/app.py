@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import shlex
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -12,6 +13,7 @@ from ago import human
 from nicegui import app, ui
 
 CONTROLLER = os.getenv("SCRAPERACK_URL", "http://127.0.0.1:7070").rstrip("/")
+PUBLIC_CONTROLLER = os.getenv("SCRAPERACK_PUBLIC_URL", "")
 client = httpx.AsyncClient(base_url=CONTROLLER, timeout=10)
 app.on_shutdown(client.aclose)
 ui.add_css(Path(__file__).with_name("style.css").read_text(), shared=True)
@@ -309,6 +311,8 @@ async def nodes_page():
             ui.label("Cluster nodes").classes("section-title")
             ui.space()
             ui.label("Live · 1 second").classes("text-xs muted")
+            revoke_button = ui.button("Revoke", icon="link_off", color="negative") \
+                .props("outline no-caps")
         nodes = table([
             {"headerName": "Name", "field": "name"},
             {"headerName": "Status", "field": "status", "maxWidth": 120, ":cellRenderer": "statusRenderer"},
@@ -318,7 +322,7 @@ async def nodes_page():
             {"headerName": "Env caches", "field": "environment_count", "maxWidth": 120},
             {"headerName": "Idle VMs", "field": "idle_count", "maxWidth": 110},
             {"headerName": "Last heartbeat", "field": "last_seen", "minWidth": 190},
-        ])
+        ], selection=True, row_key="id")
 
     async def refresh():
         try:
@@ -338,6 +342,18 @@ async def nodes_page():
         except Exception as error:
             notify_error(error)
 
+    async def revoke():
+        selected = await nodes.get_selected_row()
+        if not selected:
+            return ui.notify("Select a node first", type="warning")
+        try:
+            await request("DELETE", f'/v1/nodes/{selected["id"]}')
+            ui.notify(f'Revoked {selected["name"]}', type="positive")
+            await refresh()
+        except Exception as error:
+            notify_error(error)
+
+    revoke_button.on_click(revoke)
     await refresh()
     ui.timer(1, refresh)
 
@@ -919,6 +935,67 @@ async def vms_page():
 @ui.page("/settings")
 async def settings_page():
     with shell("settings"):
+        with ui.card().classes("panel"):
+            ui.label("Join nodes").classes("section-title")
+            ui.label("Generate a single-use command for an existing ScrapeRack installation.") \
+                .classes("text-sm muted")
+            with ui.row().classes("items-end w-full"):
+                controller_url = ui.input(
+                    "Controller URL",
+                    value=app.storage.general.get("public_controller", PUBLIC_CONTROLLER),
+                    placeholder="http://scraperack.example.com:7070",
+                ).classes("grow")
+                node_name = ui.input("Node name", placeholder="Defaults to its hostname").classes("w-64")
+                generate = ui.button("Generate command", icon="add_link").props(
+                    "unelevated no-caps color=teal"
+                )
+            command = ui.textarea("Join command").props("readonly autogrow").classes("w-full")
+            command.set_visibility(False)
+            with ui.row().classes("items-center w-full"):
+                join_status = ui.label().classes("text-sm muted")
+                ui.space()
+                copy = ui.button("Copy", icon="content_copy").props("outline no-caps")
+                copy.set_visibility(False)
+            current = {"id": None, "expires": 0}
+
+            async def create_token():
+                url = controller_url.value.strip().rstrip("/")
+                if not url.startswith(("http://", "https://")):
+                    return ui.notify("Enter a complete HTTP or HTTPS controller URL", type="warning")
+                generate.disable()
+                try:
+                    token = await request("POST", "/v1/join-tokens")
+                    parts = ["sudo scraperack join", "--controller", shlex.quote(url),
+                             "--token", shlex.quote(token["token"])]
+                    if node_name.value.strip():
+                        parts.extend(("--name", shlex.quote(node_name.value.strip())))
+                    command.value = " ".join(parts)
+                    command.set_visibility(True)
+                    copy.set_visibility(True)
+                    current.update(id=token["id"], expires=token["expires_at_ms"])
+                    app.storage.general["public_controller"] = url
+                except Exception as error:
+                    notify_error(error)
+                finally:
+                    generate.enable()
+
+            async def token_status():
+                if not current["id"]:
+                    return
+                try:
+                    token = await request("GET", f'/v1/join-tokens/{current["id"]}')
+                    if token["status"] == "pending":
+                        remaining = max(0, (token["expires_at_ms"] - int(time.time() * 1000)) // 1000)
+                        join_status.text = f'Pending · expires in {remaining // 60}:{remaining % 60:02d}'
+                    else:
+                        join_status.text = token["status"].title()
+                        current["id"] = None
+                except Exception as error:
+                    join_status.text = f"Unavailable: {error}"
+
+            generate.on_click(create_token)
+            copy.on_click(lambda: ui.clipboard.write(command.value))
+            ui.timer(1, token_status)
         with ui.card().classes("panel"):
             ui.label("Display timezone").classes("section-title")
             ui.label("All absolute dates and times in the GUI use this timezone.").classes("text-sm muted")

@@ -10,7 +10,10 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
-use reqwest::Client;
+use reqwest::{
+    Client,
+    header::{AUTHORIZATION, HeaderMap, HeaderValue},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -48,6 +51,17 @@ struct EnvironmentView {
 #[derive(Deserialize)]
 struct RegisteredNode {
     id: Uuid,
+}
+
+#[derive(Deserialize)]
+struct Credentials {
+    node_id: Uuid,
+    credential: String,
+}
+
+#[derive(Serialize)]
+struct LocalJoin {
+    id: Option<Uuid>,
 }
 
 #[derive(Serialize)]
@@ -421,6 +435,7 @@ pub async fn run(
     firecracker: PathBuf,
     kernel: PathBuf,
     advertise_address: Option<IpAddr>,
+    credential: Option<String>,
 ) -> Result<()> {
     let firecracker = fs::canonicalize(firecracker)
         .await
@@ -448,18 +463,44 @@ pub async fn run(
     fs::create_dir(&instances).await?;
 
     let id_path = data_dir.join("node-id");
-    let id = match fs::read_to_string(&id_path).await {
+    let stored_id = match fs::read_to_string(&id_path).await {
         Ok(id) => Some(Uuid::parse_str(id.trim())?),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(e.into()),
     };
-    let client = Client::new();
     let controller = controller.trim_end_matches('/');
+    let (id, credential) = match credential.filter(|value| !value.is_empty()) {
+        Some(credential) => (
+            stored_id.context("authenticated node is missing its node ID")?,
+            credential,
+        ),
+        None => {
+            let credentials = Client::new()
+                .post(format!("{controller}/internal/local-join"))
+                .json(&LocalJoin { id: stored_id })
+                .send()
+                .await?
+                .error_for_status()
+                .context("local node enrollment failed")?
+                .json::<Credentials>()
+                .await?;
+            (credentials.node_id, credentials.credential)
+        }
+    };
+    if stored_id != Some(id) {
+        fs::write(&id_path, id.to_string()).await?;
+    }
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {credential}"))?,
+    );
+    let client = Client::builder().default_headers(headers).build()?;
 
     let mut node: RegisteredNode = client
         .post(format!("{controller}/internal/nodes/register"))
         .json(&Registration {
-            id,
+            id: Some(id),
             name: &name,
             cpu_millis,
             memory_mib,
@@ -472,9 +513,6 @@ pub async fn run(
         .error_for_status()?
         .json()
         .await?;
-    if id.is_none() {
-        fs::write(&id_path, node.id.to_string()).await?;
-    }
     let snapshot_lock = Arc::new(Mutex::new(()));
     let vms = Arc::new(Mutex::new(VmState {
         idle: Vec::new(),

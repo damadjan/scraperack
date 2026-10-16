@@ -10,7 +10,9 @@ ScrapeRack currently supports fresh Ubuntu 24.04 x86_64 hosts with KVM:
 curl -fsSL https://raw.githubusercontent.com/damadjan/scraperack/main/install.sh | sudo sh
 ```
 
-The installer builds the current `main` branch, installs the controller, node, and GUI as systemd services, and preserves `/var/lib/scraperack-controller` and `/var/lib/scraperack-node` when rerun.
+GitHub Actions verifies every pull request and publishes a checksum-verified rolling Linux build from `main`. The installer downloads that build, installs the controller, node, and GUI as systemd services, and preserves `/var/lib/scraperack-controller` and `/var/lib/scraperack-node` when rerun. It skips unchanged host dependencies, Firecracker, the kernel, and the GUI environment on node-only machines, so the same command also performs fast updates.
+
+Additional installed machines can join the cluster from **Settings → Join nodes** in the GUI. Set the controller URL, optionally set a node name, generate the ten-minute single-use command, and run it on the other machine. Joining disables its local controller and GUI, keeps their data, and authenticates the node with a persistent per-node credential. Re-running the installer preserves its node-only role.
 
 ## Repository layout
 
