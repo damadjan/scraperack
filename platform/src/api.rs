@@ -40,6 +40,7 @@ const JOIN_TOKEN_TTL_MS: u64 = 10 * 60 * 1000;
 #[derive(Clone)]
 struct App {
     cluster: Arc<RwLock<Cluster>>,
+    controller_id: Uuid,
     data_dir: PathBuf,
     executions: Arc<Notify>,
     work: Arc<Notify>,
@@ -202,6 +203,16 @@ async fn load_executions(data_dir: &Path, cluster: &mut Cluster) -> Result<()> {
 pub async fn serve(listen: std::net::SocketAddr, data_dir: PathBuf) -> Result<()> {
     fs::create_dir_all(data_dir.join("images")).await?;
     fs::create_dir_all(data_dir.join("environments")).await?;
+    let controller_id_path = data_dir.join("controller-id");
+    let controller_id = match fs::read_to_string(&controller_id_path).await {
+        Ok(id) => Uuid::parse_str(id.trim())?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let id = Uuid::new_v4();
+            fs::write(controller_id_path, id.to_string()).await?;
+            id
+        }
+        Err(e) => return Err(e.into()),
+    };
     let mut cluster: Cluster = match fs::read(data_dir.join("state.json")).await {
         Ok(bytes) => serde_json::from_slice(&bytes)?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Cluster::default(),
@@ -211,6 +222,7 @@ pub async fn serve(listen: std::net::SocketAddr, data_dir: PathBuf) -> Result<()
     migrate_legacy(&mut cluster);
     let app = App {
         cluster: Arc::new(RwLock::new(cluster)),
+        controller_id,
         data_dir,
         executions: Arc::new(Notify::new()),
         work: Arc::new(Notify::new()),
@@ -248,6 +260,7 @@ pub async fn serve(listen: std::net::SocketAddr, data_dir: PathBuf) -> Result<()
         .route("/v1/executions/{id}", get(get_execution))
         .route("/v1/executions/{id}/wait", get(wait_execution))
         .route("/internal/nodes/register", post(register_node))
+        .route("/internal/identity", get(controller_identity))
         .route("/internal/join", post(join_cluster))
         .route("/internal/local-join", post(local_join))
         .route(
@@ -279,6 +292,10 @@ pub async fn serve(listen: std::net::SocketAddr, data_dir: PathBuf) -> Result<()
     )
     .await?;
     Ok(())
+}
+
+async fn controller_identity(State(app): State<App>) -> Json<Uuid> {
+    Json(app.controller_id)
 }
 
 async fn list_images(State(app): State<App>) -> Json<Vec<ImageView>> {
@@ -2168,6 +2185,7 @@ mod tests {
         fs::create_dir_all(&data_dir).await.unwrap();
         App {
             cluster: Arc::new(RwLock::new(Cluster::default())),
+            controller_id: Uuid::new_v4(),
             data_dir,
             executions: Arc::new(Notify::new()),
             work: Arc::new(Notify::new()),
