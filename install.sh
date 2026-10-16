@@ -11,16 +11,24 @@ set -eu
 [ -e /dev/kvm ] || { echo "/dev/kvm is required" >&2; exit 1; }
 
 repo=${SCRAPERACK_REPOSITORY:-damadjan/scraperack}
-ref=${SCRAPERACK_REF:-main}
+release=${SCRAPERACK_RELEASE:-rolling}
 user=${SCRAPERACK_USER:-scraperack}
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
+role=$(cat /etc/scraperack/role 2>/dev/null || true)
 
-echo "Installing host dependencies"
-export DEBIAN_FRONTEND=noninteractive
-apt-get update
-apt-get install -y build-essential ca-certificates curl docker.io e2fsprogs fakeroot \
-    iproute2 iptables pkg-config python3 python3-venv skopeo
+packages="ca-certificates curl docker.io e2fsprogs fakeroot iproute2 iptables python3 python3-venv skopeo"
+missing=
+for package in $packages; do
+    dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q 'install ok installed' || missing=1
+done
+if [ -n "$missing" ]; then
+    echo "Installing host dependencies"
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y ca-certificates curl docker.io e2fsprogs fakeroot \
+        iproute2 iptables python3 python3-venv skopeo
+fi
 systemctl enable --now docker
 
 if ! id "$user" >/dev/null 2>&1; then
@@ -31,34 +39,35 @@ fi
 usermod -aG docker,kvm "$user"
 group=$(id -gn "$user")
 
-echo "Downloading ScrapeRack $ref"
-curl -fsSL "https://codeload.github.com/$repo/tar.gz/$ref" -o "$work/source.tar.gz"
-mkdir "$work/source"
-tar -xzf "$work/source.tar.gz" -C "$work/source" --strip-components=1
-
-echo "Building ScrapeRack"
-export CARGO_HOME="$work/cargo"
-export RUSTUP_HOME="$work/rustup"
-curl -fsSL https://sh.rustup.rs -o "$work/rustup.sh"
-sh "$work/rustup.sh" -y --profile minimal --default-toolchain stable --no-modify-path
-"$CARGO_HOME/bin/cargo" build --release --locked \
-    --manifest-path "$work/source/platform/Cargo.toml"
+echo "Downloading ScrapeRack $release"
+base="https://github.com/$repo/releases/download/$release"
+archive=scraperack-linux-x86_64.tar.gz
+curl -fsSL "$base/$archive" -o "$work/$archive"
+curl -fsSL "$base/$archive.sha256" -o "$work/$archive.sha256"
+(cd "$work" && sha256sum -c "$archive.sha256")
+tar -xzf "$work/$archive" -C "$work"
+bundle="$work/scraperack"
 
 systemctl stop scraperack-gui scraperack-node scraperack-controller 2>/dev/null || true
-install -m 0755 "$work/source/platform/target/release/scraperack" /usr/local/bin/scraperack
+install -m 0755 "$bundle/bin/scraperack" /usr/local/bin/scraperack
 
-rm -rf /opt/scraperack
 install -d /opt/scraperack/platform
-cp -a "$work/source/platform/gui" /opt/scraperack/platform/gui
-install -m 0644 "$work/source/LICENSE" /opt/scraperack/LICENSE
-install -m 0644 "$work/source/THIRD_PARTY_LICENSES.txt" \
+if [ "$role" != node ]; then
+    rm -rf /opt/scraperack/platform/gui
+    cp -a "$bundle/platform/gui" /opt/scraperack/platform/gui
+    [ -x /opt/scraperack/gui-venv/bin/python ] || python3 -m venv /opt/scraperack/gui-venv
+    /opt/scraperack/gui-venv/bin/pip install --disable-pip-version-check \
+        'ago>=0.1,<1' 'httpx>=0.27,<1' 'nicegui>=3,<4' 'tzdata>=2025.2'
+fi
+install -m 0644 "$bundle/LICENSE" /opt/scraperack/LICENSE
+install -m 0644 "$bundle/THIRD_PARTY_LICENSES.txt" \
     /opt/scraperack/THIRD_PARTY_LICENSES.txt
-python3 -m venv /opt/scraperack/gui-venv
-/opt/scraperack/gui-venv/bin/pip install --disable-pip-version-check \
-    'ago>=0.1,<1' 'httpx>=0.27,<1' 'nicegui>=3,<4' 'tzdata>=2025.2'
+install -m 0644 "$bundle/BUILD_COMMIT" /opt/scraperack/BUILD_COMMIT
 
-SCRAPERACK_USER="$user" SCRAPERACK_GROUP="$group" \
-    sh "$work/source/platform/deploy/install-firecracker.sh"
+if [ ! -x /usr/local/bin/firecracker ] || [ ! -f /var/lib/scraperack-node/vmlinux ]; then
+    SCRAPERACK_USER="$user" SCRAPERACK_GROUP="$group" \
+        sh "$bundle/platform/deploy/install-firecracker.sh"
+fi
 
 install -d /etc/scraperack /var/lib/scraperack-controller /var/lib/scraperack-node
 chown -R "$user:$group" /var/lib/scraperack-controller /var/lib/scraperack-node
@@ -72,25 +81,37 @@ memory_mib=${SCRAPERACK_NODE_MEMORY_MIB:-$default_memory}
 cat > /etc/scraperack/controller.env <<EOF
 SCRAPERACK_LISTEN=${SCRAPERACK_LISTEN:-0.0.0.0:7070}
 EOF
+if [ ! -f /etc/scraperack/node.env ]; then
 cat > /etc/scraperack/node.env <<EOF
 SCRAPERACK_CONTROLLER=http://127.0.0.1:7070
+SCRAPERACK_NODE_CREDENTIAL=
 SCRAPERACK_NODE_NAME=${SCRAPERACK_NODE_NAME:-$(hostname)}
 SCRAPERACK_NODE_CPU_MILLIS=$cpu_millis
 SCRAPERACK_NODE_MEMORY_MIB=$memory_mib
 EOF
+fi
+grep -q '^SCRAPERACK_NODE_CREDENTIAL=' /etc/scraperack/node.env || \
+    printf 'SCRAPERACK_NODE_CREDENTIAL=\n' >> /etc/scraperack/node.env
 cat > /etc/scraperack/gui.env <<EOF
 SCRAPERACK_URL=http://127.0.0.1:7070
+SCRAPERACK_PUBLIC_URL=${SCRAPERACK_PUBLIC_URL:-}
 SCRAPERACK_GUI_PORT=${SCRAPERACK_GUI_PORT:-8080}
 EOF
-chmod 0644 /etc/scraperack/*.env
+chmod 0600 /etc/scraperack/*.env
 
 for service in controller node gui; do
     sed "s/^User=.*/User=$user/" \
-        "$work/source/platform/deploy/scraperack-$service.service" \
+        "$bundle/platform/deploy/scraperack-$service.service" \
         > "/etc/systemd/system/scraperack-$service.service"
 done
 
 systemctl daemon-reload
+if [ "$role" = node ]; then
+    systemctl disable --now scraperack-controller scraperack-gui
+    systemctl enable --now scraperack-node
+    echo "ScrapeRack node is running"
+    exit
+fi
 systemctl enable --now scraperack-controller scraperack-node scraperack-gui
 
 attempt=0

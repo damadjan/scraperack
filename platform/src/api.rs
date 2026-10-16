@@ -12,8 +12,8 @@ use anyhow::Result;
 use axum::{
     Json, Router,
     body::Body,
-    extract::{DefaultBodyLimit, Path as AxumPath, Query, State},
-    http::StatusCode,
+    extract::{ConnectInfo, DefaultBodyLimit, Path as AxumPath, Query, State},
+    http::{HeaderMap, StatusCode, header::AUTHORIZATION},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
 };
@@ -31,9 +31,11 @@ use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
 use crate::cluster::{
-    Cluster, Environment, Execution, ExecutionMetrics, ExecutionStatus, Image, ImageKind, MicroVm,
-    Node, NodeStatus, Pool, Work,
+    Cluster, Environment, Execution, ExecutionMetrics, ExecutionStatus, Image, ImageKind,
+    JoinToken, MicroVm, Node, NodeStatus, Pool, Work,
 };
+
+const JOIN_TOKEN_TTL_MS: u64 = 10 * 60 * 1000;
 
 #[derive(Clone)]
 struct App {
@@ -54,6 +56,39 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+fn secret() -> String {
+    format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
+}
+
+fn secret_hash(secret: &str) -> String {
+    hex::encode(Sha256::digest(secret.as_bytes()))
+}
+
+fn same_hash(left: &str, right: &str) -> bool {
+    left.len() == right.len()
+        && left
+            .bytes()
+            .zip(right.bytes())
+            .fold(0, |difference, (left, right)| difference | (left ^ right))
+            == 0
+}
+
+async fn authenticated_node(app: &App, headers: &HeaderMap) -> ApiResult<Uuid> {
+    let token = headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .ok_or_else(|| error(StatusCode::UNAUTHORIZED, "node credential required"))?;
+    let hash = secret_hash(token);
+    app.cluster
+        .read()
+        .await
+        .node_credentials
+        .iter()
+        .find_map(|(id, expected)| same_hash(expected, &hash).then_some(*id))
+        .ok_or_else(|| error(StatusCode::UNAUTHORIZED, "invalid node credential"))
 }
 
 fn migrate_legacy(cluster: &mut Cluster) {
@@ -202,6 +237,9 @@ pub async fn serve(listen: std::net::SocketAddr, data_dir: PathBuf) -> Result<()
         .route("/v1/environments/{id}/restart", post(restart_environment))
         .route("/v1/environments/{id}/artifact", get(download_environment))
         .route("/v1/nodes", get(list_nodes))
+        .route("/v1/nodes/{id}", delete(delete_node))
+        .route("/v1/join-tokens", post(create_join_token))
+        .route("/v1/join-tokens/{id}", get(get_join_token))
         .route("/v1/vms", get(list_vms))
         .route(
             "/v1/executions",
@@ -210,6 +248,8 @@ pub async fn serve(listen: std::net::SocketAddr, data_dir: PathBuf) -> Result<()
         .route("/v1/executions/{id}", get(get_execution))
         .route("/v1/executions/{id}/wait", get(wait_execution))
         .route("/internal/nodes/register", post(register_node))
+        .route("/internal/join", post(join_cluster))
+        .route("/internal/local-join", post(local_join))
         .route(
             "/internal/nodes/{id}/images/{image}/ready",
             post(image_ready),
@@ -233,7 +273,11 @@ pub async fn serve(listen: std::net::SocketAddr, data_dir: PathBuf) -> Result<()
         .with_state(app);
 
     tracing::info!(%listen, "controller listening");
-    axum::serve(TcpListener::bind(listen).await?, router).await?;
+    axum::serve(
+        TcpListener::bind(listen).await?,
+        router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -781,8 +825,10 @@ async fn update_image(
 
 async fn download_image(
     State(app): State<App>,
+    headers: HeaderMap,
     AxumPath(id): AxumPath<Uuid>,
 ) -> ApiResult<Response> {
+    authenticated_node(&app, &headers).await?;
     if !app.cluster.read().await.images.contains_key(&id) {
         return Err(error(StatusCode::NOT_FOUND, "image not found"));
     }
@@ -1466,8 +1512,10 @@ async fn delete_environment(
 
 async fn download_environment(
     State(app): State<App>,
+    headers: HeaderMap,
     AxumPath(id): AxumPath<Uuid>,
 ) -> ApiResult<Response> {
+    authenticated_node(&app, &headers).await?;
     let artifact = app
         .cluster
         .read()
@@ -1482,8 +1530,155 @@ async fn download_environment(
     Ok(Body::from_stream(ReaderStream::new(file)).into_response())
 }
 
+#[derive(Serialize)]
+struct JoinTokenView {
+    id: Uuid,
+    token: Option<String>,
+    expires_at_ms: u64,
+    status: &'static str,
+}
+
+async fn create_join_token(State(app): State<App>) -> ApiResult<Json<JoinTokenView>> {
+    let now = now_ms();
+    let token = secret();
+    let join = JoinToken {
+        id: Uuid::new_v4(),
+        token_hash: secret_hash(&token),
+        expires_at_ms: now + JOIN_TOKEN_TTL_MS,
+        used_at_ms: None,
+    };
+    let view = JoinTokenView {
+        id: join.id,
+        token: Some(token),
+        expires_at_ms: join.expires_at_ms,
+        status: "pending",
+    };
+    let mut cluster = app.cluster.write().await;
+    cluster
+        .join_tokens
+        .retain(|_, item| item.expires_at_ms + 86_400_000 >= now);
+    cluster.join_tokens.insert(join.id, join);
+    save(&app, &cluster).await?;
+    Ok(Json(view))
+}
+
+async fn get_join_token(
+    State(app): State<App>,
+    AxumPath(id): AxumPath<Uuid>,
+) -> ApiResult<Json<JoinTokenView>> {
+    let cluster = app.cluster.read().await;
+    let token = cluster
+        .join_tokens
+        .get(&id)
+        .ok_or_else(|| error(StatusCode::NOT_FOUND, "join token not found"))?;
+    let status = if token.used_at_ms.is_some() {
+        "used"
+    } else if token.expires_at_ms <= now_ms() {
+        "expired"
+    } else {
+        "pending"
+    };
+    Ok(Json(JoinTokenView {
+        id,
+        token: None,
+        expires_at_ms: token.expires_at_ms,
+        status,
+    }))
+}
+
+#[derive(Deserialize)]
+struct JoinRequest {
+    token: String,
+}
+
+#[derive(Deserialize)]
+struct LocalJoinRequest {
+    id: Option<Uuid>,
+}
+
+#[derive(Debug, Serialize)]
+struct NodeCredentials {
+    node_id: Uuid,
+    credential: String,
+}
+
+async fn join_cluster(
+    State(app): State<App>,
+    Json(request): Json<JoinRequest>,
+) -> ApiResult<Json<NodeCredentials>> {
+    let now = now_ms();
+    let hash = secret_hash(&request.token);
+    let mut cluster = app.cluster.write().await;
+    let id = cluster
+        .join_tokens
+        .values()
+        .find(|token| {
+            token.used_at_ms.is_none()
+                && token.expires_at_ms > now
+                && same_hash(&token.token_hash, &hash)
+        })
+        .map(|token| token.id)
+        .ok_or_else(|| error(StatusCode::UNAUTHORIZED, "invalid or expired join token"))?;
+    cluster.join_tokens.get_mut(&id).unwrap().used_at_ms = Some(now);
+    let node_id = Uuid::new_v4();
+    let credential = secret();
+    cluster
+        .node_credentials
+        .insert(node_id, secret_hash(&credential));
+    save(&app, &cluster).await?;
+    Ok(Json(NodeCredentials {
+        node_id,
+        credential,
+    }))
+}
+
+async fn local_join(
+    ConnectInfo(address): ConnectInfo<std::net::SocketAddr>,
+    State(app): State<App>,
+    Json(request): Json<LocalJoinRequest>,
+) -> ApiResult<Json<NodeCredentials>> {
+    if !address.ip().is_loopback() {
+        return Err(error(StatusCode::FORBIDDEN, "local enrollment only"));
+    }
+    let node_id = request.id.unwrap_or_else(Uuid::new_v4);
+    let credential = secret();
+    let mut cluster = app.cluster.write().await;
+    cluster
+        .node_credentials
+        .insert(node_id, secret_hash(&credential));
+    save(&app, &cluster).await?;
+    Ok(Json(NodeCredentials {
+        node_id,
+        credential,
+    }))
+}
+
 async fn list_nodes(State(app): State<App>) -> Json<Vec<Node>> {
     Json(app.cluster.read().await.nodes.values().cloned().collect())
+}
+
+async fn delete_node(
+    State(app): State<App>,
+    AxumPath(id): AxumPath<Uuid>,
+) -> ApiResult<StatusCode> {
+    let mut cluster = app.cluster.write().await;
+    if cluster.executions.values().any(|execution| {
+        execution.node == Some(id)
+            && matches!(
+                execution.status,
+                ExecutionStatus::Assigned | ExecutionStatus::Running
+            )
+    }) {
+        return Err(error(StatusCode::CONFLICT, "node has active executions"));
+    }
+    if cluster.nodes.remove(&id).is_none() && !cluster.node_credentials.contains_key(&id) {
+        return Err(error(StatusCode::NOT_FOUND, "node not found"));
+    }
+    cluster.node_credentials.remove(&id);
+    cluster.schedule_queued();
+    save(&app, &cluster).await?;
+    app.work.notify_waiters();
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Serialize)]
@@ -1630,7 +1825,7 @@ async fn list_executions(
         .values()
         .cloned()
         .collect::<Vec<_>>();
-    executions.sort_unstable_by(|a, b| b.created_at_ms.cmp(&a.created_at_ms));
+    executions.sort_unstable_by_key(|execution| std::cmp::Reverse(execution.created_at_ms));
     if let Some(limit) = query.limit {
         executions.truncate(limit);
     }
@@ -1694,10 +1889,15 @@ struct RegisterNode {
 
 async fn register_node(
     State(app): State<App>,
+    headers: HeaderMap,
     Json(request): Json<RegisterNode>,
 ) -> ApiResult<Json<Node>> {
+    let authenticated = authenticated_node(&app, &headers).await?;
+    if request.id != Some(authenticated) {
+        return Err(error(StatusCode::FORBIDDEN, "node identity mismatch"));
+    }
     let mut cluster = app.cluster.write().await;
-    let id = request.id.unwrap_or_else(Uuid::new_v4);
+    let id = authenticated;
     let node = cluster.nodes.entry(id).or_insert_with(|| Node {
         id,
         name: request.name.clone(),
@@ -1732,8 +1932,12 @@ async fn register_node(
 
 async fn image_ready(
     State(app): State<App>,
+    headers: HeaderMap,
     AxumPath((id, image)): AxumPath<(Uuid, Uuid)>,
 ) -> ApiResult<StatusCode> {
+    if authenticated_node(&app, &headers).await? != id {
+        return Err(error(StatusCode::FORBIDDEN, "node identity mismatch"));
+    }
     let mut cluster = app.cluster.write().await;
     if !cluster.images.contains_key(&image) {
         return Err(error(StatusCode::NOT_FOUND, "image not found"));
@@ -1752,8 +1956,12 @@ async fn image_ready(
 
 async fn environment_ready(
     State(app): State<App>,
+    headers: HeaderMap,
     AxumPath((id, artifact)): AxumPath<(Uuid, String)>,
 ) -> ApiResult<StatusCode> {
+    if authenticated_node(&app, &headers).await? != id {
+        return Err(error(StatusCode::FORBIDDEN, "node identity mismatch"));
+    }
     let mut cluster = app.cluster.write().await;
     if !cluster
         .environments
@@ -1775,15 +1983,25 @@ async fn environment_ready(
 
 async fn warm_instance_needed(
     State(app): State<App>,
+    headers: HeaderMap,
     AxumPath((id, pool)): AxumPath<(Uuid, String)>,
-) -> Json<bool> {
-    Json(app.cluster.read().await.warm_instance_needed(id, &pool))
+) -> ApiResult<Json<bool>> {
+    if authenticated_node(&app, &headers).await? != id {
+        return Err(error(StatusCode::FORBIDDEN, "node identity mismatch"));
+    }
+    Ok(Json(
+        app.cluster.read().await.warm_instance_needed(id, &pool),
+    ))
 }
 
 async fn add_warm_instance(
     State(app): State<App>,
+    headers: HeaderMap,
     AxumPath((id, pool)): AxumPath<(Uuid, String)>,
 ) -> ApiResult<Json<bool>> {
+    if authenticated_node(&app, &headers).await? != id {
+        return Err(error(StatusCode::FORBIDDEN, "node identity mismatch"));
+    }
     let mut cluster = app.cluster.write().await;
     let added = cluster.add_warm_instance(id, &pool);
     if added {
@@ -1796,8 +2014,12 @@ async fn add_warm_instance(
 
 async fn remove_idle_instance(
     State(app): State<App>,
+    headers: HeaderMap,
     AxumPath((id, pool)): AxumPath<(Uuid, String)>,
 ) -> ApiResult<Json<bool>> {
+    if authenticated_node(&app, &headers).await? != id {
+        return Err(error(StatusCode::FORBIDDEN, "node identity mismatch"));
+    }
     let mut cluster = app.cluster.write().await;
     let removed = cluster.remove_idle_instance(id, &pool);
     if removed {
@@ -1810,9 +2032,13 @@ async fn remove_idle_instance(
 
 async fn next_work(
     State(app): State<App>,
+    headers: HeaderMap,
     AxumPath(id): AxumPath<Uuid>,
     Query(query): Query<NextWork>,
 ) -> ApiResult<Json<Option<Work>>> {
+    if authenticated_node(&app, &headers).await? != id {
+        return Err(error(StatusCode::FORBIDDEN, "node identity mismatch"));
+    }
     let deadline =
         tokio::time::Instant::now() + std::time::Duration::from_millis(query.wait_ms.min(2_000));
     loop {
@@ -1866,14 +2092,22 @@ struct CompleteExecution {
 
 async fn complete_execution(
     State(app): State<App>,
+    headers: HeaderMap,
     AxumPath(id): AxumPath<Uuid>,
     Json(request): Json<CompleteExecution>,
 ) -> ApiResult<StatusCode> {
+    let node = authenticated_node(&app, &headers).await?;
     let mut cluster = app.cluster.write().await;
     let execution = cluster
         .executions
         .get_mut(&id)
         .ok_or_else(|| error(StatusCode::NOT_FOUND, "execution not found"))?;
+    if execution.node != Some(node) {
+        return Err(error(
+            StatusCode::FORBIDDEN,
+            "execution belongs to another node",
+        ));
+    }
     execution.status = if request.timed_out.unwrap_or(false) {
         ExecutionStatus::TimedOut
     } else if request.error.is_some() {
@@ -1922,4 +2156,83 @@ async fn complete_execution(
 #[allow(dead_code)]
 fn artifact_path(data_dir: &Path, id: Uuid) -> PathBuf {
     data_dir.join("images").join(id.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderValue;
+
+    async fn app() -> App {
+        let data_dir = std::env::temp_dir().join(format!("scraperack-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&data_dir).await.unwrap();
+        App {
+            cluster: Arc::new(RwLock::new(Cluster::default())),
+            data_dir,
+            executions: Arc::new(Notify::new()),
+            work: Arc::new(Notify::new()),
+        }
+    }
+
+    #[tokio::test]
+    async fn join_tokens_are_single_use_and_create_authenticated_nodes() {
+        let app = app().await;
+        let token = create_join_token(State(app.clone())).await.unwrap().0;
+        let plaintext = token.token.unwrap();
+        assert!(
+            !app.cluster
+                .read()
+                .await
+                .join_tokens
+                .values()
+                .any(|token| token.token_hash == plaintext)
+        );
+
+        let credentials = join_cluster(
+            State(app.clone()),
+            Json(JoinRequest {
+                token: plaintext.clone(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {}", credentials.credential)).unwrap(),
+        );
+        assert_eq!(
+            authenticated_node(&app, &headers).await.unwrap(),
+            credentials.node_id
+        );
+        delete_node(State(app.clone()), AxumPath(credentials.node_id))
+            .await
+            .unwrap();
+        assert_eq!(
+            authenticated_node(&app, &headers).await.unwrap_err().0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            join_cluster(State(app.clone()), Json(JoinRequest { token: plaintext }))
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+        fs::remove_dir_all(app.data_dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_enrollment_rejects_remote_clients() {
+        let app = app().await;
+        let result = local_join(
+            ConnectInfo("192.0.2.1:1234".parse().unwrap()),
+            State(app.clone()),
+            Json(LocalJoinRequest { id: None }),
+        )
+        .await;
+        assert_eq!(result.unwrap_err().0, StatusCode::FORBIDDEN);
+        fs::remove_dir_all(app.data_dir).await.unwrap();
+    }
 }

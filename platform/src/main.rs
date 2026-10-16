@@ -1,5 +1,6 @@
 mod api;
 mod cluster;
+mod join;
 mod node;
 
 use std::{
@@ -43,6 +44,18 @@ enum Command {
         #[arg(long)]
         advertise_address: Option<IpAddr>,
     },
+    Join {
+        #[arg(long)]
+        controller: String,
+        #[arg(long)]
+        token: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long, default_value = "/etc/scraperack/node.env")]
+        config: PathBuf,
+        #[arg(long, default_value = "/var/lib/scraperack-node")]
+        data_dir: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -72,8 +85,16 @@ async fn main() -> Result<()> {
                 firecracker,
                 kernel,
                 advertise_address,
+                std::env::var("SCRAPERACK_NODE_CREDENTIAL").ok(),
             )
             .await
         }
+        Command::Join {
+            controller,
+            token,
+            name,
+            config,
+            data_dir,
+        } => join::run(controller, token, name, config, data_dir).await,
     }
 }

@@ -182,6 +182,14 @@ pub struct Node {
     pub last_seen_ms: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JoinToken {
+    pub id: Uuid,
+    pub token_hash: String,
+    pub expires_at_ms: u64,
+    pub used_at_ms: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionStatus {
@@ -243,6 +251,10 @@ pub struct Cluster {
     pub executions: HashMap<Uuid, Execution>,
     #[serde(default)]
     pub environments: HashMap<Uuid, Environment>,
+    #[serde(default)]
+    pub join_tokens: HashMap<Uuid, JoinToken>,
+    #[serde(default)]
+    pub node_credentials: HashMap<Uuid, String>,
     #[serde(default)]
     round_robin: usize,
 }
