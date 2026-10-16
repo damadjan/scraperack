@@ -38,7 +38,7 @@ html, body, #app, .q-layout, .q-page-container { background: var(--base); color:
 .status-busy { color: #f59e0b; }
 .status-error { color: #ef4444; }
 .data-grid { width: 100%; cursor: default; }
-.execution-grid { height: calc(100vh - 54px); min-height: 360px; }
+.full-height-grid { height: calc(100vh - 54px); min-height: 360px; }
 .data-grid .ag-root-wrapper {
   --ag-background-color: var(--surface);
   --ag-foreground-color: #dedede;
@@ -92,7 +92,7 @@ html, body, #app, .q-layout, .q-page-container { background: var(--base); color:
 }
 @media (max-width: 800px) {
   .mobile-menu { display: inline-flex; }
-  .execution-grid { height: calc(100vh - 98px); }
+  .full-height-grid { height: calc(100vh - 98px); }
 }
 @media (max-width: 600px) {
   .summary-grid, .detail-grid, .metric-charts, .timeline, .payload-grid { grid-template-columns: 1fr; }
