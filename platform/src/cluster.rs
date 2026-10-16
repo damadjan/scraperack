@@ -329,10 +329,8 @@ impl Cluster {
                         .is_none_or(|artifact| node.environments.contains(artifact))
                     && (has_idle
                         || (can_start
-                            && node.cpu_millis.saturating_sub(node.used_cpu_millis)
-                                >= pool.cpu_millis
-                            && node.memory_mib.saturating_sub(node.used_memory_mib)
-                                >= pool.memory_mib))
+                            && node.cpu_millis >= pool.cpu_millis
+                            && node.memory_mib >= pool.memory_mib))
             })
             .map(|node| {
                 (
@@ -358,8 +356,8 @@ impl Cluster {
         if *idle > 0 {
             *idle -= 1;
         } else {
-            node.used_cpu_millis += pool.cpu_millis;
-            node.used_memory_mib += pool.memory_mib;
+            node.used_cpu_millis = node.used_cpu_millis.saturating_add(pool.cpu_millis);
+            node.used_memory_mib = node.used_memory_mib.saturating_add(pool.memory_mib);
         }
         let execution = self.executions.get_mut(&execution_id).unwrap();
         execution.node = Some(node_id);
@@ -431,13 +429,11 @@ impl Cluster {
         let Some(node) = self.nodes.get_mut(&node_id) else {
             return false;
         };
-        if node.cpu_millis.saturating_sub(node.used_cpu_millis) < pool.cpu_millis
-            || node.memory_mib.saturating_sub(node.used_memory_mib) < pool.memory_mib
-        {
+        if node.cpu_millis < pool.cpu_millis || node.memory_mib < pool.memory_mib {
             return false;
         }
-        node.used_cpu_millis += pool.cpu_millis;
-        node.used_memory_mib += pool.memory_mib;
+        node.used_cpu_millis = node.used_cpu_millis.saturating_add(pool.cpu_millis);
+        node.used_memory_mib = node.used_memory_mib.saturating_add(pool.memory_mib);
         *node.idle_instances.entry(pool.name.clone()).or_default() += 1;
         true
     }
@@ -468,8 +464,8 @@ impl Cluster {
         let warm = if pool.reuse { idle + active } else { idle };
         warm < pool.warm_instances
             && pool.max_instances.is_none_or(|limit| active + idle < limit)
-            && node.cpu_millis.saturating_sub(node.used_cpu_millis) >= pool.cpu_millis
-            && node.memory_mib.saturating_sub(node.used_memory_mib) >= pool.memory_mib
+            && node.cpu_millis >= pool.cpu_millis
+            && node.memory_mib >= pool.memory_mib
     }
 
     pub fn remove_idle_instance(&mut self, node_id: Uuid, pool_name: &str) -> bool {
@@ -560,7 +556,7 @@ mod tests {
     }
 
     #[test]
-    fn schedules_round_robin_and_respects_memory() {
+    fn schedules_round_robin_and_overcommits_capacity() {
         let image = Uuid::new_v4();
         let first = Uuid::from_u128(1);
         let second = Uuid::from_u128(2);
@@ -630,7 +626,62 @@ mod tests {
                 metrics: None,
             },
         );
-        assert!(!cluster.schedule(id));
+        assert!(cluster.schedule(id));
+        assert_eq!(cluster.executions[&id].node, Some(first));
+        assert_eq!(cluster.nodes[&first].used_memory_mib, 1024);
+        cluster.pools.get_mut("p").unwrap().warm_instances = 4;
+        assert!(cluster.add_warm_instance(first, "p"));
+        assert_eq!(cluster.nodes[&first].used_memory_mib, 1536);
+    }
+
+    #[test]
+    fn rejects_an_instance_larger_than_a_node() {
+        let image = Uuid::new_v4();
+        let node_id = Uuid::new_v4();
+        let execution_id = Uuid::new_v4();
+        let mut cluster = Cluster::default();
+        cluster.nodes.insert(node_id, node(node_id, image));
+        cluster.pools.insert(
+            "p".into(),
+            Pool {
+                name: "p".into(),
+                image,
+                warm_instances: 1,
+                max_instances: None,
+                cpu_millis: 1001,
+                memory_mib: 513,
+                disk_mib: 1024,
+                timeout_secs: 60,
+                idle_timeout_secs: 30,
+                reuse: true,
+                network: false,
+                ports: Vec::new(),
+                managed_by: None,
+                environment: None,
+                environment_artifact: None,
+                preload: Vec::new(),
+            },
+        );
+        cluster.executions.insert(
+            execution_id,
+            Execution {
+                id: execution_id,
+                pool: "p".into(),
+                node: None,
+                status: ExecutionStatus::Queued,
+                payload: Value::Null,
+                result: None,
+                error: None,
+                created_at_ms: 0,
+                started_at_ms: None,
+                finished_at_ms: None,
+                environment: None,
+                metrics: None,
+            },
+        );
+
+        assert!(!cluster.schedule(execution_id));
+        assert!(!cluster.add_warm_instance(node_id, "p"));
     }
 
     #[test]

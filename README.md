@@ -30,7 +30,7 @@ verification/  Local execution checks and benchmarks
 - Separate general-purpose VM pools and Python execution environments
 - Immutable, content-addressed Python package environments distributed and cached on nodes
 - Automatic runtime snapshots, live warm instances, idle expiry, reuse, and scale-out limits
-- Fractional CPU, fixed memory/disk, and execution timeouts in pool definitions
+- Per-VM CPU, memory, and disk limits with owner-managed aggregate overcommit
 - Round-robin node scheduling with queue-or-fail submission
 - Persistent execution history and cluster metadata
 - Python SDK with `cloudpickle` and JSON payloads

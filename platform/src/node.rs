@@ -159,16 +159,20 @@ impl VmState {
         reports
     }
 
-    fn acquire(&mut self, pool: &Pool) -> Option<LiveVm> {
-        self.active_cpu_millis += pool.cpu_millis;
-        self.active_memory_mib += pool.memory_mib;
-        self.idle
+    fn acquire(&mut self, pool: &Pool) -> std::result::Result<Option<LiveVm>, &'static str> {
+        if pool.cpu_millis > self.cpu_millis || pool.memory_mib > self.memory_mib {
+            return Err("instance resources exceed node capacity");
+        }
+        self.active_cpu_millis = self.active_cpu_millis.saturating_add(pool.cpu_millis);
+        self.active_memory_mib = self.active_memory_mib.saturating_add(pool.memory_mib);
+        Ok(self
+            .idle
             .iter()
             .enumerate()
             .filter(|(_, vm)| vm.pool.name == pool.name)
             .max_by_key(|(_, vm)| vm.last_used)
             .map(|(index, _)| index)
-            .map(|index| self.idle.swap_remove(index))
+            .map(|index| self.idle.swap_remove(index)))
     }
 
     fn release(&mut self, pool: &Pool, vm: Option<LiveVm>) {
@@ -180,15 +184,11 @@ impl VmState {
     }
 
     fn reserve_warm(&mut self, pool: &Pool) -> bool {
-        let idle_cpu = self.idle.iter().map(|vm| vm.pool.cpu_millis).sum::<u32>();
-        let idle_memory = self.idle.iter().map(|vm| vm.pool.memory_mib).sum::<u32>();
-        if self.active_cpu_millis + idle_cpu + pool.cpu_millis > self.cpu_millis
-            || self.active_memory_mib + idle_memory + pool.memory_mib > self.memory_mib
-        {
+        if pool.cpu_millis > self.cpu_millis || pool.memory_mib > self.memory_mib {
             return false;
         }
-        self.active_cpu_millis += pool.cpu_millis;
-        self.active_memory_mib += pool.memory_mib;
+        self.active_cpu_millis = self.active_cpu_millis.saturating_add(pool.cpu_millis);
+        self.active_memory_mib = self.active_memory_mib.saturating_add(pool.memory_mib);
         true
     }
 }
@@ -780,7 +780,18 @@ async fn run_execution(
     network: &Network,
     vms: &Mutex<VmState>,
 ) -> Completion {
-    let idle = vms.lock().await.acquire(&work.pool);
+    let idle = match vms.lock().await.acquire(&work.pool) {
+        Ok(idle) => idle,
+        Err(error) => {
+            return Completion {
+                result: None,
+                error: Some(error.into()),
+                timed_out: false,
+                metrics: None,
+                keep_idle: false,
+            };
+        }
+    };
     let reused = idle.is_some();
     let mut vm = match idle {
         Some(vm) => vm,
