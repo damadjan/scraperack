@@ -108,17 +108,19 @@ def shell(active):
         groups = [
             (None, [("dashboard", "/", "home", "Home")]),
             ("Execution", [
-                ("environments", "/environments", "science", "Environments"),
                 ("executions", "/executions", "terminal", "Executions"),
+                ("environments", "/environments", "science", "Environments"),
                 ("runtime-images", "/runtime-images", "extension", "Runtime Images"),
             ]),
-            ("Infrastructure", [
+            ("Virtualization", [
                 ("vms", "/vms", "memory", "MicroVMs"),
                 ("pools", "/pools", "hub", "VM Pools"),
                 ("vm-images", "/vm-images", "layers", "VM Images"),
-                ("nodes", "/nodes", "dns", "Nodes"),
             ]),
-            (None, [("settings", "/settings", "settings", "Settings")]),
+            ("Infrastructure", [
+                ("nodes", "/nodes", "dns", "Nodes"),
+                ("settings", "/settings", "settings", "Settings"),
+            ]),
         ]
         for group, links in groups:
             if group:
@@ -162,7 +164,7 @@ def table(columns, rows=None, selection=False, row_key=None, full_height=False):
     if row_key:
         options[":getRowId"] = f"(params) => params.data.{row_key}"
     grid = ui.aggrid(options, auto_size_columns=False).classes(
-        f'data-grid {"execution-grid" if full_height else ""}'
+        f'data-grid {"full-height-grid" if full_height else ""}'
     )
     return grid.classes("clickable-grid") if selection else grid
 
@@ -315,13 +317,17 @@ async def nodes_page():
             {"headerName": "Env caches", "field": "environment_count", "maxWidth": 120},
             {"headerName": "Idle VMs", "field": "idle_count", "maxWidth": 110},
             {"headerName": "Last heartbeat", "field": "last_seen", "minWidth": 190},
-        ], selection=True, row_key="id")
+        ], selection=True, row_key="id", full_height=True)
+
+    known = {}
+    initialized = False
 
     async def refresh():
+        nonlocal known, initialized
         try:
             data = await request("GET", "/v1/nodes")
-            set_rows(nodes, [
-                {**node,
+            rows = [
+                {"id": node["id"], "name": node["name"], "status": node["status"],
                  "cpu": f'{node["used_cpu_millis"] / 1000:g} / {node["cpu_millis"] / 1000:g} cores · '
                         f'{(node["used_cpu_millis"] / node["cpu_millis"] * 100 if node["cpu_millis"] else 0):.0f}%',
                  "memory": f'{node["used_memory_mib"]} / {node["memory_mib"]} MiB · '
@@ -331,7 +337,23 @@ async def nodes_page():
                  "idle_count": sum(node.get("idle_instances", {}).values()),
                  "last_seen": stamp(node["last_seen_ms"])}
                 for node in data
-            ])
+            ]
+            current = {row["id"]: row for row in rows}
+            if not initialized:
+                set_rows(nodes, rows)
+                known = current
+                initialized = True
+                return
+            transaction = {
+                "add": [row for key, row in current.items() if key not in known],
+                "update": [row for key, row in current.items() if key in known and row != known[key]],
+                "remove": [row for key, row in known.items() if key not in current],
+            }
+            with nodes.props.suspend_updates():
+                nodes.options["rowData"] = rows
+            if any(transaction.values()):
+                nodes.run_grid_method("applyTransaction", transaction)
+            known = current
         except Exception as error:
             notify_error(error)
 
