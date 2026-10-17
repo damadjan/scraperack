@@ -31,15 +31,17 @@ use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
 use crate::cluster::{
-    Cluster, Environment, Execution, ExecutionMetrics, ExecutionStatus, Image, ImageKind,
-    JoinToken, MicroVm, Node, NodeStatus, Pool, Work,
+    Cluster, Environment, Execution, ExecutionMetrics, ExecutionStatus, ExecutionView, Image,
+    ImageKind, JoinToken, MicroVm, Node, NodeStatus, Pool, Work,
 };
+use crate::storage::{Database, StorageSettings, StorageView};
 
 const JOIN_TOKEN_TTL_MS: u64 = 10 * 60 * 1000;
 
 #[derive(Clone)]
 struct App {
     cluster: Arc<RwLock<Cluster>>,
+    database: Database,
     controller_id: Uuid,
     data_dir: PathBuf,
     executions: Arc<Notify>,
@@ -144,89 +146,70 @@ fn migrate_legacy(cluster: &mut Cluster) {
 }
 
 async fn save(app: &App, cluster: &Cluster) -> ApiResult<()> {
-    let bytes = serde_json::to_vec(cluster)
-        .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let temporary = app.data_dir.join("state.json.tmp");
-    fs::write(&temporary, bytes)
-        .await
-        .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    fs::rename(temporary, app.data_dir.join("state.json"))
-        .await
-        .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+    app.database.save_cluster(cluster).map_err(internal_error)
 }
 
 async fn save_execution(app: &App, execution: &Execution) -> ApiResult<()> {
-    let bytes = serde_json::to_vec(execution)
-        .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let path = app
-        .data_dir
-        .join("executions")
-        .join(format!("{}.json", execution.id));
-    let temporary = path.with_extension("tmp");
-    fs::write(&temporary, bytes)
-        .await
-        .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    fs::rename(temporary, path)
-        .await
-        .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+    app.database
+        .save_execution(execution)
+        .map_err(internal_error)
 }
 
-async fn load_executions(data_dir: &Path, cluster: &mut Cluster) -> Result<()> {
-    let directory = data_dir.join("executions");
-    fs::create_dir_all(&directory).await?;
-    for execution in cluster.executions.values() {
-        fs::write(
-            directory.join(format!("{}.json", execution.id)),
-            serde_json::to_vec(execution)?,
-        )
-        .await?;
-    }
-    let mut entries = fs::read_dir(directory).await?;
-    while let Some(entry) = entries.next_entry().await? {
-        if entry.path().extension().and_then(OsStr::to_str) != Some("json") {
-            continue;
-        }
-        let mut execution: Execution = serde_json::from_slice(&fs::read(entry.path()).await?)?;
-        if !matches!(
-            execution.status,
-            ExecutionStatus::Succeeded | ExecutionStatus::Failed | ExecutionStatus::TimedOut
-        ) {
-            execution.status = ExecutionStatus::Queued;
-            execution.node = None;
-            execution.started_at_ms = None;
-        }
-        cluster.executions.insert(execution.id, execution);
-    }
-    Ok(())
+fn internal_error(cause: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
+    error(StatusCode::INTERNAL_SERVER_ERROR, cause.to_string())
 }
 
 pub async fn serve(listen: std::net::SocketAddr, data_dir: PathBuf) -> Result<()> {
     fs::create_dir_all(data_dir.join("images")).await?;
     fs::create_dir_all(data_dir.join("environments")).await?;
+    let database = Database::open(&data_dir.join("scraperack.db"))?;
     let controller_id_path = data_dir.join("controller-id");
-    let controller_id = match fs::read_to_string(&controller_id_path).await {
-        Ok(id) => Uuid::parse_str(id.trim())?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let id = Uuid::new_v4();
-            fs::write(controller_id_path, id.to_string()).await?;
-            id
-        }
-        Err(e) => return Err(e.into()),
+    let legacy_controller_id = match fs::read_to_string(&controller_id_path).await {
+        Ok(id) => Some(Uuid::parse_str(id.trim())?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
     };
-    let mut cluster: Cluster = match fs::read(data_dir.join("state.json")).await {
-        Ok(bytes) => serde_json::from_slice(&bytes)?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Cluster::default(),
-        Err(e) => return Err(e.into()),
+    let controller_id = database.controller_id(legacy_controller_id)?;
+    let state_path = data_dir.join("state.json");
+    let stored_cluster = database.load_cluster()?;
+    let fresh = stored_cluster.is_none();
+    let mut cluster = match stored_cluster {
+        Some(cluster) => cluster,
+        None => match fs::read(&state_path).await {
+            Ok(bytes) => serde_json::from_slice(&bytes)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Cluster::default(),
+            Err(error) => return Err(error.into()),
+        },
     };
-    load_executions(&data_dir, &mut cluster).await?;
     migrate_legacy(&mut cluster);
+    for execution in database.load_active_executions()? {
+        cluster.executions.insert(execution.id, execution);
+    }
+    database.save_cluster(&cluster)?;
+    if fresh {
+        fs::remove_file(state_path).await.ok();
+        fs::remove_file(controller_id_path).await.ok();
+        fs::remove_dir_all(data_dir.join("executions")).await.ok();
+    }
     let app = App {
         cluster: Arc::new(RwLock::new(cluster)),
+        database,
         controller_id,
         data_dir,
         executions: Arc::new(Notify::new()),
         work: Arc::new(Notify::new()),
     };
+    app.database.prune(now_ms())?;
+    let garbage_collector = app.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            if let Err(error) = garbage_collector.database.prune(now_ms()) {
+                tracing::error!(%error, "execution garbage collection failed");
+            }
+        }
+    });
     let router = Router::new()
         .route("/health", get(|| async { Json(json!({ "ok": true })) }))
         .route("/v1/images", get(list_images))
@@ -250,6 +233,10 @@ pub async fn serve(listen: std::net::SocketAddr, data_dir: PathBuf) -> Result<()
         .route("/v1/environments/{id}/artifact", get(download_environment))
         .route("/v1/nodes", get(list_nodes))
         .route("/v1/nodes/{id}", delete(delete_node))
+        .route(
+            "/v1/settings/storage",
+            get(get_storage_settings).put(update_storage_settings),
+        )
         .route("/v1/join-tokens", post(create_join_token))
         .route("/v1/join-tokens/{id}", get(get_join_token))
         .route("/v1/vms", get(list_vms))
@@ -259,6 +246,9 @@ pub async fn serve(listen: std::net::SocketAddr, data_dir: PathBuf) -> Result<()
         )
         .route("/v1/executions/{id}", get(get_execution))
         .route("/v1/executions/{id}/wait", get(wait_execution))
+        .route("/v1/executions/{id}/payload", get(get_execution_payload))
+        .route("/v1/executions/{id}/result", get(get_execution_result))
+        .route("/v1/executions/{id}/logs", get(get_execution_logs))
         .route("/internal/nodes/register", post(register_node))
         .route("/internal/identity", get(controller_identity))
         .route("/internal/join", post(join_cluster))
@@ -1433,17 +1423,18 @@ async fn update_environment(
         Vec::new()
     };
     cluster.environments.insert(id, environment.clone());
-    cluster.schedule_queued();
+    let scheduled = cluster.schedule_queued();
     let ready = cluster.environment_ready(&environment);
     save(&app, &cluster).await?;
-    let reassigned = reassigned
+    let mut reassigned = reassigned
         .into_iter()
         .map(|id| cluster.executions[&id].clone())
         .collect::<Vec<_>>();
+    reassigned.extend(scheduled);
     drop(cluster);
-    for execution in &reassigned {
-        save_execution(&app, execution).await?;
-    }
+    app.database
+        .save_executions(&reassigned)
+        .map_err(internal_error)?;
     app.work.notify_waiters();
     Ok(Json(EnvironmentView { environment, ready }))
 }
@@ -1460,17 +1451,18 @@ async fn restart_environment(
         .ok_or_else(|| error(StatusCode::NOT_FOUND, "environment not found"))?;
     let reassigned = restart_environment_pool(&mut cluster, &mut environment);
     cluster.environments.insert(id, environment.clone());
-    cluster.schedule_queued();
+    let scheduled = cluster.schedule_queued();
     let ready = cluster.environment_ready(&environment);
     save(&app, &cluster).await?;
-    let reassigned = reassigned
+    let mut reassigned = reassigned
         .into_iter()
         .map(|id| cluster.executions[&id].clone())
         .collect::<Vec<_>>();
+    reassigned.extend(scheduled);
     drop(cluster);
-    for execution in &reassigned {
-        save_execution(&app, execution).await?;
-    }
+    app.database
+        .save_executions(&reassigned)
+        .map_err(internal_error)?;
     app.work.notify_waiters();
     Ok(Json(EnvironmentView { environment, ready }))
 }
@@ -1692,8 +1684,11 @@ async fn delete_node(
         return Err(error(StatusCode::NOT_FOUND, "node not found"));
     }
     cluster.node_credentials.remove(&id);
-    cluster.schedule_queued();
+    let scheduled = cluster.schedule_queued();
     save(&app, &cluster).await?;
+    app.database
+        .save_executions(&scheduled)
+        .map_err(internal_error)?;
     app.work.notify_waiters();
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1729,6 +1724,27 @@ async fn list_vms(State(app): State<App>) -> Json<Vec<VmView>> {
     )
 }
 
+async fn get_storage_settings(State(app): State<App>) -> ApiResult<Json<StorageView>> {
+    app.database.settings().map(Json).map_err(internal_error)
+}
+
+async fn update_storage_settings(
+    State(app): State<App>,
+    Json(settings): Json<StorageSettings>,
+) -> ApiResult<Json<StorageView>> {
+    if !(1..=24).contains(&settings.retention_hours) || settings.max_storage_bytes == 0 {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "retention must be 1-24 hours and storage limit must be greater than zero",
+        ));
+    }
+    app.database
+        .update_settings(&settings)
+        .map_err(internal_error)?;
+    app.database.prune(now_ms()).map_err(internal_error)?;
+    get_storage_settings(State(app)).await
+}
+
 #[derive(Deserialize)]
 struct CreateExecution {
     #[serde(default)]
@@ -1747,7 +1763,7 @@ fn default_queue() -> bool {
 async fn create_execution(
     State(app): State<App>,
     Json(request): Json<CreateExecution>,
-) -> ApiResult<(StatusCode, Json<Execution>)> {
+) -> ApiResult<(StatusCode, Json<ExecutionView>)> {
     let mut cluster = app.cluster.write().await;
     let environment = request.environment.as_deref().and_then(|key| {
         Uuid::parse_str(key)
@@ -1797,32 +1813,41 @@ async fn create_execution(
         ));
     }
     let id = Uuid::new_v4();
-    cluster.executions.insert(
+    let execution = Execution {
         id,
-        Execution {
-            id,
-            pool: pool_name,
-            node: None,
-            status: ExecutionStatus::Queued,
-            payload: request.payload,
-            result: None,
-            error: None,
-            created_at_ms: now_ms(),
-            started_at_ms: None,
-            finished_at_ms: None,
-            environment: environment_id,
-            metrics: None,
-        },
-    );
+        pool: pool_name,
+        node: None,
+        status: ExecutionStatus::Queued,
+        payload: request.payload,
+        result: None,
+        error: None,
+        created_at_ms: now_ms(),
+        started_at_ms: None,
+        finished_at_ms: None,
+        environment: environment_id,
+        metrics: None,
+    };
+    if !app
+        .database
+        .insert_execution(&execution)
+        .map_err(internal_error)?
+    {
+        return Err(error(
+            StatusCode::INSUFFICIENT_STORAGE,
+            "controller execution storage is full",
+        ));
+    }
+    cluster.executions.insert(id, execution);
     if !cluster.schedule(id) && !request.queue {
         cluster.executions.remove(&id);
+        app.database.delete_execution(id).map_err(internal_error)?;
         return Err(error(StatusCode::SERVICE_UNAVAILABLE, "cluster is full"));
     }
     let execution = cluster.executions[&id].clone();
     save_execution(&app, &execution).await?;
     drop(cluster);
     app.work.notify_waiters();
-    Ok((StatusCode::ACCEPTED, Json(execution)))
+    Ok((StatusCode::ACCEPTED, Json(ExecutionView::from(&execution))))
 }
 
 #[derive(Deserialize)]
@@ -1833,62 +1858,122 @@ struct ListExecutions {
 async fn list_executions(
     State(app): State<App>,
     Query(query): Query<ListExecutions>,
-) -> Json<Vec<Execution>> {
-    let mut executions = app
-        .cluster
-        .read()
-        .await
-        .executions
-        .values()
-        .cloned()
-        .collect::<Vec<_>>();
-    executions.sort_unstable_by_key(|execution| std::cmp::Reverse(execution.created_at_ms));
-    if let Some(limit) = query.limit {
-        executions.truncate(limit);
-    }
-    Json(executions)
+) -> ApiResult<Json<Vec<ExecutionView>>> {
+    app.database
+        .list_executions(query.limit)
+        .map(Json)
+        .map_err(internal_error)
 }
 
 async fn get_execution(
     State(app): State<App>,
     AxumPath(id): AxumPath<Uuid>,
-) -> ApiResult<Json<Execution>> {
-    app.cluster
-        .read()
-        .await
-        .executions
-        .get(&id)
-        .cloned()
-        .map(Json)
+) -> ApiResult<Json<ExecutionView>> {
+    app.database
+        .execution(id)
+        .map_err(internal_error)?
+        .map(|execution| Json(ExecutionView::from(&execution)))
         .ok_or_else(|| error(StatusCode::NOT_FOUND, "execution not found"))
 }
 
 async fn wait_execution(
     State(app): State<App>,
     AxumPath(id): AxumPath<Uuid>,
-) -> ApiResult<Json<Execution>> {
+) -> ApiResult<Json<ExecutionView>> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(25);
     loop {
         let notified = app.executions.notified();
         let execution = app
-            .cluster
-            .read()
-            .await
-            .executions
-            .get(&id)
-            .cloned()
+            .database
+            .execution(id)
+            .map_err(internal_error)?
             .ok_or_else(|| error(StatusCode::NOT_FOUND, "execution not found"))?;
         if matches!(
             execution.status,
             ExecutionStatus::Succeeded | ExecutionStatus::Failed | ExecutionStatus::TimedOut
         ) || tokio::time::Instant::now() >= deadline
         {
-            return Ok(Json(execution));
+            return Ok(Json(ExecutionView::from(&execution)));
         }
         if tokio::time::timeout_at(deadline, notified).await.is_err() {
             return get_execution(State(app), AxumPath(id)).await;
         }
     }
+}
+
+#[derive(Serialize)]
+struct ExecutionResult {
+    status: ExecutionStatus,
+    value: Option<Value>,
+    error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ExecutionLogs {
+    stdout: String,
+    stderr: String,
+}
+
+async fn get_execution_payload(
+    State(app): State<App>,
+    AxumPath(id): AxumPath<Uuid>,
+) -> ApiResult<Json<Value>> {
+    app.database
+        .execution(id)
+        .map_err(internal_error)?
+        .map(|execution| Json(execution.payload))
+        .ok_or_else(|| error(StatusCode::NOT_FOUND, "execution not found"))
+}
+
+async fn get_execution_result(
+    State(app): State<App>,
+    AxumPath(id): AxumPath<Uuid>,
+) -> ApiResult<Json<ExecutionResult>> {
+    let execution = app
+        .database
+        .execution(id)
+        .map_err(internal_error)?
+        .ok_or_else(|| error(StatusCode::NOT_FOUND, "execution not found"))?;
+    if !matches!(
+        execution.status,
+        ExecutionStatus::Succeeded | ExecutionStatus::Failed | ExecutionStatus::TimedOut
+    ) {
+        return Err(error(StatusCode::CONFLICT, "execution is not finished"));
+    }
+    let value = execution
+        .result
+        .as_ref()
+        .and_then(|result| result.get("value"))
+        .cloned();
+    Ok(Json(ExecutionResult {
+        status: execution.status,
+        value,
+        error: execution.error,
+    }))
+}
+
+async fn get_execution_logs(
+    State(app): State<App>,
+    AxumPath(id): AxumPath<Uuid>,
+) -> ApiResult<Json<ExecutionLogs>> {
+    let execution = app
+        .database
+        .execution(id)
+        .map_err(internal_error)?
+        .ok_or_else(|| error(StatusCode::NOT_FOUND, "execution not found"))?;
+    let output = execution.result.as_ref();
+    Ok(Json(ExecutionLogs {
+        stdout: output
+            .and_then(|result| result.get("stdout"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .into(),
+        stderr: output
+            .and_then(|result| result.get("stderr"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .into(),
+    }))
 }
 
 #[derive(Deserialize)]
@@ -1940,9 +2025,12 @@ async fn register_node(
         cluster.reset_idle_instances(id);
     }
     cluster.refresh_node(id);
-    cluster.schedule_queued();
+    let scheduled = cluster.schedule_queued();
     let node = cluster.nodes[&id].clone();
     save(&app, &cluster).await?;
+    app.database
+        .save_executions(&scheduled)
+        .map_err(internal_error)?;
     app.work.notify_waiters();
     Ok(Json(node))
 }
@@ -1965,8 +2053,11 @@ async fn image_ready(
         .ok_or_else(|| error(StatusCode::NOT_FOUND, "node not found"))?;
     node.images.insert(image);
     cluster.refresh_node(id);
-    cluster.schedule_queued();
+    let scheduled = cluster.schedule_queued();
     save(&app, &cluster).await?;
+    app.database
+        .save_executions(&scheduled)
+        .map_err(internal_error)?;
     app.work.notify_waiters();
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1992,8 +2083,11 @@ async fn environment_ready(
         .get_mut(&id)
         .ok_or_else(|| error(StatusCode::NOT_FOUND, "node not found"))?;
     node.environments.insert(artifact);
-    cluster.schedule_queued();
+    let scheduled = cluster.schedule_queued();
     save(&app, &cluster).await?;
+    app.database
+        .save_executions(&scheduled)
+        .map_err(internal_error)?;
     app.work.notify_waiters();
     Ok(StatusCode::NO_CONTENT)
 }
@@ -2022,8 +2116,11 @@ async fn add_warm_instance(
     let mut cluster = app.cluster.write().await;
     let added = cluster.add_warm_instance(id, &pool);
     if added {
-        cluster.schedule_queued();
+        let scheduled = cluster.schedule_queued();
         save(&app, &cluster).await?;
+        app.database
+            .save_executions(&scheduled)
+            .map_err(internal_error)?;
         app.work.notify_waiters();
     }
     Ok(Json(added))
@@ -2040,8 +2137,11 @@ async fn remove_idle_instance(
     let mut cluster = app.cluster.write().await;
     let removed = cluster.remove_idle_instance(id, &pool);
     if removed {
-        cluster.schedule_queued();
+        let scheduled = cluster.schedule_queued();
         save(&app, &cluster).await?;
+        app.database
+            .save_executions(&scheduled)
+            .map_err(internal_error)?;
         app.work.notify_waiters();
     }
     Ok(Json(removed))
@@ -2082,6 +2182,7 @@ async fn next_work(
             })
         };
         if let Some(work) = work {
+            save_execution(&app, &work.execution).await?;
             return Ok(Json(Some(work)));
         }
         if query.wait_ms == 0 || tokio::time::timeout_at(deadline, notified).await.is_err() {
@@ -2159,12 +2260,18 @@ async fn complete_execution(
                 .used_memory_mib
                 .saturating_sub(pool.memory_mib.saturating_mul(idle));
         }
-        save(&app, &cluster).await?;
     }
-    cluster.schedule_queued();
+    let scheduled = cluster.schedule_queued();
     let execution = cluster.executions[&id].clone();
+    cluster.executions.remove(&id);
+    save(&app, &cluster).await?;
     drop(cluster);
-    save_execution(&app, &execution).await?;
+    app.database
+        .save_executions(&scheduled)
+        .map_err(internal_error)?;
+    app.database
+        .complete_execution(&execution)
+        .map_err(internal_error)?;
     app.executions.notify_waiters();
     app.work.notify_waiters();
     Ok(StatusCode::NO_CONTENT)
@@ -2183,8 +2290,10 @@ mod tests {
     async fn app() -> App {
         let data_dir = std::env::temp_dir().join(format!("scraperack-test-{}", Uuid::new_v4()));
         fs::create_dir_all(&data_dir).await.unwrap();
+        let database = Database::open(&data_dir.join("scraperack.db")).unwrap();
         App {
             cluster: Arc::new(RwLock::new(Cluster::default())),
+            database,
             controller_id: Uuid::new_v4(),
             data_dir,
             executions: Arc::new(Notify::new()),

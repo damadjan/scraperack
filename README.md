@@ -66,7 +66,7 @@ def add(a, b):
     return a + b
 
 execution = cluster.run(environment["id"], add, (2, 3))
-result = cluster.wait(execution["id"])
+result = cluster.result(execution["id"])
 ```
 
 ## Development

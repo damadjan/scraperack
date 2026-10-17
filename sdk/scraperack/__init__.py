@@ -1,4 +1,4 @@
-from .client import AsyncCluster, Cluster
+from .client import AsyncCluster, Cluster, RemoteError
 from .types import (
     EncodedValue,
     Environment,
@@ -33,4 +33,5 @@ __all__ = [
     "PortProtocol",
     "PortSpec",
     "PublishedPort",
+    "RemoteError",
 ]

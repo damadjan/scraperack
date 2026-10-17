@@ -14,7 +14,6 @@ jobs = [
 try:
     for name, source, params in jobs:
         execution = cluster.run_source(environment, source, params)
-        result = cluster.wait(execution["id"])
-        print(name, result["status"], result.get("result") or result.get("error"))
+        print(name, cluster.result(execution["id"]))
 finally:
     cluster.close()

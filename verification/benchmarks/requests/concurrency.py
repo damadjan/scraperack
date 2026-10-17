@@ -30,20 +30,17 @@ levels = [int(value) for value in sys.argv[1:]] or [1, 2, 4, 8, 16, 32]
 cluster = Cluster(url="http://192.168.2.16:7070")
 print("sent  peak  ok  total    req/s  p50     p95")
 for concurrency in levels:
+    def execute(_):
+        execution = cluster.run(environment="bench2", function=request)
+        value = cluster.result(execution["id"])
+        return cluster.execution(execution["id"]), value
+
     start = time.perf_counter()
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
-        executions = list(pool.map(
-            lambda _: cluster.wait(execution_id=cluster.run(
-                environment="bench2", function=request,
-            )["id"]),
-            range(concurrency),
-        ))
+        completed = list(pool.map(execute, range(concurrency)))
     total = time.perf_counter() - start
-    elapsed = sorted(
-        execution["result"]["value"]["data"][1]
-        for execution in executions
-        if not execution["error"]
-    )
+    executions = [execution for execution, _ in completed]
+    elapsed = sorted(value[1] for _, value in completed)
     p50 = elapsed[len(elapsed) // 2] if elapsed else 0
     p95 = elapsed[int((len(elapsed) - 1) * .95)] if elapsed else 0
     print(f"{concurrency:>4}  {peak(executions):>4}  {len(elapsed):>2}  "
