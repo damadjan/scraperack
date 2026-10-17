@@ -180,10 +180,15 @@ async def execution_details(event):
     if not run:
         return
     try:
-        run, environments = await asyncio.gather(
+        run, environments, payload, logs = await asyncio.gather(
             request("GET", f'/v1/executions/{run["id"]}'),
             request("GET", "/v1/environments"),
+            request("GET", f'/v1/executions/{run["id"]}/payload'),
+            request("GET", f'/v1/executions/{run["id"]}/logs'),
         )
+        outcome = {"value": None}
+        if run["status"] in ("succeeded", "failed", "timed_out"):
+            outcome = await request("GET", f'/v1/executions/{run["id"]}/result')
     except Exception as error:
         notify_error(error)
         return
@@ -241,10 +246,12 @@ async def execution_details(event):
                         ui.label(label).classes("detail-label")
                         ui.label(stamp(value)).classes("text-sm")
         with ui.element("div").classes("payload-grid"):
-            for label, value in (("Payload", run["payload"]), ("Result", run["result"])):
+            for label, value in (("Payload", payload), ("Result", outcome["value"]),
+                                 ("stdout", logs["stdout"]), ("stderr", logs["stderr"])):
                 with ui.element("div").classes("data-block"):
                     ui.label(label).classes("section-title")
-                    ui.code(json.dumps(value, indent=2, ensure_ascii=False) if value is not None else "—").classes("json-code")
+                    text = value if isinstance(value, str) else json.dumps(value, indent=2, ensure_ascii=False)
+                    ui.code(text if value is not None else "—").classes("json-code")
         if run["error"]:
             with ui.element("div").classes("error-block"):
                 ui.label("Error").classes("section-title")
@@ -950,6 +957,39 @@ async def vms_page():
 @ui.page("/settings")
 async def settings_page():
     with shell("settings"):
+        storage = await request("GET", "/v1/settings/storage")
+        with ui.card().classes("panel"):
+            ui.label("Execution storage").classes("section-title")
+            ui.label("Completed executions are a temporary buffer and may be evicted early when full.") \
+                .classes("text-sm muted")
+            with ui.row().classes("items-end w-full"):
+                retention = ui.number("Retention", value=storage["retention_hours"],
+                                      min=1, max=24, suffix="hours").classes("w-48")
+                limit = ui.number("Maximum storage", value=storage["max_storage_bytes"] / 1024**3,
+                                  min=.1, step=.1, suffix="GiB").classes("w-56")
+                save_storage = ui.button("Save", icon="save").props("unelevated no-caps color=teal")
+            usage = ui.label(
+                f'{size(storage["used_storage_bytes"])} used of {size(storage["max_storage_bytes"])}'
+            ).classes("text-sm muted")
+
+            async def update_storage():
+                save_storage.disable()
+                try:
+                    updated = await request("PUT", "/v1/settings/storage", json={
+                        "retention_hours": int(retention.value),
+                        "max_storage_bytes": round(float(limit.value) * 1024**3),
+                    })
+                    usage.text = (
+                        f'{size(updated["used_storage_bytes"])} used of '
+                        f'{size(updated["max_storage_bytes"])}'
+                    )
+                    ui.notify("Storage settings saved", type="positive")
+                except Exception as error:
+                    notify_error(error)
+                finally:
+                    save_storage.enable()
+
+            save_storage.on_click(update_storage)
         with ui.card().classes("panel"):
             ui.label("Join nodes").classes("section-title")
             ui.label("Generate a single-use command for an existing ScrapeRack installation.") \

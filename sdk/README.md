@@ -25,8 +25,7 @@ def add(a, b):
 cluster = Cluster("http://controller:7070")
 try:
     execution = cluster.run("python", add, (2, 3))
-    result = cluster.wait(execution["id"])
-    print(result["result"]["value"]["data"])
+    print(cluster.result(execution["id"]))
 finally:
     cluster.close()
 ```

@@ -2,6 +2,7 @@ mod api;
 mod cluster;
 mod join;
 mod node;
+mod storage;
 
 use std::{
     net::{IpAddr, SocketAddr},

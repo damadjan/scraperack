@@ -32,7 +32,6 @@ jobs = [
 try:
     for function, params in jobs:
         execution = cluster.run(environment, function, params)
-        result = cluster.wait(execution["id"])
-        print(function.__name__, result["status"], result.get("error") or result.get("result"))
+        print(function.__name__, cluster.result(execution["id"]))
 finally:
     cluster.close()

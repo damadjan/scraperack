@@ -9,6 +9,10 @@ import httpx
 from .types import Environment, Execution, Image, ImageView, MicroVM, Node, Pool, PortSpec
 
 
+class RemoteError(RuntimeError):
+    """An execution failed in the remote environment."""
+
+
 def _payload(
     function: Callable[..., Any], params: Sequence[Any]
 ) -> dict[str, Any]:
@@ -26,6 +30,16 @@ def _files(files: Mapping[str, str | Path]) -> dict[str, str]:
         name: base64.b64encode(Path(path).read_bytes()).decode()
         for name, path in files.items()
     }
+
+
+def _decode(value: Mapping[str, Any] | None) -> Any:
+    if value is None:
+        return None
+    if value["encoding"] == "json":
+        return value["data"]
+    if value["encoding"] == "cloudpickle":
+        return cloudpickle.loads(base64.b64decode(value["data"]))
+    raise ValueError(f'unknown result encoding: {value["encoding"]}')
 
 
 class Cluster:
@@ -203,6 +217,18 @@ class Cluster:
             execution = response.json()
             if execution["status"] in {"succeeded", "failed", "timed_out"}:
                 return execution
+
+    def result(self, execution_id: str) -> Any:
+        """Wait for an execution and return its decoded value."""
+        self.wait(execution_id)
+        outcome = self._get(f"/v1/executions/{execution_id}/result")
+        if outcome["status"] != "succeeded":
+            raise RemoteError(outcome["error"] or f'execution {outcome["status"]}')
+        return _decode(outcome["value"])
+
+    def logs(self, execution_id: str) -> dict[str, str]:
+        """Return captured stdout and stderr for an execution."""
+        return self._get(f"/v1/executions/{execution_id}/logs")
 
     def nodes(self) -> list[Node]:
         """Return all registered worker nodes."""
@@ -405,6 +431,18 @@ class AsyncCluster:
             execution = response.json()
             if execution["status"] in {"succeeded", "failed", "timed_out"}:
                 return execution
+
+    async def result(self, execution_id: str) -> Any:
+        """Wait for an execution and return its decoded value."""
+        await self.wait(execution_id)
+        outcome = await self._get(f"/v1/executions/{execution_id}/result")
+        if outcome["status"] != "succeeded":
+            raise RemoteError(outcome["error"] or f'execution {outcome["status"]}')
+        return _decode(outcome["value"])
+
+    async def logs(self, execution_id: str) -> dict[str, str]:
+        """Return captured stdout and stderr for an execution."""
+        return await self._get(f"/v1/executions/{execution_id}/logs")
 
     async def vms(self) -> list[MicroVM]:
         """Return live microVMs and their published ports."""

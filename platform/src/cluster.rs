@@ -237,6 +237,37 @@ pub struct Execution {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionView {
+    pub id: Uuid,
+    pub pool: String,
+    pub node: Option<Uuid>,
+    pub status: ExecutionStatus,
+    pub error: Option<String>,
+    pub created_at_ms: u64,
+    pub started_at_ms: Option<u64>,
+    pub finished_at_ms: Option<u64>,
+    pub environment: Option<Uuid>,
+    pub metrics: Option<ExecutionMetrics>,
+}
+
+impl From<&Execution> for ExecutionView {
+    fn from(execution: &Execution) -> Self {
+        Self {
+            id: execution.id,
+            pool: execution.pool.clone(),
+            node: execution.node,
+            status: execution.status.clone(),
+            error: execution.error.clone(),
+            created_at_ms: execution.created_at_ms,
+            started_at_ms: execution.started_at_ms,
+            finished_at_ms: execution.finished_at_ms,
+            environment: execution.environment,
+            metrics: execution.metrics.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Work {
     pub execution: Execution,
     pub pool: Pool,
@@ -365,7 +396,7 @@ impl Cluster {
         true
     }
 
-    pub fn schedule_queued(&mut self) {
+    pub fn schedule_queued(&mut self) -> Vec<Execution> {
         let mut queued = self
             .executions
             .values()
@@ -373,9 +404,13 @@ impl Cluster {
             .map(|execution| (execution.created_at_ms, execution.id))
             .collect::<Vec<_>>();
         queued.sort();
+        let mut scheduled = Vec::new();
         for (_, id) in queued {
-            self.schedule(id);
+            if self.schedule(id) {
+                scheduled.push(self.executions[&id].clone());
+            }
         }
+        scheduled
     }
 
     pub fn release(&mut self, execution_id: Uuid, keep_idle: bool) {

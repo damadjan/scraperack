@@ -17,10 +17,7 @@ cluster = Cluster(url="http://192.168.2.16:7070")
 
 def execute(_):
     execution = cluster.run(environment="requests", function=request)
-    execution = cluster.wait(execution_id=execution["id"])
-    if execution["error"]:
-        raise RuntimeError(execution["error"])
-    return execution["result"]["value"]["data"]
+    return cluster.result(execution["id"])
 
 
 started = time.perf_counter()

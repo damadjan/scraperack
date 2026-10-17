@@ -139,8 +139,6 @@ class Execution(TypedDict):
     pool: str
     node: str | None
     status: ExecutionStatus
-    payload: Any
-    result: ExecutionOutput | None
     error: str | None
     created_at_ms: int
     started_at_ms: int | None
