@@ -72,6 +72,12 @@ pub async fn run(
         .context("SCRAPERACK_NODE_CPU_MILLIS is missing from the node configuration")?;
     let memory = value(&current, "SCRAPERACK_NODE_MEMORY_MIB")
         .context("SCRAPERACK_NODE_MEMORY_MIB is missing from the node configuration")?;
+    let vm_start_concurrency = value(&current, "SCRAPERACK_NODE_VM_START_CONCURRENCY")
+        .unwrap_or_else(|| {
+            cpu.parse::<u32>()
+                .map(|cpu| (cpu / 2000).max(1).to_string())
+                .unwrap_or_else(|_| "1".into())
+        });
     let controller = controller.trim_end_matches('/');
     let client = reqwest::Client::new();
     let target_id = client
@@ -95,8 +101,8 @@ pub async fn run(
         .json::<Credentials>()
         .await?;
     let config = format!(
-        "SCRAPERACK_CONTROLLER={}\nSCRAPERACK_NODE_CREDENTIAL={}\nSCRAPERACK_NODE_NAME={}\nSCRAPERACK_NODE_CPU_MILLIS={}\nSCRAPERACK_NODE_MEMORY_MIB={}",
-        controller, response.credential, name, cpu, memory
+        "SCRAPERACK_CONTROLLER={}\nSCRAPERACK_NODE_CREDENTIAL={}\nSCRAPERACK_NODE_NAME={}\nSCRAPERACK_NODE_CPU_MILLIS={}\nSCRAPERACK_NODE_MEMORY_MIB={}\nSCRAPERACK_NODE_VM_START_CONCURRENCY={}",
+        controller, response.credential, name, cpu, memory, vm_start_concurrency
     );
 
     systemctl(&["stop", "scraperack-node"]).await?;

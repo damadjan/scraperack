@@ -36,6 +36,8 @@ enum Command {
         cpu_millis: u32,
         #[arg(long, default_value_t = 16384)]
         memory_mib: u32,
+        #[arg(long)]
+        vm_start_concurrency: Option<usize>,
         #[arg(long, default_value = "data/node")]
         data_dir: PathBuf,
         #[arg(long, default_value = "/usr/local/bin/firecracker")]
@@ -74,6 +76,7 @@ async fn main() -> Result<()> {
             name,
             cpu_millis,
             memory_mib,
+            vm_start_concurrency,
             data_dir,
             firecracker,
             kernel,
@@ -84,6 +87,7 @@ async fn main() -> Result<()> {
                 name,
                 cpu_millis,
                 memory_mib,
+                vm_start_concurrency,
                 data_dir,
                 firecracker,
                 kernel,

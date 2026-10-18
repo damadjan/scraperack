@@ -77,6 +77,9 @@ total_memory=$(awk '/MemTotal/ { print int($2 / 1024) }' /proc/meminfo)
 default_memory=$((total_memory - 2048))
 [ "$default_memory" -ge 512 ] || default_memory=512
 memory_mib=${SCRAPERACK_NODE_MEMORY_MIB:-$default_memory}
+vm_start_concurrency=$((cpu_millis / 2000))
+[ "$vm_start_concurrency" -ge 1 ] || vm_start_concurrency=1
+vm_start_concurrency=${SCRAPERACK_NODE_VM_START_CONCURRENCY:-$vm_start_concurrency}
 
 cat > /etc/scraperack/controller.env <<EOF
 SCRAPERACK_LISTEN=${SCRAPERACK_LISTEN:-0.0.0.0:7070}
@@ -88,10 +91,13 @@ SCRAPERACK_NODE_CREDENTIAL=
 SCRAPERACK_NODE_NAME=${SCRAPERACK_NODE_NAME:-$(hostname)}
 SCRAPERACK_NODE_CPU_MILLIS=$cpu_millis
 SCRAPERACK_NODE_MEMORY_MIB=$memory_mib
+SCRAPERACK_NODE_VM_START_CONCURRENCY=$vm_start_concurrency
 EOF
 fi
 grep -q '^SCRAPERACK_NODE_CREDENTIAL=' /etc/scraperack/node.env || \
     printf 'SCRAPERACK_NODE_CREDENTIAL=\n' >> /etc/scraperack/node.env
+grep -q '^SCRAPERACK_NODE_VM_START_CONCURRENCY=' /etc/scraperack/node.env || \
+    printf 'SCRAPERACK_NODE_VM_START_CONCURRENCY=%s\n' "$vm_start_concurrency" >> /etc/scraperack/node.env
 cat > /etc/scraperack/gui.env <<EOF
 SCRAPERACK_URL=http://127.0.0.1:7070
 SCRAPERACK_PUBLIC_URL=${SCRAPERACK_PUBLIC_URL:-}
