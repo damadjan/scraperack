@@ -22,7 +22,7 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader},
     net::UnixStream,
     process::{Child, Command},
-    sync::Mutex,
+    sync::{Mutex, Semaphore},
 };
 use uuid::Uuid;
 
@@ -432,6 +432,7 @@ pub async fn run(
     name: String,
     cpu_millis: u32,
     memory_mib: u32,
+    vm_start_concurrency: Option<usize>,
     data_dir: PathBuf,
     firecracker: PathBuf,
     kernel: PathBuf,
@@ -515,6 +516,11 @@ pub async fn run(
         .json()
         .await?;
     let snapshot_lock = Arc::new(Mutex::new(()));
+    let vm_start_concurrency = vm_start_concurrency
+        .unwrap_or_else(|| default_vm_start_concurrency(cpu_millis))
+        .max(1);
+    tracing::info!(vm_start_concurrency, "configured VM start concurrency");
+    let vm_starts = Arc::new(Semaphore::new(vm_start_concurrency));
     let vms = Arc::new(Mutex::new(VmState {
         idle: Vec::new(),
         running: HashMap::new(),
@@ -542,6 +548,7 @@ pub async fn run(
         &kernel,
         &data_dir,
         &snapshot_lock,
+        &vm_starts,
         &network,
         &vms,
         &pools,
@@ -587,6 +594,7 @@ pub async fn run(
                 &kernel,
                 &data_dir,
                 &snapshot_lock,
+                &vm_starts,
                 &network,
                 &vms,
                 &pools,
@@ -611,6 +619,7 @@ pub async fn run(
             let kernel = kernel.clone();
             let data_dir = data_dir.clone();
             let snapshot_lock = snapshot_lock.clone();
+            let vm_starts = vm_starts.clone();
             let network = network.clone();
             let vms = vms.clone();
             tokio::spawn(async move {
@@ -621,6 +630,7 @@ pub async fn run(
                     &data_dir,
                     &work,
                     &snapshot_lock,
+                    &vm_starts,
                     &network,
                     &vms,
                 )
@@ -771,12 +781,14 @@ async fn sync_environments(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_execution(
     firecracker: &Path,
     kernel: &Path,
     data_dir: &Path,
     work: &Work,
     snapshot_lock: &Mutex<()>,
+    vm_starts: &Semaphore,
     network: &Network,
     vms: &Mutex<VmState>,
 ) -> Completion {
@@ -795,28 +807,35 @@ async fn run_execution(
     let reused = idle.is_some();
     let mut vm = match idle {
         Some(vm) => vm,
-        None => match start_vm(
-            firecracker,
-            kernel,
-            data_dir,
-            &work.pool,
-            snapshot_lock,
-            network,
-        )
-        .await
-        {
-            Ok(vm) => vm,
-            Err(error) => {
-                vms.lock().await.release(&work.pool, None);
-                return Completion {
-                    result: None,
-                    error: Some(format!("{error:#}")),
-                    timed_out: false,
-                    metrics: None,
-                    keep_idle: false,
-                };
+        None => {
+            let permit = vm_starts
+                .acquire()
+                .await
+                .expect("VM start semaphore closed");
+            let started = start_vm(
+                firecracker,
+                kernel,
+                data_dir,
+                &work.pool,
+                snapshot_lock,
+                network,
+            )
+            .await;
+            drop(permit);
+            match started {
+                Ok(vm) => vm,
+                Err(error) => {
+                    vms.lock().await.release(&work.pool, None);
+                    return Completion {
+                        result: None,
+                        error: Some(format!("{error:#}")),
+                        timed_out: false,
+                        metrics: None,
+                        keep_idle: false,
+                    };
+                }
             }
-        },
+        }
     };
     tracing::info!(
         id = %work.execution.id,
@@ -1011,6 +1030,7 @@ async fn maintain_vms(
     kernel: &Path,
     data_dir: &Path,
     snapshot_lock: &Mutex<()>,
+    vm_starts: &Semaphore,
     network: &Network,
     vms: &Mutex<VmState>,
     pools: &[Pool],
@@ -1078,15 +1098,21 @@ async fn maintain_vms(
             if !needed || !vms.lock().await.reserve_warm(pool) {
                 break;
             }
-            let vm =
-                match start_vm(firecracker, kernel, data_dir, pool, snapshot_lock, network).await {
-                    Ok(vm) => vm,
-                    Err(error) => {
-                        vms.lock().await.release(pool, None);
-                        tracing::error!(pool = %pool.name, %error, "failed to start warm microVM");
-                        break;
-                    }
-                };
+            let permit = vm_starts
+                .acquire()
+                .await
+                .expect("VM start semaphore closed");
+            let started =
+                start_vm(firecracker, kernel, data_dir, pool, snapshot_lock, network).await;
+            drop(permit);
+            let vm = match started {
+                Ok(vm) => vm,
+                Err(error) => {
+                    vms.lock().await.release(pool, None);
+                    tracing::error!(pool = %pool.name, %error, "failed to start warm microVM");
+                    break;
+                }
+            };
             let accepted = client
                 .post(format!(
                     "{controller}/internal/nodes/{node}/pools/{}/idle",
@@ -1108,6 +1134,10 @@ async fn maintain_vms(
         }
     }
     Ok(())
+}
+
+fn default_vm_start_concurrency(cpu_millis: u32) -> usize {
+    (cpu_millis / 2000).max(1) as usize
 }
 
 async fn start_vm(
@@ -1764,5 +1794,19 @@ impl tokio::io::AsyncWrite for DigestWriter<'_> {
         _: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         std::task::Poll::Ready(Ok(()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::default_vm_start_concurrency;
+
+    #[test]
+    fn vm_start_concurrency_is_half_the_node_vcpus_with_a_minimum_of_one() {
+        assert_eq!(default_vm_start_concurrency(500), 1);
+        assert_eq!(default_vm_start_concurrency(1000), 1);
+        assert_eq!(default_vm_start_concurrency(4000), 2);
+        assert_eq!(default_vm_start_concurrency(8000), 4);
+        assert_eq!(default_vm_start_concurrency(16_000), 8);
     }
 }

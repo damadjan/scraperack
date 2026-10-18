@@ -11,7 +11,7 @@ Environment=RUST_LOG=info
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
 Environment=XTABLES_LOCKFILE=/var/lib/scraperack-node/xtables.lock
 ExecStartPre=+/usr/sbin/sysctl -w net.ipv4.ip_forward=1
-ExecStart=/usr/local/bin/scraperack node --controller ${SCRAPERACK_CONTROLLER} --name ${SCRAPERACK_NODE_NAME} --cpu-millis ${SCRAPERACK_NODE_CPU_MILLIS} --memory-mib ${SCRAPERACK_NODE_MEMORY_MIB} --data-dir /var/lib/scraperack-node --firecracker /usr/local/bin/firecracker --kernel /var/lib/scraperack-node/vmlinux
+ExecStart=/usr/local/bin/scraperack node --controller ${SCRAPERACK_CONTROLLER} --name ${SCRAPERACK_NODE_NAME} --cpu-millis ${SCRAPERACK_NODE_CPU_MILLIS} --memory-mib ${SCRAPERACK_NODE_MEMORY_MIB} --vm-start-concurrency ${SCRAPERACK_NODE_VM_START_CONCURRENCY} --data-dir /var/lib/scraperack-node --firecracker /usr/local/bin/firecracker --kernel /var/lib/scraperack-node/vmlinux
 AmbientCapabilities=CAP_NET_ADMIN
 CapabilityBoundingSet=CAP_NET_ADMIN
 Restart=on-failure
