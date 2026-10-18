@@ -94,6 +94,8 @@ SCRAPERACK_NODE_MEMORY_MIB=$memory_mib
 SCRAPERACK_NODE_VM_START_CONCURRENCY=$vm_start_concurrency
 EOF
 fi
+[ ! -s /etc/scraperack/node.env ] || [ -z "$(tail -c 1 /etc/scraperack/node.env)" ] || \
+    printf '\n' >> /etc/scraperack/node.env
 grep -q '^SCRAPERACK_NODE_CREDENTIAL=' /etc/scraperack/node.env || \
     printf 'SCRAPERACK_NODE_CREDENTIAL=\n' >> /etc/scraperack/node.env
 grep -q '^SCRAPERACK_NODE_VM_START_CONCURRENCY=' /etc/scraperack/node.env || \
