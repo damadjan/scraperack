@@ -437,6 +437,10 @@ impl Cluster {
         let Some(pool) = self.pools.get(pool_name) else {
             return false;
         };
+        let targets = self.warm_targets(pool);
+        let Some(target) = targets.get(&node_id) else {
+            return false;
+        };
         let active = self
             .executions
             .values()
@@ -454,7 +458,9 @@ impl Cluster {
             .map(|node| node.idle_instances.get(pool_name).copied().unwrap_or(0))
             .sum::<u32>();
         let warm = if pool.reuse { idle + active } else { idle };
-        if warm >= pool.warm_instances
+        let local = self.warm_instances_on(node_id, pool);
+        if local >= *target
+            || warm >= targets.values().sum()
             || pool
                 .max_instances
                 .is_some_and(|limit| active + idle >= limit)
@@ -477,7 +483,8 @@ impl Cluster {
         let Some(pool) = self.pools.get(pool_name) else {
             return false;
         };
-        let Some(node) = self.nodes.get(&node_id) else {
+        let targets = self.warm_targets(pool);
+        let Some(target) = targets.get(&node_id) else {
             return false;
         };
         let active = self
@@ -497,16 +504,17 @@ impl Cluster {
             .map(|node| node.idle_instances.get(pool_name).copied().unwrap_or(0))
             .sum::<u32>();
         let warm = if pool.reuse { idle + active } else { idle };
-        warm < pool.warm_instances
+        self.warm_instances_on(node_id, pool) < *target
+            && warm < targets.values().sum()
             && pool.max_instances.is_none_or(|limit| active + idle < limit)
-            && node.cpu_millis >= pool.cpu_millis
-            && node.memory_mib >= pool.memory_mib
     }
 
     pub fn remove_idle_instance(&mut self, node_id: Uuid, pool_name: &str) -> bool {
         let Some(pool) = self.pools.get(pool_name) else {
             return false;
         };
+        let targets = self.warm_targets(pool);
+        let target = targets.get(&node_id).copied().unwrap_or(0);
         let active = self
             .executions
             .values()
@@ -518,22 +526,13 @@ impl Cluster {
                     )
             })
             .count() as u32;
-        let total_idle = self
+        let idle = self
             .nodes
             .values()
             .map(|node| node.idle_instances.get(pool_name).copied().unwrap_or(0))
             .sum::<u32>();
-        let target = if pool.reuse {
-            pool.warm_instances.saturating_sub(active)
-        } else {
-            pool.warm_instances
-        }
-        .min(
-            pool.max_instances
-                .map(|limit| limit.saturating_sub(active))
-                .unwrap_or(u32::MAX),
-        );
-        if total_idle <= target {
+        let warm = if pool.reuse { idle + active } else { idle };
+        if self.warm_instances_on(node_id, pool) <= target || warm < targets.values().sum() {
             return false;
         }
         let Some(node) = self.nodes.get_mut(&node_id) else {
@@ -549,6 +548,82 @@ impl Cluster {
         node.used_cpu_millis = node.used_cpu_millis.saturating_sub(pool.cpu_millis);
         node.used_memory_mib = node.used_memory_mib.saturating_sub(pool.memory_mib);
         true
+    }
+
+    fn warm_targets(&self, pool: &Pool) -> HashMap<Uuid, u32> {
+        let active = self
+            .executions
+            .values()
+            .filter(|execution| {
+                execution.pool == pool.name
+                    && matches!(
+                        execution.status,
+                        ExecutionStatus::Assigned | ExecutionStatus::Running
+                    )
+            })
+            .count() as u32;
+        let target = if pool.reuse {
+            pool.warm_instances
+                .min(pool.max_instances.unwrap_or(u32::MAX))
+        } else {
+            pool.warm_instances.min(
+                pool.max_instances
+                    .map(|limit| limit.saturating_sub(active))
+                    .unwrap_or(u32::MAX),
+            )
+        };
+        let mut nodes = self
+            .nodes
+            .values()
+            .filter(|node| {
+                node.images.contains(&pool.image)
+                    && pool
+                        .environment_artifact
+                        .as_ref()
+                        .is_none_or(|artifact| node.environments.contains(artifact))
+                    && node.cpu_millis >= pool.cpu_millis
+                    && node.memory_mib >= pool.memory_mib
+            })
+            .map(|node| node.id)
+            .collect::<Vec<_>>();
+        nodes.sort_unstable();
+        let Some(count) = u32::try_from(nodes.len()).ok().filter(|count| *count > 0) else {
+            return HashMap::new();
+        };
+        nodes
+            .into_iter()
+            .enumerate()
+            .map(|(index, node)| {
+                (
+                    node,
+                    target / count + u32::from(index < (target % count) as usize),
+                )
+            })
+            .collect()
+    }
+
+    fn warm_instances_on(&self, node_id: Uuid, pool: &Pool) -> u32 {
+        let idle = self
+            .nodes
+            .get(&node_id)
+            .and_then(|node| node.idle_instances.get(&pool.name))
+            .copied()
+            .unwrap_or(0);
+        if !pool.reuse {
+            return idle;
+        }
+        idle + self
+            .executions
+            .values()
+            .filter(|execution| {
+                execution.pool == pool.name
+                    && execution.node == Some(node_id)
+                    && matches!(
+                        execution.status,
+                        ExecutionStatus::Assigned | ExecutionStatus::Running
+                    )
+            })
+            .count() as u32
     }
 
     pub fn reset_idle_instances(&mut self, node_id: Uuid) {
@@ -665,8 +740,82 @@ mod tests {
         assert_eq!(cluster.executions[&id].node, Some(first));
         assert_eq!(cluster.nodes[&first].used_memory_mib, 1024);
         cluster.pools.get_mut("p").unwrap().warm_instances = 4;
-        assert!(cluster.add_warm_instance(first, "p"));
-        assert_eq!(cluster.nodes[&first].used_memory_mib, 1536);
+        assert!(cluster.add_warm_instance(second, "p"));
+        assert_eq!(cluster.nodes[&second].used_memory_mib, 1024);
+    }
+
+    #[test]
+    fn balances_warm_instances_between_nodes() {
+        let image = Uuid::new_v4();
+        let first = Uuid::from_u128(1);
+        let second = Uuid::from_u128(2);
+        let mut cluster = Cluster::default();
+        cluster.nodes.insert(first, node(first, image));
+        cluster.nodes.insert(second, node(second, image));
+        cluster.pools.insert(
+            "p".into(),
+            Pool {
+                name: "p".into(),
+                image,
+                warm_instances: 4,
+                max_instances: None,
+                cpu_millis: 250,
+                memory_mib: 256,
+                disk_mib: 1024,
+                timeout_secs: 60,
+                idle_timeout_secs: 30,
+                reuse: true,
+                network: false,
+                ports: Vec::new(),
+                managed_by: None,
+                environment: None,
+                environment_artifact: None,
+                preload: Vec::new(),
+            },
+        );
+
+        for node in [first, second] {
+            assert!(cluster.warm_instance_needed(node, "p"));
+            assert!(cluster.add_warm_instance(node, "p"));
+            assert!(cluster.warm_instance_needed(node, "p"));
+            assert!(cluster.add_warm_instance(node, "p"));
+            assert!(!cluster.warm_instance_needed(node, "p"));
+            assert!(!cluster.add_warm_instance(node, "p"));
+        }
+        assert_eq!(cluster.nodes[&first].idle_instances["p"], 2);
+        assert_eq!(cluster.nodes[&second].idle_instances["p"], 2);
+
+        cluster
+            .nodes
+            .get_mut(&first)
+            .unwrap()
+            .idle_instances
+            .insert("p".into(), 4);
+        cluster
+            .nodes
+            .get_mut(&second)
+            .unwrap()
+            .idle_instances
+            .insert("p".into(), 0);
+        cluster.nodes.get_mut(&first).unwrap().used_cpu_millis = 1000;
+        cluster.nodes.get_mut(&first).unwrap().used_memory_mib = 1024;
+        cluster.nodes.get_mut(&second).unwrap().used_cpu_millis = 0;
+        cluster.nodes.get_mut(&second).unwrap().used_memory_mib = 0;
+        assert!(cluster.remove_idle_instance(first, "p"));
+        assert!(!cluster.remove_idle_instance(first, "p"));
+        assert!(cluster.add_warm_instance(second, "p"));
+        assert!(cluster.remove_idle_instance(first, "p"));
+        assert!(cluster.add_warm_instance(second, "p"));
+        assert_eq!(cluster.nodes[&first].idle_instances["p"], 2);
+        assert_eq!(cluster.nodes[&second].idle_instances["p"], 2);
+
+        cluster.nodes.get_mut(&first).unwrap().images.clear();
+        for _ in 0..2 {
+            assert!(cluster.remove_idle_instance(first, "p"));
+            assert!(cluster.add_warm_instance(second, "p"));
+        }
+        assert_eq!(cluster.nodes[&first].idle_instances["p"], 0);
+        assert_eq!(cluster.nodes[&second].idle_instances["p"], 4);
     }
 
     #[test]
