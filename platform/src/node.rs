@@ -9,6 +9,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use futures_util::StreamExt;
 use reqwest::{
     Client,
@@ -164,6 +165,7 @@ struct LiveVm {
     guest: UnixStream,
     network: Option<NetworkLease>,
     functions: HashSet<String>,
+    working_dirs: HashSet<String>,
     last_used: Instant,
 }
 
@@ -520,6 +522,7 @@ pub async fn run(
     let address = advertise_address.unwrap_or(detect_address()?);
     fs::create_dir_all(data_dir.join("images")).await?;
     fs::create_dir_all(data_dir.join("environments")).await?;
+    fs::create_dir_all(data_dir.join("working-dirs")).await?;
     fs::create_dir_all(data_dir.join("logs")).await?;
     fs::create_dir_all(data_dir.join("snapshots")).await?;
     let instances = data_dir.join("instances");
@@ -584,6 +587,7 @@ pub async fn run(
         .json()
         .await?;
     let snapshot_lock = Arc::new(Mutex::new(()));
+    let working_dir_lock = Arc::new(Mutex::new(()));
     let vm_start_concurrency = node
         .vm_start_concurrency
         .unwrap_or(local_vm_start_concurrency);
@@ -694,17 +698,21 @@ pub async fn run(
             let kernel = kernel.clone();
             let data_dir = data_dir.clone();
             let snapshot_lock = snapshot_lock.clone();
+            let working_dir_lock = working_dir_lock.clone();
             let vm_starts = vm_starts.clone();
             let network = network.clone();
             let vms = vms.clone();
             tokio::spawn(async move {
                 let execution = &work.execution;
                 let completion = run_execution(
+                    &client,
+                    &controller,
                     &firecracker,
                     &kernel,
                     &data_dir,
                     &work,
                     &snapshot_lock,
+                    &working_dir_lock,
                     &vm_starts,
                     &network,
                     &vms,
@@ -856,17 +864,82 @@ async fn sync_environments(
     Ok(())
 }
 
+async fn ensure_working_dir(
+    client: &Client,
+    controller: &str,
+    data_dir: &Path,
+    lock: &Mutex<()>,
+    digest: &str,
+) -> Result<PathBuf> {
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("invalid working directory hash");
+    }
+    let path = data_dir.join("working-dirs").join(format!("{digest}.zip"));
+    let marker = path.with_extension("sha256");
+    if path.exists() && fs::read_to_string(&marker).await.unwrap_or_default() == digest {
+        return Ok(path);
+    }
+    let _guard = lock.lock().await;
+    if path.exists() && fs::read_to_string(&marker).await.unwrap_or_default() == digest {
+        return Ok(path);
+    }
+    if path.exists() && hash(&path).await? == digest {
+        fs::write(&marker, digest).await?;
+        return Ok(path);
+    }
+    download(
+        client,
+        &format!("{controller}/internal/working-dirs/{digest}"),
+        &path,
+    )
+    .await?;
+    if hash(&path).await? != digest {
+        bail!("working directory failed checksum verification");
+    }
+    fs::write(marker, digest).await?;
+    Ok(path)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_execution(
+    client: &Client,
+    controller: &str,
     firecracker: &Path,
     kernel: &Path,
     data_dir: &Path,
     work: &Work,
     snapshot_lock: &Mutex<()>,
+    working_dir_lock: &Mutex<()>,
     vm_starts: &VmStartLimiter,
     network: &Network,
     vms: &Mutex<VmState>,
 ) -> Completion {
+    let working_dir = work
+        .execution
+        .payload
+        .get("working_dir")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let working_dir_path = if let Some(digest) = &working_dir {
+        match ensure_working_dir(client, controller, data_dir, working_dir_lock, digest).await {
+            Ok(path) => Some(path),
+            Err(error) => {
+                return Completion {
+                    result: None,
+                    error: Some(format!("{error:#}")),
+                    timed_out: false,
+                    metrics: None,
+                    keep_idle: false,
+                };
+            }
+        }
+    } else {
+        None
+    };
     let idle = match vms.lock().await.acquire(&work.pool) {
         Ok(idle) => idle,
         Err(error) => {
@@ -909,6 +982,27 @@ async fn run_execution(
             }
         }
     };
+    let working_dir_archive = if working_dir
+        .as_ref()
+        .is_some_and(|digest| !vm.working_dirs.contains(digest))
+    {
+        match fs::read(working_dir_path.as_ref().unwrap()).await {
+            Ok(archive) => Some(BASE64.encode(archive)),
+            Err(error) => {
+                destroy_vm(vm, network).await;
+                vms.lock().await.release(&work.pool, None);
+                return Completion {
+                    result: None,
+                    error: Some(format!("read working directory: {error}")),
+                    timed_out: false,
+                    metrics: None,
+                    keep_idle: false,
+                };
+            }
+        }
+    } else {
+        None
+    };
     tracing::info!(
         id = %work.execution.id,
         pool = %work.execution.pool,
@@ -936,8 +1030,12 @@ async fn run_execution(
         },
     );
     let mut payload = work.execution.payload.clone();
+    if let Some(payload) = payload.as_object_mut() {
+        payload.remove("working_dir");
+    }
     let function = payload
-        .get("hash")
+        .get("cache_key")
+        .or_else(|| payload.get("hash"))
         .and_then(Value::as_str)
         .map(str::to_owned);
     if function
@@ -947,12 +1045,16 @@ async fn run_execution(
     {
         payload.remove("function");
     }
-    if !work.execution.variables.is_empty() || !work.secrets.is_empty() {
+    if !work.execution.variables.is_empty() || !work.secrets.is_empty() || working_dir.is_some() {
         payload = json!({
             "encoding": "scraperack-invocation",
             "payload": payload,
             "variables": &work.execution.variables,
             "secrets": &work.secrets,
+            "working_dir": working_dir.as_ref().map(|digest| json!({
+                "hash": digest,
+                "archive": working_dir_archive,
+            })),
         });
     }
     let cgroup = vm_cgroup(vm.id).await.ok();
@@ -1052,7 +1154,13 @@ async fn run_execution(
         && work.pool.reuse
         && (work.pool.idle_timeout_secs > 0 || work.pool.warm_instances > 0);
     completion.keep_idle = keep_idle;
-    if healthy && let Some(function) = function {
+    if healthy && let Some(working_dir) = &working_dir {
+        vm.working_dirs.insert(working_dir.clone());
+    }
+    if healthy
+        && (working_dir.is_none() || completion.error.is_none())
+        && let Some(function) = function
+    {
         vm.functions.insert(function);
     }
     vms.lock().await.running.remove(&vm.id);
@@ -1342,6 +1450,7 @@ async fn start_vm(
         guest,
         network: network_lease,
         functions: HashSet::new(),
+        working_dirs: HashSet::new(),
         last_used: Instant::now(),
     })
 }

@@ -32,6 +32,7 @@ try:
         "python",
         add,
         (2, 3),
+        working_dir="./project",
         variables={"LOG_LEVEL": "DEBUG"},
         secrets={"DATABASE_URL": "postgresql://..."},
     )
@@ -39,5 +40,9 @@ try:
 finally:
     cluster.close()
 ```
+
+`working_dir` uploads project modules and files using a content-addressed cache. It is
+made importable and becomes the current directory for the invocation. Third-party
+packages still belong in the selected ScrapeRack environment.
 
 Installation, cluster setup, and source code are available at [github.com/damadjan/scraperack](https://github.com/damadjan/scraperack).

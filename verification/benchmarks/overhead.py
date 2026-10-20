@@ -5,10 +5,18 @@ from scraperack import Cluster
 
 
 cluster = Cluster(url="http://192.168.2.16:7070")
+
+
+def identity(value):
+    return value
+
+
 start = time.perf_counter()
 with ThreadPoolExecutor(max_workers=5) as pool:
     executions = list(pool.map(
-        lambda value: cluster.wait(execution_id=cluster.run_json(environment="bench2", payload=value)["id"]),
+        lambda value: cluster.wait(
+            execution_id=cluster.run("bench2", identity, (value,))["id"]
+        ),
         range(5),
     ))
 durations = [(execution["finished_at_ms"] - execution["started_at_ms"]) / 1000

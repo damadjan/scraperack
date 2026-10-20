@@ -11,7 +11,7 @@ use std::{
 use anyhow::Result;
 use axum::{
     Json, Router,
-    body::Body,
+    body::{Body, Bytes},
     extract::{ConnectInfo, DefaultBodyLimit, Path as AxumPath, Query, State},
     http::{HeaderMap, StatusCode, header::AUTHORIZATION},
     response::{IntoResponse, Response},
@@ -163,6 +163,7 @@ fn internal_error(cause: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
 pub async fn serve(listen: std::net::SocketAddr, data_dir: PathBuf) -> Result<()> {
     fs::create_dir_all(data_dir.join("images")).await?;
     fs::create_dir_all(data_dir.join("environments")).await?;
+    fs::create_dir_all(data_dir.join("working-dirs")).await?;
     let database = Database::open(&data_dir.join("scraperack.db"))?;
     let secrets = SecretCipher::load(&data_dir.join("execution-secrets.key"))?;
     let controller_id_path = data_dir.join("controller-id");
@@ -222,6 +223,14 @@ pub async fn serve(listen: std::net::SocketAddr, data_dir: PathBuf) -> Result<()
             axum::routing::patch(update_image).delete(delete_image),
         )
         .route("/v1/images/{id}/artifact", get(download_image))
+        .route(
+            "/v1/working-dirs/{digest}",
+            axum::routing::head(working_dir_exists).put(upload_working_dir),
+        )
+        .route(
+            "/internal/working-dirs/{digest}",
+            get(download_working_dir_for_node),
+        )
         .route("/v1/pools", get(list_pools).post(create_pool))
         .route("/v1/pools/{name}", delete(delete_pool))
         .route(
@@ -862,6 +871,77 @@ async fn download_image(
     let file = fs::File::open(app.data_dir.join("images").join(id.to_string()))
         .await
         .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Body::from_stream(ReaderStream::new(file)).into_response())
+}
+
+fn working_dir_path(app: &App, digest: &str) -> ApiResult<PathBuf> {
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "invalid working directory hash",
+        ));
+    }
+    Ok(app
+        .data_dir
+        .join("working-dirs")
+        .join(format!("{digest}.zip")))
+}
+
+async fn working_dir_exists(
+    State(app): State<App>,
+    AxumPath(digest): AxumPath<String>,
+) -> ApiResult<StatusCode> {
+    if working_dir_path(&app, &digest)?.exists() {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(error(StatusCode::NOT_FOUND, "working directory not found"))
+    }
+}
+
+async fn upload_working_dir(
+    State(app): State<App>,
+    AxumPath(digest): AxumPath<String>,
+    body: Bytes,
+) -> ApiResult<StatusCode> {
+    let path = working_dir_path(&app, &digest)?;
+    if path.exists() {
+        return Ok(StatusCode::NO_CONTENT);
+    }
+    if hex::encode(Sha256::digest(&body)) != digest {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "working directory hash does not match content",
+        ));
+    }
+    let temporary = path.with_extension(format!("{}.partial", Uuid::new_v4()));
+    fs::write(&temporary, body)
+        .await
+        .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    fs::rename(&temporary, &path)
+        .await
+        .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(StatusCode::CREATED)
+}
+
+async fn download_working_dir_for_node(
+    State(app): State<App>,
+    headers: HeaderMap,
+    AxumPath(digest): AxumPath<String>,
+) -> ApiResult<Response> {
+    authenticated_node(&app, &headers).await?;
+    let file = fs::File::open(working_dir_path(&app, &digest)?)
+        .await
+        .map_err(|cause| {
+            if cause.kind() == std::io::ErrorKind::NotFound {
+                error(StatusCode::NOT_FOUND, "working directory not found")
+            } else {
+                error(StatusCode::INTERNAL_SERVER_ERROR, cause.to_string())
+            }
+        })?;
     Ok(Body::from_stream(ReaderStream::new(file)).into_response())
 }
 
@@ -1815,6 +1895,20 @@ async fn create_execution(
     State(app): State<App>,
     Json(request): Json<CreateExecution>,
 ) -> ApiResult<(StatusCode, Json<ExecutionView>)> {
+    if let Some(working_dir) = request.payload.get("working_dir") {
+        let digest = working_dir.as_str().ok_or_else(|| {
+            error(
+                StatusCode::BAD_REQUEST,
+                "working directory hash must be a string",
+            )
+        })?;
+        if !working_dir_path(&app, digest)?.exists() {
+            return Err(error(
+                StatusCode::BAD_REQUEST,
+                "working directory was not uploaded",
+            ));
+        }
+    }
     let mut cluster = app.cluster.write().await;
     let environment = request.environment.as_deref().and_then(|key| {
         Uuid::parse_str(key)
@@ -2373,6 +2467,35 @@ mod tests {
             executions: Arc::new(Notify::new()),
             work: Arc::new(Notify::new()),
         }
+    }
+
+    #[tokio::test]
+    async fn stores_working_directories_by_verified_hash() {
+        let app = app().await;
+        fs::create_dir(app.data_dir.join("working-dirs"))
+            .await
+            .unwrap();
+        let body = Bytes::from_static(b"project archive");
+        let digest = hex::encode(Sha256::digest(&body));
+        assert_eq!(
+            upload_working_dir(State(app.clone()), AxumPath(digest.clone()), body.clone(),)
+                .await
+                .unwrap(),
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            working_dir_exists(State(app.clone()), AxumPath(digest))
+                .await
+                .unwrap(),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            upload_working_dir(State(app), AxumPath("0".repeat(64)), body,)
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::BAD_REQUEST
+        );
     }
 
     #[tokio::test]

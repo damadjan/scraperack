@@ -1,7 +1,10 @@
+import asyncio
 import base64
 import hashlib
+import io
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
+from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 
 import cloudpickle
 import httpx
@@ -14,22 +17,37 @@ class RemoteError(RuntimeError):
 
 
 def _payload(
-    function: Callable[..., Any], params: Sequence[Any]
+    function: Callable[..., Any], params: Sequence[Any], working_dir: str | None
 ) -> dict[str, Any]:
     data = cloudpickle.dumps(function)
-    return {
+    payload = {
         "encoding": "python-function",
         "hash": hashlib.sha256(data).hexdigest(),
         "function": base64.b64encode(data).decode(),
         "params": base64.b64encode(cloudpickle.dumps(tuple(params))).decode(),
     }
+    if working_dir:
+        payload["working_dir"] = working_dir
+        payload["cache_key"] = hashlib.sha256(data + working_dir.encode()).hexdigest()
+    return payload
 
 
-def _files(files: Mapping[str, str | Path]) -> dict[str, str]:
-    return {
-        name: base64.b64encode(Path(path).read_bytes()).decode()
-        for name, path in files.items()
-    }
+def _archive(path: str | Path) -> tuple[str, bytes]:
+    root = Path(path).resolve()
+    if not root.is_dir():
+        raise ValueError(f"working directory does not exist: {path}")
+    output = io.BytesIO()
+    with ZipFile(output, "w") as archive:
+        for file in sorted(root.rglob("*")):
+            if file.is_symlink():
+                raise ValueError(f"working directory contains a symlink: {file}")
+            if not file.is_file():
+                continue
+            info = ZipInfo(file.relative_to(root).as_posix(), (1980, 1, 1, 0, 0, 0))
+            info.compress_type = ZIP_DEFLATED
+            archive.writestr(info, file.read_bytes())
+    data = output.getvalue()
+    return hashlib.sha256(data).hexdigest(), data
 
 
 def _decode(value: Mapping[str, Any] | None) -> Any:
@@ -158,64 +176,23 @@ class Cluster:
         queue: bool = True,
         variables: Mapping[str, str] | None = None,
         secrets: Mapping[str, str] | None = None,
+        working_dir: str | Path | None = None,
     ) -> Execution:
-        """Submit a Python function and its positional arguments."""
-        return self.submit(environment, _payload(function, params), queue, variables, secrets)
-
-    def delete_pool(self, name: str) -> None:
-        """Delete an inactive pool."""
-        self._delete(f"/v1/pools/{name}")
-
-    def run_json(
-        self,
-        environment: str,
-        payload: Any,
-        queue: bool = True,
-        variables: Mapping[str, str] | None = None,
-        secrets: Mapping[str, str] | None = None,
-    ) -> Execution:
-        """Submit a JSON-compatible value as the execution payload."""
-        return self.submit(
+        """Submit a Python function, its arguments, and optional project directory."""
+        digest = self._upload_working_dir(working_dir) if working_dir else None
+        return self._submit(
             environment,
-            {"encoding": "json", "data": payload},
+            _payload(function, params, digest),
             queue,
             variables,
             secrets,
         )
 
-    def run_source(
-        self,
-        environment: str,
-        source: str,
-        params: Sequence[Any] = (),
-        queue: bool = True,
-        variables: Mapping[str, str] | None = None,
-        secrets: Mapping[str, str] | None = None,
-    ) -> Execution:
-        """Submit Python source that defines ``main(...)``."""
-        return self.submit(environment, {
-            "encoding": "python-source",
-            "source": source,
-            "params": params,
-        }, queue, variables, secrets)
+    def delete_pool(self, name: str) -> None:
+        """Delete an inactive pool."""
+        self._delete(f"/v1/pools/{name}")
 
-    def run_files(
-        self,
-        environment: str,
-        files: Mapping[str, str | Path],
-        command: str | Sequence[str],
-        queue: bool = True,
-        variables: Mapping[str, str] | None = None,
-        secrets: Mapping[str, str] | None = None,
-    ) -> Execution:
-        """Upload files and run a command inside a temporary directory."""
-        return self.submit(environment, {
-            "encoding": "files",
-            "files": _files(files),
-            "command": command,
-        }, queue, variables, secrets)
-
-    def submit(
+    def _submit(
         self,
         environment: str,
         payload: Mapping[str, Any],
@@ -223,7 +200,6 @@ class Cluster:
         variables: Mapping[str, str] | None = None,
         secrets: Mapping[str, str] | None = None,
     ) -> Execution:
-        """Submit a raw execution payload."""
         return self._post(
             "/v1/executions",
             {
@@ -234,6 +210,18 @@ class Cluster:
                 "secrets": dict(secrets or {}),
             },
         )
+
+    def _upload_working_dir(self, path: str | Path) -> str:
+        digest, archive = _archive(path)
+        response = self.client.head(f"/v1/working-dirs/{digest}")
+        if response.status_code == 404:
+            response = self.client.put(
+                f"/v1/working-dirs/{digest}",
+                content=archive,
+                headers={"Content-Type": "application/zip"},
+            )
+        response.raise_for_status()
+        return digest
 
     def execution(self, execution_id: str) -> Execution:
         """Return one execution by ID."""
@@ -403,62 +391,19 @@ class AsyncCluster:
         queue: bool = True,
         variables: Mapping[str, str] | None = None,
         secrets: Mapping[str, str] | None = None,
+        working_dir: str | Path | None = None,
     ) -> Execution:
-        """Submit a Python function and its positional arguments."""
-        return await self.submit(
-            environment, _payload(function, params), queue, variables, secrets
-        )
-
-    async def run_json(
-        self,
-        environment: str,
-        payload: Any,
-        queue: bool = True,
-        variables: Mapping[str, str] | None = None,
-        secrets: Mapping[str, str] | None = None,
-    ) -> Execution:
-        """Submit a JSON-compatible value as the execution payload."""
-        return await self.submit(
+        """Submit a Python function, its arguments, and optional project directory."""
+        digest = await self._upload_working_dir(working_dir) if working_dir else None
+        return await self._submit(
             environment,
-            {"encoding": "json", "data": payload},
+            _payload(function, params, digest),
             queue,
             variables,
             secrets,
         )
 
-    async def run_source(
-        self,
-        environment: str,
-        source: str,
-        params: Sequence[Any] = (),
-        queue: bool = True,
-        variables: Mapping[str, str] | None = None,
-        secrets: Mapping[str, str] | None = None,
-    ) -> Execution:
-        """Submit Python source that defines ``main(...)``."""
-        return await self.submit(environment, {
-            "encoding": "python-source",
-            "source": source,
-            "params": params,
-        }, queue, variables, secrets)
-
-    async def run_files(
-        self,
-        environment: str,
-        files: Mapping[str, str | Path],
-        command: str | Sequence[str],
-        queue: bool = True,
-        variables: Mapping[str, str] | None = None,
-        secrets: Mapping[str, str] | None = None,
-    ) -> Execution:
-        """Upload files and run a command inside a temporary directory."""
-        return await self.submit(environment, {
-            "encoding": "files",
-            "files": _files(files),
-            "command": command,
-        }, queue, variables, secrets)
-
-    async def submit(
+    async def _submit(
         self,
         environment: str,
         payload: Mapping[str, Any],
@@ -466,7 +411,6 @@ class AsyncCluster:
         variables: Mapping[str, str] | None = None,
         secrets: Mapping[str, str] | None = None,
     ) -> Execution:
-        """Submit a raw execution payload."""
         return await self._post("/v1/executions", {
             "environment": environment,
             "payload": payload,
@@ -474,6 +418,18 @@ class AsyncCluster:
             "variables": dict(variables or {}),
             "secrets": dict(secrets or {}),
         })
+
+    async def _upload_working_dir(self, path: str | Path) -> str:
+        digest, archive = await asyncio.to_thread(_archive, path)
+        response = await self.client.head(f"/v1/working-dirs/{digest}")
+        if response.status_code == 404:
+            response = await self.client.put(
+                f"/v1/working-dirs/{digest}",
+                content=archive,
+                headers={"Content-Type": "application/zip"},
+            )
+        response.raise_for_status()
+        return digest
 
     async def execution(self, execution_id: str) -> Execution:
         """Return one execution by ID."""

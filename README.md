@@ -67,6 +67,7 @@ def add(a, b):
 
 execution = cluster.run(
     environment["id"], add, (2, 3),
+    working_dir="./project",
     variables={"LOG_LEVEL": "INFO"},
     secrets={"DATABASE_URL": "postgresql://..."},
 )
@@ -78,6 +79,10 @@ Execution code reads invocation-scoped values with
 `scraperack_runtime.secret("DATABASE_URL")`. Secrets remain encrypted in the
 controller queue, are cleared when execution finishes, and are redacted from
 captured output and errors.
+
+`working_dir` packages local project modules and files into a content-addressed
+archive. The controller, nodes, and warm microVMs cache each version, and the guest
+makes it importable before deserializing the submitted function.
 
 ## Development
 
