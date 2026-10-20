@@ -947,6 +947,14 @@ async fn run_execution(
     {
         payload.remove("function");
     }
+    if !work.execution.variables.is_empty() || !work.secrets.is_empty() {
+        payload = json!({
+            "encoding": "scraperack-invocation",
+            "payload": payload,
+            "variables": &work.execution.variables,
+            "secrets": &work.secrets,
+        });
+    }
     let cgroup = vm_cgroup(vm.id).await.ok();
     let before = match &cgroup {
         Some(path) => read_vm_counters(path).await.unwrap_or_default(),
@@ -1039,6 +1047,7 @@ async fn run_execution(
             &work.pool,
         )
     });
+    redact_completion(&mut completion, &work.secrets);
     let keep_idle = healthy
         && work.pool.reuse
         && (work.pool.idle_timeout_secs > 0 || work.pool.warm_instances > 0);
@@ -1055,6 +1064,24 @@ async fn run_execution(
         vms.lock().await.release(&work.pool, None);
     }
     completion
+}
+
+fn redact_completion(completion: &mut Completion, secrets: &HashMap<String, String>) {
+    for secret in secrets.values().filter(|value| !value.is_empty()) {
+        if let Some(error) = &mut completion.error {
+            *error = error.replace(secret, "[REDACTED]");
+        }
+        if let Some(result) = completion.result.as_mut().and_then(Value::as_object_mut) {
+            for field in ["stdout", "stderr"] {
+                if let Some(value) = result.get(field).and_then(Value::as_str) {
+                    result.insert(
+                        field.into(),
+                        Value::String(value.replace(secret, "[REDACTED]")),
+                    );
+                }
+            }
+        }
+    }
 }
 
 async fn sync_snapshots(
@@ -1868,7 +1895,11 @@ impl tokio::io::AsyncWrite for DigestWriter<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::default_vm_start_concurrency;
+    use std::collections::HashMap;
+
+    use serde_json::json;
+
+    use super::{Completion, default_vm_start_concurrency, redact_completion};
 
     #[test]
     fn vm_start_concurrency_is_half_the_node_vcpus_with_a_minimum_of_one() {
@@ -1877,5 +1908,30 @@ mod tests {
         assert_eq!(default_vm_start_concurrency(4000), 2);
         assert_eq!(default_vm_start_concurrency(8000), 4);
         assert_eq!(default_vm_start_concurrency(16_000), 8);
+    }
+
+    #[test]
+    fn redacts_secrets_from_output_and_errors_but_not_results() {
+        let mut completion = Completion {
+            result: Some(json!({
+                "value": {"encoding": "json", "data": "keep secret-value"},
+                "stdout": "printed secret-value",
+                "stderr": "warned secret-value",
+            })),
+            error: Some("failed with secret-value".into()),
+            timed_out: false,
+            metrics: None,
+            keep_idle: false,
+        };
+        redact_completion(
+            &mut completion,
+            &HashMap::from([("TOKEN".into(), "secret-value".into())]),
+        );
+
+        let result = completion.result.unwrap();
+        assert_eq!(result["stdout"], "printed [REDACTED]");
+        assert_eq!(result["stderr"], "warned [REDACTED]");
+        assert_eq!(result["value"]["data"], "keep secret-value");
+        assert_eq!(completion.error.unwrap(), "failed with [REDACTED]");
     }
 }

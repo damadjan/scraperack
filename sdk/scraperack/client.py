@@ -156,17 +156,32 @@ class Cluster:
         function: Callable[..., Any],
         params: Sequence[Any] = (),
         queue: bool = True,
+        variables: Mapping[str, str] | None = None,
+        secrets: Mapping[str, str] | None = None,
     ) -> Execution:
         """Submit a Python function and its positional arguments."""
-        return self.submit(environment, _payload(function, params), queue)
+        return self.submit(environment, _payload(function, params), queue, variables, secrets)
 
     def delete_pool(self, name: str) -> None:
         """Delete an inactive pool."""
         self._delete(f"/v1/pools/{name}")
 
-    def run_json(self, environment: str, payload: Any, queue: bool = True) -> Execution:
+    def run_json(
+        self,
+        environment: str,
+        payload: Any,
+        queue: bool = True,
+        variables: Mapping[str, str] | None = None,
+        secrets: Mapping[str, str] | None = None,
+    ) -> Execution:
         """Submit a JSON-compatible value as the execution payload."""
-        return self.submit(environment, {"encoding": "json", "data": payload}, queue)
+        return self.submit(
+            environment,
+            {"encoding": "json", "data": payload},
+            queue,
+            variables,
+            secrets,
+        )
 
     def run_source(
         self,
@@ -174,13 +189,15 @@ class Cluster:
         source: str,
         params: Sequence[Any] = (),
         queue: bool = True,
+        variables: Mapping[str, str] | None = None,
+        secrets: Mapping[str, str] | None = None,
     ) -> Execution:
         """Submit Python source that defines ``main(...)``."""
         return self.submit(environment, {
             "encoding": "python-source",
             "source": source,
             "params": params,
-        }, queue)
+        }, queue, variables, secrets)
 
     def run_files(
         self,
@@ -188,21 +205,34 @@ class Cluster:
         files: Mapping[str, str | Path],
         command: str | Sequence[str],
         queue: bool = True,
+        variables: Mapping[str, str] | None = None,
+        secrets: Mapping[str, str] | None = None,
     ) -> Execution:
         """Upload files and run a command inside a temporary directory."""
         return self.submit(environment, {
             "encoding": "files",
             "files": _files(files),
             "command": command,
-        }, queue)
+        }, queue, variables, secrets)
 
     def submit(
-        self, environment: str, payload: Mapping[str, Any], queue: bool = True
+        self,
+        environment: str,
+        payload: Mapping[str, Any],
+        queue: bool = True,
+        variables: Mapping[str, str] | None = None,
+        secrets: Mapping[str, str] | None = None,
     ) -> Execution:
         """Submit a raw execution payload."""
         return self._post(
             "/v1/executions",
-            {"environment": environment, "payload": payload, "queue": queue},
+            {
+                "environment": environment,
+                "payload": payload,
+                "queue": queue,
+                "variables": dict(variables or {}),
+                "secrets": dict(secrets or {}),
+            },
         )
 
     def execution(self, execution_id: str) -> Execution:
@@ -371,15 +401,30 @@ class AsyncCluster:
         function: Callable[..., Any],
         params: Sequence[Any] = (),
         queue: bool = True,
+        variables: Mapping[str, str] | None = None,
+        secrets: Mapping[str, str] | None = None,
     ) -> Execution:
         """Submit a Python function and its positional arguments."""
-        return await self.submit(environment, _payload(function, params), queue)
+        return await self.submit(
+            environment, _payload(function, params), queue, variables, secrets
+        )
 
     async def run_json(
-        self, environment: str, payload: Any, queue: bool = True
+        self,
+        environment: str,
+        payload: Any,
+        queue: bool = True,
+        variables: Mapping[str, str] | None = None,
+        secrets: Mapping[str, str] | None = None,
     ) -> Execution:
         """Submit a JSON-compatible value as the execution payload."""
-        return await self.submit(environment, {"encoding": "json", "data": payload}, queue)
+        return await self.submit(
+            environment,
+            {"encoding": "json", "data": payload},
+            queue,
+            variables,
+            secrets,
+        )
 
     async def run_source(
         self,
@@ -387,13 +432,15 @@ class AsyncCluster:
         source: str,
         params: Sequence[Any] = (),
         queue: bool = True,
+        variables: Mapping[str, str] | None = None,
+        secrets: Mapping[str, str] | None = None,
     ) -> Execution:
         """Submit Python source that defines ``main(...)``."""
         return await self.submit(environment, {
             "encoding": "python-source",
             "source": source,
             "params": params,
-        }, queue)
+        }, queue, variables, secrets)
 
     async def run_files(
         self,
@@ -401,22 +448,31 @@ class AsyncCluster:
         files: Mapping[str, str | Path],
         command: str | Sequence[str],
         queue: bool = True,
+        variables: Mapping[str, str] | None = None,
+        secrets: Mapping[str, str] | None = None,
     ) -> Execution:
         """Upload files and run a command inside a temporary directory."""
         return await self.submit(environment, {
             "encoding": "files",
             "files": _files(files),
             "command": command,
-        }, queue)
+        }, queue, variables, secrets)
 
     async def submit(
-        self, environment: str, payload: Mapping[str, Any], queue: bool = True
+        self,
+        environment: str,
+        payload: Mapping[str, Any],
+        queue: bool = True,
+        variables: Mapping[str, str] | None = None,
+        secrets: Mapping[str, str] | None = None,
     ) -> Execution:
         """Submit a raw execution payload."""
         return await self._post("/v1/executions", {
             "environment": environment,
             "payload": payload,
             "queue": queue,
+            "variables": dict(variables or {}),
+            "secrets": dict(secrets or {}),
         })
 
     async def execution(self, execution_id: str) -> Execution:

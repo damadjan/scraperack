@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     ffi::OsStr,
     net::IpAddr,
     path::{Path, PathBuf},
@@ -34,7 +34,7 @@ use crate::cluster::{
     Cluster, Environment, Execution, ExecutionMetrics, ExecutionStatus, ExecutionView, Image,
     ImageKind, JoinToken, MicroVm, Node, NodeStatus, Pool, Work,
 };
-use crate::storage::{Database, StorageSettings, StorageView};
+use crate::storage::{Database, SecretCipher, StorageSettings, StorageView};
 
 const JOIN_TOKEN_TTL_MS: u64 = 10 * 60 * 1000;
 
@@ -42,6 +42,7 @@ const JOIN_TOKEN_TTL_MS: u64 = 10 * 60 * 1000;
 struct App {
     cluster: Arc<RwLock<Cluster>>,
     database: Database,
+    secrets: SecretCipher,
     controller_id: Uuid,
     data_dir: PathBuf,
     executions: Arc<Notify>,
@@ -163,6 +164,7 @@ pub async fn serve(listen: std::net::SocketAddr, data_dir: PathBuf) -> Result<()
     fs::create_dir_all(data_dir.join("images")).await?;
     fs::create_dir_all(data_dir.join("environments")).await?;
     let database = Database::open(&data_dir.join("scraperack.db"))?;
+    let secrets = SecretCipher::load(&data_dir.join("execution-secrets.key"))?;
     let controller_id_path = data_dir.join("controller-id");
     let legacy_controller_id = match fs::read_to_string(&controller_id_path).await {
         Ok(id) => Some(Uuid::parse_str(id.trim())?),
@@ -194,6 +196,7 @@ pub async fn serve(listen: std::net::SocketAddr, data_dir: PathBuf) -> Result<()
     let app = App {
         cluster: Arc::new(RwLock::new(cluster)),
         database,
+        secrets,
         controller_id,
         data_dir,
         executions: Arc::new(Notify::new()),
@@ -497,6 +500,7 @@ async fn build_docker_image(
     .await?;
     let agent = work.join("scraperack-init");
     let python_executor = work.join("scraperack-python-executor");
+    let python_runtime = work.join("scraperack_runtime.py");
     fs::write(&agent, include_bytes!("../guest/scraperack-init"))
         .await
         .map_err(|e| e.to_string())?;
@@ -508,11 +512,24 @@ async fn build_docker_image(
     .map_err(|e| e.to_string())?;
     install(&state, &agent, &root.join("sbin/scraperack-init"), "0755").await?;
     if executor.is_some() {
+        fs::write(
+            &python_runtime,
+            include_bytes!("../guest/scraperack_runtime.py"),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
         install(
             &state,
             &python_executor,
             &root.join("opt/scraperack/executors/python"),
             "0755",
+        )
+        .await?;
+        install(
+            &state,
+            &python_runtime,
+            &root.join("opt/scraperack/runtime/scraperack_runtime.py"),
+            "0644",
         )
         .await?;
     }
@@ -1782,6 +1799,10 @@ struct CreateExecution {
     #[serde(default)]
     environment: Option<String>,
     payload: Value,
+    #[serde(default)]
+    variables: HashMap<String, String>,
+    #[serde(default)]
+    secrets: HashMap<String, String>,
     #[serde(default = "default_queue")]
     queue: bool,
 }
@@ -1849,6 +1870,7 @@ async fn create_execution(
         node: None,
         status: ExecutionStatus::Queued,
         payload: request.payload,
+        variables: request.variables,
         result: None,
         error: None,
         created_at_ms: now_ms(),
@@ -1857,9 +1879,13 @@ async fn create_execution(
         environment: environment_id,
         metrics: None,
     };
+    let secrets = app
+        .secrets
+        .encrypt(id, &request.secrets)
+        .map_err(internal_error)?;
     if !app
         .database
-        .insert_execution(&execution)
+        .insert_execution(&execution, &secrets)
         .map_err(internal_error)?
     {
         return Err(error(
@@ -2215,10 +2241,20 @@ async fn next_work(
             execution.map(|execution| Work {
                 pool: cluster.pools[&execution.pool].clone(),
                 execution,
+                secrets: HashMap::new(),
             })
         };
-        if let Some(work) = work {
+        if let Some(mut work) = work {
             save_execution(&app, &work.execution).await?;
+            let encrypted = app
+                .database
+                .execution_secrets(work.execution.id)
+                .map_err(internal_error)?
+                .unwrap_or_default();
+            work.secrets = app
+                .secrets
+                .decrypt(work.execution.id, &encrypted)
+                .map_err(internal_error)?;
             return Ok(Json(Some(work)));
         }
         if query.wait_ms == 0 || tokio::time::timeout_at(deadline, notified).await.is_err() {
@@ -2327,9 +2363,11 @@ mod tests {
         let data_dir = std::env::temp_dir().join(format!("scraperack-test-{}", Uuid::new_v4()));
         fs::create_dir_all(&data_dir).await.unwrap();
         let database = Database::open(&data_dir.join("scraperack.db")).unwrap();
+        let secrets = SecretCipher::load(&data_dir.join("execution-secrets.key")).unwrap();
         App {
             cluster: Arc::new(RwLock::new(Cluster::default())),
             database,
+            secrets,
             controller_id: Uuid::new_v4(),
             data_dir,
             executions: Arc::new(Notify::new()),

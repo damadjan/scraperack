@@ -65,9 +65,19 @@ environment = cluster.create_environment(
 def add(a, b):
     return a + b
 
-execution = cluster.run(environment["id"], add, (2, 3))
+execution = cluster.run(
+    environment["id"], add, (2, 3),
+    variables={"LOG_LEVEL": "INFO"},
+    secrets={"DATABASE_URL": "postgresql://..."},
+)
 result = cluster.result(execution["id"])
 ```
+
+Execution code reads invocation-scoped values with
+`scraperack_runtime.variable("LOG_LEVEL")` and
+`scraperack_runtime.secret("DATABASE_URL")`. Secrets remain encrypted in the
+controller queue, are cleared when execution finishes, and are redacted from
+captured output and errors.
 
 ## Development
 
