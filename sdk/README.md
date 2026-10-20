@@ -19,12 +19,22 @@ from scraperack import Cluster
 
 
 def add(a, b):
+    from scraperack_runtime import secret, variable
+
+    print(variable("LOG_LEVEL", "INFO"))
+    database_url = secret("DATABASE_URL")
     return a + b
 
 
 cluster = Cluster("http://controller:7070")
 try:
-    execution = cluster.run("python", add, (2, 3))
+    execution = cluster.run(
+        "python",
+        add,
+        (2, 3),
+        variables={"LOG_LEVEL": "DEBUG"},
+        secrets={"DATABASE_URL": "postgresql://..."},
+    )
     print(cluster.result(execution["id"]))
 finally:
     cluster.close()

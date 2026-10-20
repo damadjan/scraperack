@@ -227,6 +227,8 @@ pub struct Execution {
     pub node: Option<Uuid>,
     pub status: ExecutionStatus,
     pub payload: Value,
+    #[serde(default)]
+    pub variables: HashMap<String, String>,
     pub result: Option<Value>,
     pub error: Option<String>,
     pub created_at_ms: u64,
@@ -273,6 +275,8 @@ impl From<&Execution> for ExecutionView {
 pub struct Work {
     pub execution: Execution,
     pub pool: Pool,
+    #[serde(default)]
+    pub secrets: HashMap<String, String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -708,6 +712,7 @@ mod tests {
                     node: None,
                     status: ExecutionStatus::Queued,
                     payload: Value::Null,
+                    variables: HashMap::new(),
                     result: None,
                     error: None,
                     created_at_ms: 0,
@@ -730,6 +735,7 @@ mod tests {
                 node: None,
                 status: ExecutionStatus::Queued,
                 payload: Value::Null,
+                variables: HashMap::new(),
                 result: None,
                 error: None,
                 created_at_ms: 0,
@@ -857,6 +863,7 @@ mod tests {
                 node: None,
                 status: ExecutionStatus::Queued,
                 payload: Value::Null,
+                variables: HashMap::new(),
                 result: None,
                 error: None,
                 created_at_ms: 0,
@@ -911,6 +918,7 @@ mod tests {
                 node: None,
                 status: ExecutionStatus::Queued,
                 payload: Value::Null,
+                variables: HashMap::new(),
                 result: None,
                 error: None,
                 created_at_ms: 0,

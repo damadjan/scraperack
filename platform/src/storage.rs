@@ -1,10 +1,17 @@
 use std::{
+    collections::HashMap,
+    fs::OpenOptions,
+    io::{ErrorKind, Write},
     path::Path,
     sync::{Arc, Mutex, MutexGuard},
     time::Duration,
 };
 
 use anyhow::{Context, Result};
+use ring::{
+    aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey},
+    rand::{SecureRandom, SystemRandom},
+};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -16,6 +23,95 @@ const DEFAULT_STORAGE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct Database(Arc<Mutex<Connection>>);
+
+#[derive(Clone)]
+pub struct SecretCipher([u8; 32]);
+
+impl SecretCipher {
+    pub fn load(path: &Path) -> Result<Self> {
+        match std::fs::read(path) {
+            Ok(key) => return Self::from_bytes(&key),
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let mut key = [0; 32];
+        SystemRandom::new()
+            .fill(&mut key)
+            .map_err(|_| anyhow::anyhow!("could not generate execution secret key"))?;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(path) {
+            Ok(mut file) => {
+                file.write_all(&key)?;
+                file.sync_all()?;
+            }
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                return Self::from_bytes(&std::fs::read(path)?);
+            }
+            Err(error) => return Err(error.into()),
+        }
+        Ok(Self(key))
+    }
+
+    fn from_bytes(value: &[u8]) -> Result<Self> {
+        Ok(Self(value.try_into().map_err(|_| {
+            anyhow::anyhow!("invalid execution secret key")
+        })?))
+    }
+
+    pub fn encrypt(&self, execution: Uuid, secrets: &HashMap<String, String>) -> Result<Vec<u8>> {
+        if secrets.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut nonce = [0; 12];
+        SystemRandom::new()
+            .fill(&mut nonce)
+            .map_err(|_| anyhow::anyhow!("could not generate execution secret nonce"))?;
+        let mut encrypted = serde_json::to_vec(secrets)?;
+        self.key()?
+            .seal_in_place_append_tag(
+                Nonce::assume_unique_for_key(nonce),
+                Aad::from(execution.as_bytes()),
+                &mut encrypted,
+            )
+            .map_err(|_| anyhow::anyhow!("could not encrypt execution secrets"))?;
+        let mut result = nonce.to_vec();
+        result.extend(encrypted);
+        Ok(result)
+    }
+
+    pub fn decrypt(&self, execution: Uuid, encrypted: &[u8]) -> Result<HashMap<String, String>> {
+        if encrypted.is_empty() {
+            return Ok(HashMap::new());
+        }
+        if encrypted.len() < 12 {
+            anyhow::bail!("invalid encrypted execution secrets");
+        }
+        let (nonce, encrypted) = encrypted.split_at(12);
+        let mut plaintext = encrypted.to_vec();
+        let plaintext = self
+            .key()?
+            .open_in_place(
+                Nonce::assume_unique_for_key(nonce.try_into().unwrap()),
+                Aad::from(execution.as_bytes()),
+                &mut plaintext,
+            )
+            .map_err(|_| anyhow::anyhow!("could not decrypt execution secrets"))?;
+        Ok(serde_json::from_slice(plaintext)?)
+    }
+
+    fn key(&self) -> Result<LessSafeKey> {
+        Ok(LessSafeKey::new(
+            UnboundKey::new(&AES_256_GCM, &self.0)
+                .map_err(|_| anyhow::anyhow!("invalid execution secret key"))?,
+        ))
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageSettings {
@@ -57,12 +153,23 @@ impl Database {
                 finished_at_ms INTEGER,
                 environment TEXT,
                 metrics BLOB,
+                variables BLOB NOT NULL DEFAULT X'7B7D',
+                secrets BLOB,
                 size_bytes INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS executions_created ON executions(created_at_ms DESC);
             CREATE INDEX IF NOT EXISTS executions_finished ON executions(finished_at_ms);
             CREATE INDEX IF NOT EXISTS executions_status ON executions(status);",
         )?;
+        if !column_exists(&connection, "executions", "variables")? {
+            connection.execute(
+                "ALTER TABLE executions ADD COLUMN variables BLOB NOT NULL DEFAULT X'7B7D'",
+                [],
+            )?;
+        }
+        if !column_exists(&connection, "executions", "secrets")? {
+            connection.execute("ALTER TABLE executions ADD COLUMN secrets BLOB", [])?;
+        }
         let database = Self(Arc::new(Mutex::new(connection)));
         database.set_default("retention_ms", DEFAULT_RETENTION_MS)?;
         database.set_default("max_storage_bytes", DEFAULT_STORAGE_BYTES)?;
@@ -133,7 +240,7 @@ impl Database {
         )?;
         let mut statement = connection.prepare(
             "SELECT id, pool, node, status, payload, result, error, created_at_ms,
-                    started_at_ms, finished_at_ms, environment, metrics
+                    started_at_ms, finished_at_ms, environment, metrics, variables
              FROM executions WHERE status = 'queued' ORDER BY created_at_ms",
         )?;
         let rows = statement.query_map([], execution_from_row)?;
@@ -141,10 +248,17 @@ impl Database {
             .map_err(Into::into)
     }
 
-    pub fn insert_execution(&self, execution: &Execution) -> Result<bool> {
+    pub fn insert_execution(&self, execution: &Execution, secrets: &[u8]) -> Result<bool> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
         upsert_execution(&transaction, execution)?;
+        if !secrets.is_empty() {
+            transaction.execute(
+                "UPDATE executions SET secrets = ?2, size_bytes = size_bytes + length(?2)
+                 WHERE id = ?1",
+                params![execution.id.to_string(), secrets],
+            )?;
+        }
         prune(&transaction, execution.created_at_ms, Some(execution.id))?;
         let limit = setting(&transaction, "max_storage_bytes")?;
         if storage_used(&transaction)? > limit {
@@ -178,6 +292,11 @@ impl Database {
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
         upsert_execution(&transaction, execution)?;
+        transaction.execute(
+            "UPDATE executions SET size_bytes = size_bytes - COALESCE(length(secrets), 0),
+             secrets = NULL WHERE id = ?1",
+            [execution.id.to_string()],
+        )?;
         prune(
             &transaction,
             execution.finished_at_ms.unwrap_or(execution.created_at_ms),
@@ -229,10 +348,21 @@ impl Database {
         self.connection()?
             .query_row(
                 "SELECT id, pool, node, status, payload, result, error, created_at_ms,
-                        started_at_ms, finished_at_ms, environment, metrics
+                        started_at_ms, finished_at_ms, environment, metrics, variables
                  FROM executions WHERE id = ?1",
                 [id.to_string()],
                 execution_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn execution_secrets(&self, id: Uuid) -> Result<Option<Vec<u8>>> {
+        self.connection()?
+            .query_row(
+                "SELECT COALESCE(secrets, X'') FROM executions WHERE id = ?1",
+                [id.to_string()],
+                |row| row.get(0),
             )
             .optional()
             .map_err(Into::into)
@@ -279,6 +409,7 @@ impl Database {
 
 fn upsert_execution(connection: &Connection, execution: &Execution) -> Result<()> {
     let payload = serde_json::to_vec(&execution.payload)?;
+    let variables = serde_json::to_vec(&execution.variables)?;
     let result = execution
         .result
         .as_ref()
@@ -290,20 +421,22 @@ fn upsert_execution(connection: &Connection, execution: &Execution) -> Result<()
         .map(serde_json::to_vec)
         .transpose()?;
     let size = payload.len()
+        + variables.len()
         + result.as_ref().map_or(0, Vec::len)
         + metrics.as_ref().map_or(0, Vec::len)
         + execution.error.as_ref().map_or(0, String::len);
     connection.execute(
         "INSERT INTO executions(
             id, pool, node, status, payload, result, error, created_at_ms,
-            started_at_ms, finished_at_ms, environment, metrics, size_bytes
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+            started_at_ms, finished_at_ms, environment, metrics, variables, size_bytes
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
          ON CONFLICT(id) DO UPDATE SET
             pool = excluded.pool, node = excluded.node, status = excluded.status,
             payload = excluded.payload, result = excluded.result, error = excluded.error,
             started_at_ms = excluded.started_at_ms, finished_at_ms = excluded.finished_at_ms,
             environment = excluded.environment, metrics = excluded.metrics,
-            size_bytes = excluded.size_bytes",
+            variables = excluded.variables,
+            size_bytes = excluded.size_bytes + COALESCE(length(executions.secrets), 0)",
         params![
             execution.id.to_string(),
             execution.pool,
@@ -317,6 +450,7 @@ fn upsert_execution(connection: &Connection, execution: &Execution) -> Result<()
             execution.finished_at_ms,
             execution.environment.map(|id| id.to_string()),
             metrics,
+            variables,
             size as u64,
         ],
     )?;
@@ -337,7 +471,16 @@ fn execution_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Execution> {
         finished_at_ms: row.get(9)?,
         environment: optional_uuid(row.get(10)?)?,
         metrics: optional_json(row.get(11)?)?,
+        variables: json(row.get::<_, Vec<u8>>(12)?)?,
     })
+}
+
+fn column_exists(connection: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(columns.iter().any(|name| name == column))
 }
 
 fn execution_view_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ExecutionView> {
@@ -468,6 +611,7 @@ mod tests {
             node: None,
             status: ExecutionStatus::Queued,
             payload: json!({"encoding": "json", "data": "input"}),
+            variables: HashMap::new(),
             result: None,
             error: None,
             created_at_ms,
@@ -487,7 +631,7 @@ mod tests {
     fn stores_execution_data_outside_metadata_views() {
         let (database, path) = database();
         let mut execution = execution(1);
-        database.insert_execution(&execution).unwrap();
+        database.insert_execution(&execution, &[]).unwrap();
         execution.status = ExecutionStatus::Succeeded;
         execution.finished_at_ms = Some(2);
         execution.result = Some(json!({"value": {"encoding": "json", "data": "output"}}));
@@ -514,9 +658,9 @@ mod tests {
             })
             .unwrap();
         let active = execution(1);
-        database.insert_execution(&active).unwrap();
+        database.insert_execution(&active, &[]).unwrap();
         let mut completed = execution(1);
-        database.insert_execution(&completed).unwrap();
+        database.insert_execution(&completed, &[]).unwrap();
         completed.status = ExecutionStatus::Succeeded;
         completed.finished_at_ms = Some(2);
         database.complete_execution(&completed).unwrap();
@@ -524,6 +668,36 @@ mod tests {
         database.prune(3_600_003).unwrap();
         assert!(database.execution(active.id).unwrap().is_some());
         assert!(database.execution(completed.id).unwrap().is_none());
+        drop(database);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn encrypts_queued_secrets_and_clears_them_on_completion() {
+        let (database, path) = database();
+        let cipher = SecretCipher::from_bytes(&[7; 32]).unwrap();
+        let mut execution = execution(1);
+        let secrets = HashMap::from([("TOKEN".into(), "do-not-store-plainly".into())]);
+        let encrypted = cipher.encrypt(execution.id, &secrets).unwrap();
+        assert!(
+            !encrypted
+                .windows("do-not-store-plainly".len())
+                .any(|value| value == b"do-not-store-plainly")
+        );
+        database.insert_execution(&execution, &encrypted).unwrap();
+        let stored = database.execution_secrets(execution.id).unwrap().unwrap();
+        assert_eq!(cipher.decrypt(execution.id, &stored).unwrap(), secrets);
+
+        execution.status = ExecutionStatus::Succeeded;
+        execution.finished_at_ms = Some(2);
+        database.complete_execution(&execution).unwrap();
+        assert!(
+            database
+                .execution_secrets(execution.id)
+                .unwrap()
+                .unwrap()
+                .is_empty()
+        );
         drop(database);
         std::fs::remove_file(path).unwrap();
     }
