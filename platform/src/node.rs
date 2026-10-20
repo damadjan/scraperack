@@ -1158,6 +1158,7 @@ async fn maintain_vms(
         let mut state = vms.lock().await;
         std::mem::take(&mut state.idle)
     };
+    let mut retained = Vec::new();
     while let Some(mut vm) = idle.pop() {
         let expired = vm.last_used.elapsed() >= Duration::from_secs(vm.pool.idle_timeout_secs);
         let release = client
@@ -1176,11 +1177,10 @@ async fn maintain_vms(
             if expired {
                 vm.last_used = Instant::now();
             }
-            idle.push(vm);
-            vms.lock().await.idle.append(&mut idle);
-            break;
+            retained.push(vm);
         }
     }
+    vms.lock().await.idle.append(&mut retained);
 
     for pool in pools {
         loop {
