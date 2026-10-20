@@ -232,7 +232,10 @@ pub async fn serve(listen: std::net::SocketAddr, data_dir: PathBuf) -> Result<()
         .route("/v1/environments/{id}/restart", post(restart_environment))
         .route("/v1/environments/{id}/artifact", get(download_environment))
         .route("/v1/nodes", get(list_nodes))
-        .route("/v1/nodes/{id}", delete(delete_node))
+        .route(
+            "/v1/nodes/{id}",
+            axum::routing::put(update_node).delete(delete_node),
+        )
         .route(
             "/v1/settings/storage",
             get(get_storage_settings).put(update_storage_settings),
@@ -1666,6 +1669,33 @@ async fn list_nodes(State(app): State<App>) -> Json<Vec<Node>> {
     Json(app.cluster.read().await.nodes.values().cloned().collect())
 }
 
+#[derive(Deserialize)]
+struct UpdateNode {
+    vm_start_concurrency: usize,
+}
+
+async fn update_node(
+    State(app): State<App>,
+    AxumPath(id): AxumPath<Uuid>,
+    Json(request): Json<UpdateNode>,
+) -> ApiResult<Json<Node>> {
+    if request.vm_start_concurrency == 0 {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "VM start concurrency must be at least 1",
+        ));
+    }
+    let mut cluster = app.cluster.write().await;
+    let node = cluster
+        .nodes
+        .get_mut(&id)
+        .ok_or_else(|| error(StatusCode::NOT_FOUND, "node not found"))?;
+    node.vm_start_concurrency = Some(request.vm_start_concurrency);
+    let node = node.clone();
+    save(&app, &cluster).await?;
+    Ok(Json(node))
+}
+
 async fn delete_node(
     State(app): State<App>,
     AxumPath(id): AxumPath<Uuid>,
@@ -1982,6 +2012,8 @@ struct RegisterNode {
     name: String,
     cpu_millis: u32,
     memory_mib: u32,
+    #[serde(default)]
+    vm_start_concurrency: Option<usize>,
     address: Option<IpAddr>,
     #[serde(default)]
     reset_idle: bool,
@@ -2005,6 +2037,7 @@ async fn register_node(
         name: request.name.clone(),
         cpu_millis: request.cpu_millis,
         memory_mib: request.memory_mib,
+        vm_start_concurrency: None,
         address: request.address,
         used_cpu_millis: 0,
         used_memory_mib: 0,
@@ -2018,6 +2051,9 @@ async fn register_node(
     node.name = request.name;
     node.cpu_millis = request.cpu_millis;
     node.memory_mib = request.memory_mib;
+    if node.vm_start_concurrency.is_none() {
+        node.vm_start_concurrency = request.vm_start_concurrency.map(|value| value.max(1));
+    }
     node.address = request.address;
     node.last_seen_ms = now_ms();
     node.vms = request.vms;

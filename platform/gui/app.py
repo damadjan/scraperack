@@ -323,6 +323,7 @@ async def nodes_page():
             {"headerName": "Images", "field": "image_count", "maxWidth": 100},
             {"headerName": "Env caches", "field": "environment_count", "maxWidth": 120},
             {"headerName": "Idle VMs", "field": "idle_count", "maxWidth": 110},
+            {"headerName": "Concurrent VM starts", "field": "vm_start_concurrency", "minWidth": 190},
             {"headerName": "Last heartbeat", "field": "last_seen", "minWidth": 190},
         ], selection=True, row_key="id", full_height=True)
 
@@ -335,6 +336,7 @@ async def nodes_page():
             data = await request("GET", "/v1/nodes")
             rows = [
                 {"id": node["id"], "name": node["name"], "status": node["status"],
+                 "cpu_millis": node["cpu_millis"],
                  "cpu": f'{node["used_cpu_millis"] / 1000:g} / {node["cpu_millis"] / 1000:g} cores · '
                         f'{(node["used_cpu_millis"] / node["cpu_millis"] * 100 if node["cpu_millis"] else 0):.0f}%',
                  "memory": f'{node["used_memory_mib"]} / {node["memory_mib"]} MiB · '
@@ -342,6 +344,8 @@ async def nodes_page():
                  "image_count": len(node["images"]),
                  "environment_count": len(node.get("environments", [])),
                  "idle_count": sum(node.get("idle_instances", {}).values()),
+                 "vm_start_concurrency": node.get("vm_start_concurrency")
+                                         or max(1, node["cpu_millis"] // 2000),
                  "last_seen": stamp(node["last_seen_ms"])}
                 for node in data
             ]
@@ -364,6 +368,38 @@ async def nodes_page():
         except Exception as error:
             notify_error(error)
 
+    async def settings(event):
+        selected = event.args.get("data")
+        if not selected:
+            return
+        with ui.dialog() as dialog, ui.card().classes("execution-dialog"):
+            with ui.row().classes("items-center w-full"):
+                ui.label(f'{selected["name"]} settings').classes("section-title")
+                ui.space()
+                ui.button(icon="close", on_click=dialog.close).props("flat round")
+            concurrency = ui.number(
+                "Concurrent VM starts", value=selected["vm_start_concurrency"], min=1,
+                step=1, precision=0,
+            ).classes("w-64")
+            ui.label("Limits simultaneous cold and warm microVM starts on this node.") \
+                .classes("text-sm muted")
+
+            async def save_settings():
+                try:
+                    await request("PUT", f'/v1/nodes/{selected["id"]}', json={
+                        "vm_start_concurrency": int(concurrency.value),
+                    })
+                    dialog.close()
+                    ui.notify(f'Updated {selected["name"]}', type="positive")
+                    await refresh()
+                except Exception as error:
+                    notify_error(error)
+
+            with ui.row().classes("w-full justify-end"):
+                ui.button("Cancel", on_click=dialog.close).props("flat no-caps")
+                ui.button("Save", on_click=save_settings).props("no-caps")
+        dialog.open()
+
     async def revoke():
         selected = await nodes.get_selected_row()
         if not selected:
@@ -376,6 +412,7 @@ async def nodes_page():
             notify_error(error)
 
     revoke_button.on_click(revoke)
+    nodes.classes("clickable-grid").on("cellClicked", settings, ["data"])
     await refresh()
     ui.timer(1, refresh)
 
