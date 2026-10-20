@@ -168,6 +168,8 @@ pub struct Node {
     pub cpu_millis: u32,
     pub memory_mib: u32,
     #[serde(default)]
+    pub vm_start_concurrency: Option<usize>,
+    #[serde(default)]
     pub address: Option<IpAddr>,
     pub used_cpu_millis: u32,
     pub used_memory_mib: u32,
@@ -653,6 +655,7 @@ mod tests {
             name: id.to_string(),
             cpu_millis: 1000,
             memory_mib: 512,
+            vm_start_concurrency: None,
             address: None,
             used_cpu_millis: 0,
             used_memory_mib: 0,

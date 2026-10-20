@@ -22,7 +22,7 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader},
     net::UnixStream,
     process::{Child, Command},
-    sync::{Mutex, Semaphore},
+    sync::{Mutex, Notify},
 };
 use uuid::Uuid;
 
@@ -51,6 +51,69 @@ struct EnvironmentView {
 #[derive(Deserialize)]
 struct RegisteredNode {
     id: Uuid,
+    #[serde(default)]
+    vm_start_concurrency: Option<usize>,
+}
+
+struct VmStartLimiter {
+    state: std::sync::Mutex<VmStartLimiterState>,
+    changed: Notify,
+}
+
+struct VmStartLimiterState {
+    active: usize,
+    limit: usize,
+}
+
+struct VmStartPermit<'a>(&'a VmStartLimiter);
+
+impl VmStartLimiter {
+    fn new(limit: usize) -> Self {
+        Self {
+            state: std::sync::Mutex::new(VmStartLimiterState {
+                active: 0,
+                limit: limit.max(1),
+            }),
+            changed: Notify::new(),
+        }
+    }
+
+    async fn acquire(&self) -> VmStartPermit<'_> {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            {
+                let mut state = self.state.lock().expect("VM start limiter poisoned");
+                if state.active < state.limit {
+                    state.active += 1;
+                    return VmStartPermit(self);
+                }
+            }
+            changed.await;
+        }
+    }
+
+    fn set_limit(&self, limit: usize) -> bool {
+        let limit = limit.max(1);
+        let mut state = self.state.lock().expect("VM start limiter poisoned");
+        if state.limit == limit {
+            return false;
+        }
+        state.limit = limit;
+        drop(state);
+        self.changed.notify_waiters();
+        true
+    }
+}
+
+impl Drop for VmStartPermit<'_> {
+    fn drop(&mut self) {
+        let mut state = self.0.state.lock().expect("VM start limiter poisoned");
+        state.active = state.active.saturating_sub(1);
+        drop(state);
+        self.0.changed.notify_one();
+    }
 }
 
 #[derive(Deserialize)]
@@ -70,6 +133,7 @@ struct Registration<'a> {
     name: &'a str,
     cpu_millis: u32,
     memory_mib: u32,
+    vm_start_concurrency: usize,
     address: IpAddr,
     reset_idle: bool,
     vms: Vec<MicroVm>,
@@ -499,6 +563,9 @@ pub async fn run(
     );
     let client = Client::builder().default_headers(headers).build()?;
 
+    let local_vm_start_concurrency = vm_start_concurrency
+        .unwrap_or_else(|| default_vm_start_concurrency(cpu_millis))
+        .max(1);
     let mut node: RegisteredNode = client
         .post(format!("{controller}/internal/nodes/register"))
         .json(&Registration {
@@ -506,6 +573,7 @@ pub async fn run(
             name: &name,
             cpu_millis,
             memory_mib,
+            vm_start_concurrency: local_vm_start_concurrency,
             address,
             reset_idle: true,
             vms: Vec::new(),
@@ -516,11 +584,11 @@ pub async fn run(
         .json()
         .await?;
     let snapshot_lock = Arc::new(Mutex::new(()));
-    let vm_start_concurrency = vm_start_concurrency
-        .unwrap_or_else(|| default_vm_start_concurrency(cpu_millis))
-        .max(1);
+    let vm_start_concurrency = node
+        .vm_start_concurrency
+        .unwrap_or(local_vm_start_concurrency);
     tracing::info!(vm_start_concurrency, "configured VM start concurrency");
-    let vm_starts = Arc::new(Semaphore::new(vm_start_concurrency));
+    let vm_starts = Arc::new(VmStartLimiter::new(vm_start_concurrency));
     let vms = Arc::new(Mutex::new(VmState {
         idle: Vec::new(),
         running: HashMap::new(),
@@ -566,6 +634,7 @@ pub async fn run(
                     name: &name,
                     cpu_millis,
                     memory_mib,
+                    vm_start_concurrency: local_vm_start_concurrency,
                     address,
                     reset_idle: false,
                     vms: reports,
@@ -575,6 +644,12 @@ pub async fn run(
                 .error_for_status()?
                 .json()
                 .await?;
+            let vm_start_concurrency = node
+                .vm_start_concurrency
+                .unwrap_or(local_vm_start_concurrency);
+            if vm_starts.set_limit(vm_start_concurrency) {
+                tracing::info!(vm_start_concurrency, "updated VM start concurrency");
+            }
             sync_images(&client, controller, node.id, &data_dir).await?;
             sync_environments(&client, controller, node.id, &data_dir).await?;
             let pools = sync_snapshots(
@@ -788,7 +863,7 @@ async fn run_execution(
     data_dir: &Path,
     work: &Work,
     snapshot_lock: &Mutex<()>,
-    vm_starts: &Semaphore,
+    vm_starts: &VmStartLimiter,
     network: &Network,
     vms: &Mutex<VmState>,
 ) -> Completion {
@@ -808,10 +883,7 @@ async fn run_execution(
     let mut vm = match idle {
         Some(vm) => vm,
         None => {
-            let permit = vm_starts
-                .acquire()
-                .await
-                .expect("VM start semaphore closed");
+            let permit = vm_starts.acquire().await;
             let started = start_vm(
                 firecracker,
                 kernel,
@@ -1030,7 +1102,7 @@ async fn maintain_vms(
     kernel: &Path,
     data_dir: &Path,
     snapshot_lock: &Mutex<()>,
-    vm_starts: &Semaphore,
+    vm_starts: &VmStartLimiter,
     network: &Network,
     vms: &Mutex<VmState>,
     pools: &[Pool],
@@ -1098,10 +1170,7 @@ async fn maintain_vms(
             if !needed || !vms.lock().await.reserve_warm(pool) {
                 break;
             }
-            let permit = vm_starts
-                .acquire()
-                .await
-                .expect("VM start semaphore closed");
+            let permit = vm_starts.acquire().await;
             let started =
                 start_vm(firecracker, kernel, data_dir, pool, snapshot_lock, network).await;
             drop(permit);
