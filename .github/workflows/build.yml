@@ -49,9 +49,10 @@ jobs:
 
       - name: Check Python
         run: |
-          pip install ruff
+          pip install ruff -e sdk
           ruff check --select E4,E7,E9,F platform/gui sdk verification
           python -m compileall -q platform/gui sdk verification
+          python -m unittest discover -s sdk/tests
 
       - name: Check shell scripts
         run: sh -n install.sh platform/deploy/*.sh

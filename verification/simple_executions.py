@@ -5,15 +5,29 @@ from scraperack import Cluster
 
 cluster = Cluster(os.getenv("SCRAPERACK_URL", "http://192.168.2.16:7070"))
 environment = os.getenv("SCRAPERACK_ENVIRONMENT", "python")
+
+
+def hello():
+    return "hello from a microVM"
+
+
+def math(a, b):
+    return {"sum": a + b, "product": a * b}
+
+
+def squares(values):
+    return [value**2 for value in values]
+
+
 jobs = [
-    ("hello", "def main():\n    return 'hello from a microVM'", ()),
-    ("math", "def main(a, b):\n    return {'sum': a + b, 'product': a * b}", (6, 7)),
-    ("python", "def main(values):\n    return [value ** 2 for value in values]", ([1, 2, 3, 4, 5],)),
+    ("hello", hello, ()),
+    ("math", math, (6, 7)),
+    ("python", squares, ([1, 2, 3, 4, 5],)),
 ]
 
 try:
-    for name, source, params in jobs:
-        execution = cluster.run_source(environment, source, params)
+    for name, function, params in jobs:
+        execution = cluster.run(environment, function, params)
         print(name, cluster.result(execution["id"]))
 finally:
     cluster.close()
