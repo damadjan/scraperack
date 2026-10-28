@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
@@ -1385,9 +1385,16 @@ async fn start_vm(
             }]);
         }
         firecracker_request("PUT", &api_socket, "/snapshot/load", &load).await?;
+        let unix_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("system time is before the Unix epoch")?
+            .as_secs_f64();
         let ready = tokio::time::timeout(
             Duration::from_secs(10),
-            guest_request(&vsock, &json!({"encoding": "scraperack-snapshot"})),
+            guest_request(
+                &vsock,
+                &json!({"encoding": "scraperack-snapshot", "unix_time": unix_time}),
+            ),
         )
         .await
         .context("restored guest did not become ready")??;

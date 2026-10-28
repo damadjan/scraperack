@@ -151,6 +151,8 @@ def handle(connection):
         try:
             payload = json.loads(line)
             if payload["encoding"] == "scraperack-snapshot":
+                if "unix_time" in payload:
+                    time.clock_settime(time.CLOCK_REALTIME, payload["unix_time"])
                 if service and service.poll() not in (None, 0):
                     raise RuntimeError(f"service exited {service.returncode}")
                 if payload.get("preload"):
