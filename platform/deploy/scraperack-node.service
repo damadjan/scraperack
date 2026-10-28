@@ -1,7 +1,8 @@
 [Unit]
 Description=Scraperack worker node
-After=network-online.target scraperack-controller.service
+After=network-online.target scraperack-controller.service scraperack-dns.service
 Wants=network-online.target
+Requires=scraperack-dns.service
 
 [Service]
 User=scraperack

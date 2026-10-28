@@ -14,6 +14,7 @@ The deployment scripts install or download the following components directly fro
 | --- | --- |
 | Firecracker | [Firecracker releases](https://github.com/firecracker-microvm/firecracker/releases) |
 | Firecracker CI kernel | [Firecracker CI artifacts](https://s3.amazonaws.com/spec.ccfc.min/) |
+| dnsproxy | [AdGuardTeam dnsproxy releases](https://github.com/AdguardTeam/dnsproxy/releases) |
 | Ubuntu packages | [Ubuntu archive](https://archive.ubuntu.com/ubuntu/) |
 | CPython | [Python.org](https://www.python.org/downloads/source/) |
 | Python packages | [PyPI](https://pypi.org/) |

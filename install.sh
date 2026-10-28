@@ -13,6 +13,8 @@ set -eu
 repo=${SCRAPERACK_REPOSITORY:-damadjan/scraperack}
 release=${SCRAPERACK_RELEASE:-rolling}
 user=${SCRAPERACK_USER:-scraperack}
+dnsproxy_version=0.85.0
+dnsproxy_sha256=740af768b17fe8ecc2dbc8c82c7b5224e43278a181b4fe31b0cce5d8da656332
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 role=$(cat /etc/scraperack/role 2>/dev/null || true)
@@ -48,10 +50,26 @@ curl -fsSL "$base/$archive.sha256" -o "$work/$archive.sha256"
 tar -xzf "$work/$archive" -C "$work"
 bundle="$work/scraperack"
 
-systemctl stop scraperack-gui scraperack-node scraperack-controller 2>/dev/null || true
+if [ ! -x /usr/local/bin/dnsproxy ] || \
+   [ "$(cat /opt/scraperack/DNSPROXY_VERSION 2>/dev/null || true)" != "$dnsproxy_version" ]; then
+    dnsproxy_archive="dnsproxy-linux-amd64-v$dnsproxy_version.tar.gz"
+    curl -fsSL "https://github.com/AdguardTeam/dnsproxy/releases/download/v$dnsproxy_version/$dnsproxy_archive" \
+        -o "$work/$dnsproxy_archive"
+    printf '%s  %s\n' "$dnsproxy_sha256" "$dnsproxy_archive" > "$work/dnsproxy.sha256"
+    (cd "$work" && sha256sum -c dnsproxy.sha256)
+    tar -xzf "$work/$dnsproxy_archive" -C "$work"
+fi
+
+systemctl stop scraperack-gui scraperack-node scraperack-controller scraperack-dns 2>/dev/null || true
 install -m 0755 "$bundle/bin/scraperack" /usr/local/bin/scraperack
 
 install -d /opt/scraperack/platform
+if [ -d "$work/linux-amd64" ]; then
+    install -m 0755 "$work/linux-amd64/dnsproxy" /usr/local/bin/dnsproxy
+    install -d /opt/scraperack/licenses
+    install -m 0644 "$work/linux-amd64/LICENSE" /opt/scraperack/licenses/dnsproxy-LICENSE
+    printf '%s\n' "$dnsproxy_version" > /opt/scraperack/DNSPROXY_VERSION
+fi
 if [ "$role" != node ]; then
     rm -rf /opt/scraperack/platform/gui
     cp -a "$bundle/platform/gui" /opt/scraperack/platform/gui
@@ -107,7 +125,7 @@ SCRAPERACK_GUI_PORT=${SCRAPERACK_GUI_PORT:-8080}
 EOF
 chmod 0600 /etc/scraperack/*.env
 
-for service in controller node gui; do
+for service in controller node gui dns; do
     sed "s/^User=.*/User=$user/" \
         "$bundle/platform/deploy/scraperack-$service.service" \
         > "/etc/systemd/system/scraperack-$service.service"
@@ -116,18 +134,18 @@ done
 systemctl daemon-reload
 if [ "$role" = node ]; then
     systemctl disable --now scraperack-controller scraperack-gui
-    systemctl enable --now scraperack-node
+    systemctl enable --now scraperack-dns scraperack-node
     echo "ScrapeRack node is running"
     exit
 fi
-systemctl enable --now scraperack-controller scraperack-node scraperack-gui
+systemctl enable --now scraperack-controller scraperack-dns scraperack-node scraperack-gui
 
 attempt=0
 until [ "$(curl -fsS http://127.0.0.1:7070/v1/nodes 2>/dev/null)" != "[]" ] && \
       curl -fsS http://127.0.0.1:8080/ >/dev/null; do
     attempt=$((attempt + 1))
     [ "$attempt" -lt 30 ] || {
-        systemctl --no-pager --full status scraperack-controller scraperack-node scraperack-gui || true
+        systemctl --no-pager --full status scraperack-controller scraperack-dns scraperack-node scraperack-gui || true
         exit 1
     }
     sleep 1
