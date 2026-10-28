@@ -34,6 +34,7 @@ use crate::cluster::{
 
 const GUEST_PORT: u32 = 5000;
 const NETWORK: &str = "10.240.0.0/16";
+const GUEST_DNS: Ipv4Addr = Ipv4Addr::new(10, 239, 255, 254);
 const PORT_START: u16 = 30000;
 const PORT_END: u16 = 49999;
 
@@ -1403,7 +1404,7 @@ async fn start_vm(
                         "address": lease.guest_ip,
                         "prefix": 30,
                         "gateway": lease.gateway,
-                        "dns": ["1.1.1.1", "8.8.8.8"],
+                        "dns": [GUEST_DNS],
                     }),
                 ),
             )
