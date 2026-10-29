@@ -6,3 +6,4 @@ __pycache__/
 /platform/data/
 /.pytest_cache
 v/
+docker_build_commands*.txt
