@@ -2,8 +2,12 @@ name: Build
 
 on:
   pull_request:
+    paths-ignore:
+      - images/**
   push:
     branches: [main]
+    paths-ignore:
+      - images/**
   workflow_dispatch:
 
 concurrency:
