@@ -184,6 +184,7 @@ def handle(connection):
         connection.sendall(json.dumps(response).encode() + b"\n")
 
 
+subprocess.run(["mount", "-t", "proc", "-o", "nosuid,nodev,noexec", "proc", "/proc"], check=True)
 subprocess.run(["mount", "-t", "tmpfs", "-o", "mode=1777", "tmpfs", "/tmp"], check=True)
 if Path("/dev/vdb").exists():
     Path("/tmp/environment").mkdir()
