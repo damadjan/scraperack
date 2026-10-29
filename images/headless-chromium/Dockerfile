@@ -5,6 +5,7 @@ RUN apt-get update \
         ca-certificates \
         chromium \
         fonts-liberation \
+        python3 \
         util-linux \
     && rm -rf /var/lib/apt/lists/*
 
