@@ -186,6 +186,11 @@ def handle(connection):
 
 subprocess.run(["mount", "-t", "proc", "-o", "nosuid,nodev,noexec", "proc", "/proc"], check=True)
 subprocess.run(["mount", "-t", "tmpfs", "-o", "mode=1777", "tmpfs", "/tmp"], check=True)
+with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as control:
+    interface = b"lo"
+    ifreq = struct.pack("16sh22x", interface, 0)
+    flags = struct.unpack("16sh22x", fcntl.ioctl(control, 0x8913, ifreq))[1]
+    fcntl.ioctl(control, 0x8914, struct.pack("16sh22x", interface, flags | 1))
 if Path("/dev/vdb").exists():
     Path("/tmp/environment").mkdir()
     subprocess.run(["mount", "-t", "ext4", "-o", "ro", "/dev/vdb", "/tmp/environment"], check=True)

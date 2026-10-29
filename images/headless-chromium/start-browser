@@ -1,0 +1,16 @@
+#!/bin/sh
+set -eu
+
+socat TCP4-LISTEN:9222,fork,reuseaddr TCP4:127.0.0.1:9223 &
+
+exec chromium \
+    --headless=new \
+    --no-sandbox \
+    --disable-dev-shm-usage \
+    --no-first-run \
+    --no-default-browser-check \
+    --remote-allow-origins='*' \
+    --remote-debugging-address=127.0.0.1 \
+    --remote-debugging-port=9223 \
+    --user-data-dir="$HOME/profile" \
+    "$@"
