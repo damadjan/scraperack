@@ -86,6 +86,10 @@ html, body, #app, .q-layout, .q-page-container { background: var(--base); color:
 .data-block, .error-block { min-width: 0; padding: 10px; }
 .json-code { width: 100%; max-height: 320px; overflow-y: auto; overflow-wrap: anywhere; white-space: pre-wrap; margin-top: 8px; border-radius: 5px; }
 .error-block { border-color: #7f1d1d; background: #230b0b; }
+.status-starting { color: #67e8f9; border-color: #155e75; background: #083344; }
+.status-stopped { color: #d4d4d4; border-color: #525252; background: #262626; }
+.plugin-frame { width: 100%; height: calc(100vh - 16px); border: 0; border-radius: 8px; background: var(--base); }
+@media (max-width: 800px) { .plugin-frame { height: calc(100vh - 60px); } }
 @media (max-width: 1000px) {
   .summary-grid { grid-template-columns: repeat(2, 1fr); }
   .detail-grid { grid-template-columns: repeat(2, 1fr); }

@@ -42,7 +42,7 @@ fn default_executor() -> Option<String> {
     Some("Python 3.10.11".into())
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Pool {
     pub name: String,
     pub image: Uuid,
@@ -65,10 +65,68 @@ pub struct Pool {
     pub managed_by: Option<String>,
     #[serde(default)]
     pub environment: Option<Uuid>,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub environment_artifact: Option<String>,
     #[serde(default)]
     pub preload: Vec<String>,
+    /// Bumped whenever VM-affecting settings change; stale VMs are recycled.
+    #[serde(default)]
+    pub revision: u64,
+    /// Extra read-only disks attached after the root filesystem, in order.
+    #[serde(default)]
+    pub disks: Vec<PoolDisk>,
+    /// Command the guest agent starts to handle execution payloads.
+    #[serde(default)]
+    pub executor: Vec<String>,
+    /// Extra names that resolve to this pool when submitting executions.
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    #[serde(default)]
+    pub display_name: Option<String>,
+}
+
+impl Pool {
+    pub fn disks_ready(&self, node: &Node) -> bool {
+        self.disks.iter().all(|disk| node.disks.contains(&disk.key))
+    }
+
+    pub fn matches(&self, key: &str) -> bool {
+        self.name == key || self.aliases.iter().any(|alias| alias == key)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PoolDisk {
+    pub key: String,
+    pub mount: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Disk {
+    pub key: String,
+    pub sha256: String,
+    pub size: u64,
+    #[serde(default)]
+    pub owner: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginRecord {
+    pub name: String,
+    pub version: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub previous_version: Option<String>,
+    pub enabled: bool,
+    #[serde(default)]
+    pub gui: bool,
+    #[serde(default)]
+    pub guest_disk: Option<String>,
+    /// Guest disk of `previous_version`, kept so a rollback can use it.
+    #[serde(default)]
+    pub previous_guest_disk: Option<String>,
+    pub installed_at_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -174,8 +232,10 @@ pub struct Node {
     pub used_cpu_millis: u32,
     pub used_memory_mib: u32,
     pub images: HashSet<Uuid>,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub environments: HashSet<String>,
+    #[serde(default)]
+    pub disks: HashSet<String>,
     #[serde(default)]
     pub idle_instances: HashMap<String, u32>,
     #[serde(default)]
@@ -286,8 +346,13 @@ pub struct Cluster {
     pub nodes: HashMap<Uuid, Node>,
     #[serde(default, skip_serializing)]
     pub executions: HashMap<Uuid, Execution>,
-    #[serde(default)]
+    /// Legacy Python environments, migrated to the Python plugin on startup.
+    #[serde(default, skip_serializing)]
     pub environments: HashMap<Uuid, Environment>,
+    #[serde(default)]
+    pub disks: HashMap<String, Disk>,
+    #[serde(default)]
+    pub plugins: HashMap<String, PluginRecord>,
     #[serde(default)]
     pub join_tokens: HashMap<Uuid, JoinToken>,
     #[serde(default)]
@@ -301,12 +366,18 @@ impl Cluster {
         self.nodes.values().all(|node| node.images.contains(&image))
     }
 
-    pub fn environment_ready(&self, environment: &Environment) -> bool {
-        environment.artifact.as_ref().is_none_or(|artifact| {
-            self.nodes
-                .values()
-                .all(|node| node.environments.contains(artifact))
-        })
+    pub fn disk_ready(&self, key: &str) -> bool {
+        self.nodes.values().all(|node| node.disks.contains(key))
+    }
+
+    pub fn pool_ready(&self, pool: &Pool) -> bool {
+        self.image_ready(pool.image) && pool.disks.iter().all(|disk| self.disk_ready(&disk.key))
+    }
+
+    pub fn find_pool(&self, key: &str) -> Option<&Pool> {
+        self.pools
+            .get(key)
+            .or_else(|| self.pools.values().find(|pool| pool.matches(key)))
     }
 
     pub fn refresh_node(&mut self, id: Uuid) {
@@ -360,10 +431,7 @@ impl Cluster {
                 let has_idle = node.idle_instances.get(&pool.name).copied().unwrap_or(0) > 0;
                 node.status == NodeStatus::Ready
                     && node.images.contains(&pool.image)
-                    && pool
-                        .environment_artifact
-                        .as_ref()
-                        .is_none_or(|artifact| node.environments.contains(artifact))
+                    && pool.disks_ready(node)
                     && (has_idle
                         || (can_start
                             && node.cpu_millis >= pool.cpu_millis
@@ -556,6 +624,28 @@ impl Cluster {
         true
     }
 
+    /// Forget one idle instance regardless of warm targets, e.g. after a revision change.
+    pub fn discard_idle_instance(&mut self, node_id: Uuid, pool_name: &str) -> bool {
+        let Some(pool) = self.pools.get(pool_name) else {
+            return false;
+        };
+        let (cpu, memory) = (pool.cpu_millis, pool.memory_mib);
+        let Some(node) = self.nodes.get_mut(&node_id) else {
+            return false;
+        };
+        let Some(idle) = node
+            .idle_instances
+            .get_mut(pool_name)
+            .filter(|idle| **idle > 0)
+        else {
+            return false;
+        };
+        *idle -= 1;
+        node.used_cpu_millis = node.used_cpu_millis.saturating_sub(cpu);
+        node.used_memory_mib = node.used_memory_mib.saturating_sub(memory);
+        true
+    }
+
     fn warm_targets(&self, pool: &Pool) -> HashMap<Uuid, u32> {
         let active = self
             .executions
@@ -583,10 +673,7 @@ impl Cluster {
             .values()
             .filter(|node| {
                 node.images.contains(&pool.image)
-                    && pool
-                        .environment_artifact
-                        .as_ref()
-                        .is_none_or(|artifact| node.environments.contains(artifact))
+                    && pool.disks_ready(node)
                     && node.cpu_millis >= pool.cpu_millis
                     && node.memory_mib >= pool.memory_mib
             })
@@ -665,6 +752,7 @@ mod tests {
             used_memory_mib: 0,
             images: HashSet::from([image]),
             environments: HashSet::new(),
+            disks: HashSet::new(),
             idle_instances: HashMap::new(),
             vms: Vec::new(),
             status: NodeStatus::Ready,
@@ -699,6 +787,7 @@ mod tests {
                 environment: None,
                 environment_artifact: None,
                 preload: Vec::new(),
+                ..Default::default()
             },
         );
 
@@ -780,6 +869,7 @@ mod tests {
                 environment: None,
                 environment_artifact: None,
                 preload: Vec::new(),
+                ..Default::default()
             },
         );
 
@@ -853,6 +943,7 @@ mod tests {
                 environment: None,
                 environment_artifact: None,
                 preload: Vec::new(),
+                ..Default::default()
             },
         );
         cluster.executions.insert(
@@ -908,6 +999,7 @@ mod tests {
                 environment: None,
                 environment_artifact: None,
                 preload: Vec::new(),
+                ..Default::default()
             },
         );
         cluster.executions.insert(

@@ -99,8 +99,10 @@ vm_start_concurrency=$((cpu_millis / 2000))
 [ "$vm_start_concurrency" -ge 1 ] || vm_start_concurrency=1
 vm_start_concurrency=${SCRAPERACK_NODE_VM_START_CONCURRENCY:-$vm_start_concurrency}
 
+allow_plugins=$(sed -n 's/^SCRAPERACK_ALLOW_PLUGIN_INSTALL=//p' /etc/scraperack/controller.env 2>/dev/null || true)
 cat > /etc/scraperack/controller.env <<EOF
 SCRAPERACK_LISTEN=${SCRAPERACK_LISTEN:-0.0.0.0:7070}
+SCRAPERACK_ALLOW_PLUGIN_INSTALL=${SCRAPERACK_ALLOW_PLUGIN_INSTALL:-${allow_plugins:-true}}
 EOF
 if [ ! -f /etc/scraperack/node.env ]; then
 cat > /etc/scraperack/node.env <<EOF

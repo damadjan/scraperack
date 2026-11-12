@@ -2,6 +2,7 @@ mod api;
 mod cluster;
 mod join;
 mod node;
+mod plugins;
 mod storage;
 
 use std::{
@@ -26,6 +27,14 @@ enum Command {
         listen: SocketAddr,
         #[arg(long, default_value = "data/controller")]
         data_dir: PathBuf,
+        /// Allow installing plugins through the API and GUI.
+        #[arg(
+            long,
+            env = "SCRAPERACK_ALLOW_PLUGIN_INSTALL",
+            default_value_t = true,
+            action = clap::ArgAction::Set
+        )]
+        allow_plugin_install: bool,
     },
     Node {
         #[arg(long)]
@@ -70,7 +79,11 @@ async fn main() -> Result<()> {
         .init();
 
     match Cli::parse().command {
-        Command::Controller { listen, data_dir } => api::serve(listen, data_dir).await,
+        Command::Controller {
+            listen,
+            data_dir,
+            allow_plugin_install,
+        } => api::serve(listen, data_dir, allow_plugin_install).await,
         Command::Node {
             controller,
             name,

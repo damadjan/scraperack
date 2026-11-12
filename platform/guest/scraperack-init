@@ -1,17 +1,23 @@
 #!/usr/bin/python3
+"""ScrapeRack guest agent.
+
+Runs as PID 1 inside every microVM. It is workload-agnostic: the pool tells it,
+in the first ``scraperack-snapshot`` request, which extra disks to mount and
+which executor command handles execution payloads. Executors speak
+length-prefixed JSON over ``/tmp/scraperack-executor.sock``.
+"""
 import fcntl
 import json
 import os
 import socket
+import string
 import struct
 import subprocess
 import time
 import traceback
 from pathlib import Path
 
-EXECUTOR = Path("/opt/scraperack/executors/python")
 EXECUTOR_SOCKET = Path("/tmp/scraperack-executor.sock")
-ENVIRONMENT_PYTHON = Path("/tmp/environment/bin/python")
 SERVICE = Path("/etc/scraperack-service.json")
 
 
@@ -63,13 +69,25 @@ def netlink_attr(kind, value):
     return struct.pack("HH", length, kind) + value + b"\0" * ((-length) % 4)
 
 
+def mount_disks(mounts):
+    letters = string.ascii_lowercase[1:]
+    if len(mounts) > len(letters):
+        raise ValueError("too many disks")
+    for letter, target in zip(letters, mounts):
+        target = Path(target)
+        if not target.is_absolute():
+            raise ValueError(f"disk mount must be absolute: {target}")
+        target.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["mount", "-t", "ext4", "-o", "ro", f"/dev/vd{letter}", str(target)],
+                       check=True)
+
+
 def start_executor():
     global executor_connection, executor_process
-    if not EXECUTOR.is_file() or not os.access(EXECUTOR, os.X_OK):
+    if not executor_command:
         return None
     EXECUTOR_SOCKET.unlink(missing_ok=True)
-    command = [ENVIRONMENT_PYTHON, EXECUTOR] if ENVIRONMENT_PYTHON.is_file() else [EXECUTOR]
-    executor_process = subprocess.Popen(command, stdin=subprocess.DEVNULL,
+    executor_process = subprocess.Popen(executor_command, stdin=subprocess.DEVNULL,
                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     executor_connection = None
     return executor_process
@@ -90,7 +108,7 @@ def connect_executor():
     if executor_process is None or executor_process.poll() is not None:
         start_executor()
     if executor_process is None:
-        raise RuntimeError("image has no executor")
+        raise RuntimeError("this pool has no executor")
     deadline = time.monotonic() + 10
     while True:
         try:
@@ -123,17 +141,6 @@ def executor_request(payload):
                 raise
 
 
-def execute(payload):
-    return executor_request(payload)
-
-
-def executor_description():
-    if not EXECUTOR.is_file() or not os.access(EXECUTOR, os.X_OK):
-        return None
-    response = executor_request({"encoding": "scraperack-describe"})
-    return response["result"]["value"]["data"] if not response["error"] else None
-
-
 def start_service():
     if not SERVICE.is_file():
         return None
@@ -146,6 +153,16 @@ def start_service():
     return subprocess.Popen(command, cwd=config.get("working_dir") or "/", env=env)
 
 
+def initialize(payload):
+    """Configure the guest once, before the pool snapshot is taken."""
+    global executor_command, initialized, service
+    mount_disks(payload.get("disks") or [])
+    executor_command = [str(part) for part in payload.get("executor") or []]
+    start_executor()
+    service = start_service()
+    initialized = True
+
+
 def handle(connection):
     for line in connection.makefile():
         try:
@@ -153,6 +170,8 @@ def handle(connection):
             if payload["encoding"] == "scraperack-snapshot":
                 if "unix_time" in payload:
                     time.clock_settime(time.CLOCK_REALTIME, payload["unix_time"])
+                if not initialized:
+                    initialize(payload)
                 if service and service.poll() not in (None, 0):
                     raise RuntimeError(f"service exited {service.returncode}")
                 if payload.get("preload"):
@@ -165,7 +184,7 @@ def handle(connection):
                 response = {
                     "result": {"value": {"encoding": "json", "data": {
                         "compatible": True,
-                        "executor": executor_description(),
+                        "executor": bool(executor_command),
                     }}, "stdout": "", "stderr": ""},
                     "error": None,
                     "timed_out": False,
@@ -174,7 +193,7 @@ def handle(connection):
                 configure_network(payload)
                 response = {"result": None, "error": None, "timed_out": False}
             else:
-                response = execute(payload)
+                response = executor_request(payload)
         except BaseException:
             response = {
                 "result": {"stdout": "", "stderr": ""},
@@ -191,15 +210,13 @@ with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as control:
     ifreq = struct.pack("16sh22x", interface, 0)
     flags = struct.unpack("16sh22x", fcntl.ioctl(control, 0x8913, ifreq))[1]
     fcntl.ioctl(control, 0x8914, struct.pack("16sh22x", interface, flags | 1))
-if Path("/dev/vdb").exists():
-    Path("/tmp/environment").mkdir()
-    subprocess.run(["mount", "-t", "ext4", "-o", "ro", "/dev/vdb", "/tmp/environment"], check=True)
 os.environ.update(HOME="/tmp", TMPDIR="/tmp", PYTHONDONTWRITEBYTECODE="1")
 os.chdir("/tmp")
+initialized = False
+executor_command = []
 executor_process = None
 executor_connection = None
-start_executor()
-service = start_service()
+service = None
 server = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
 server.bind((socket.VMADDR_CID_ANY, 5000))
 server.listen(1)

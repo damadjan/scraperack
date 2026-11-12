@@ -10,12 +10,30 @@ from zoneinfo import ZoneInfo, available_timezones
 
 import httpx
 from ago import human
+from fastapi import Request
+from fastapi.responses import Response
 from nicegui import app, ui
 
 CONTROLLER = os.getenv("SCRAPERACK_URL", "http://127.0.0.1:7070").rstrip("/")
 PUBLIC_CONTROLLER = os.getenv("SCRAPERACK_PUBLIC_URL", "")
 client = httpx.AsyncClient(base_url=CONTROLLER, timeout=10)
 app.on_shutdown(client.aclose)
+HOP_HEADERS = {"connection", "keep-alive", "transfer-encoding", "content-length", "host",
+               "content-encoding"}
+
+
+@app.api_route("/plugins/{name}/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+               include_in_schema=False)
+async def plugin_proxy(name: str, path: str, request: Request):
+    """Serve plugin pages and APIs through the controller from the GUI's own origin."""
+    headers = {key: value for key, value in request.headers.items() if key.lower() not in HOP_HEADERS}
+    response = await client.request(
+        request.method, f"/plugins/{quote(name, safe='')}/{path}",
+        params=request.query_params, content=await request.body(), headers=headers, timeout=None,
+    )
+    return Response(response.content, status_code=response.status_code,
+                    headers={key: value for key, value in response.headers.items()
+                             if key.lower() not in HOP_HEADERS})
 ui.add_css(Path(__file__).with_name("style.css").read_text(), shared=True)
 ui.add_head_html('''<script>
 function statusRenderer(params) {
@@ -94,7 +112,8 @@ def parse_ports(value):
     return result
 
 
-def shell(active):
+def shell(active, plugins=()):
+    """Page layout; ``plugins`` lists installed plugins for their sidebar entries."""
     ui.colors(primary="#14b8a6")
     ui.dark_mode().enable()
     drawer = ui.left_drawer(value=True).props("width=220 breakpoint=800").classes("compact-drawer")
@@ -105,17 +124,19 @@ def shell(active):
                 ui.label("SCRAPERACK").classes("text-lg font-semibold text-white tracking-wide")
                 ui.label("MicroVM cluster").classes("text-xs muted")
         ui.separator().classes("mb-1")
+        plugin_links = [(f'plugin-{plugin["name"]}', f'/plugin/{quote(plugin["name"], safe="")}',
+                         "widgets", plugin["name"].replace("-", " ").title())
+                        for plugin in plugins if plugin.get("gui") and plugin.get("enabled")]
         groups = [
             (None, [("dashboard", "/", "home", "Home")]),
             ("Execution", [
                 ("executions", "/executions", "terminal", "Executions"),
-                ("environments", "/environments", "science", "Environments"),
-                ("runtime-images", "/runtime-images", "extension", "Runtime Images"),
             ]),
+            ("Plugins", [*plugin_links, ("plugins", "/plugins", "extension", "Manage plugins")]),
             ("Virtualization", [
                 ("vms", "/vms", "memory", "MicroVMs"),
                 ("pools", "/pools", "hub", "VM Pools"),
-                ("vm-images", "/vm-images", "layers", "VM Images"),
+                ("images", "/images", "layers", "Images"),
             ]),
             ("Infrastructure", [
                 ("nodes", "/nodes", "dns", "Nodes"),
@@ -132,6 +153,26 @@ def shell(active):
     with content:
         ui.button(icon="menu", on_click=drawer.toggle).props("flat round").classes("mobile-menu")
     return content
+
+
+async def layout(active):
+    try:
+        plugins = await request("GET", "/v1/plugins")
+    except Exception:
+        plugins = []
+    return shell(active, plugins)
+
+
+async def pool_names():
+    """Map pool names to the names their owners show for them."""
+    return {pool["name"]: pool.get("display_name") or pool["name"]
+            for pool in await request("GET", "/v1/pools")}
+
+
+def owner_label(managed_by):
+    if not managed_by:
+        return "VM pool"
+    return managed_by.removeprefix("plugin:").replace("-", " ").title() + " plugin"
 
 
 def summary(icon, label, value, detail):
@@ -180,9 +221,9 @@ async def execution_details(event):
     if not run:
         return
     try:
-        run, environments, payload, logs = await asyncio.gather(
+        run, names, payload, logs = await asyncio.gather(
             request("GET", f'/v1/executions/{run["id"]}'),
-            request("GET", "/v1/environments"),
+            pool_names(),
             request("GET", f'/v1/executions/{run["id"]}/payload'),
             request("GET", f'/v1/executions/{run["id"]}/logs'),
         )
@@ -192,7 +233,6 @@ async def execution_details(event):
     except Exception as error:
         notify_error(error)
         return
-    environment_names = {environment["id"]: environment["name"] for environment in environments}
     end = run["finished_at_ms"] or int(time.time() * 1000)
     duration = f'{(end - run["started_at_ms"]) / 1000:.2f}s' if run["started_at_ms"] else "—"
     with ui.dialog() as dialog, ui.card().classes("execution-dialog"):
@@ -204,7 +244,7 @@ async def execution_details(event):
             ui.button(icon="close", on_click=dialog.close).props("flat round")
         with ui.element("div").classes("detail-grid"):
             for label, value, mono in (
-                ("Environment", environment_names.get(run.get("environment"), "—"), False),
+                ("Pool", names.get(run["pool"], run["pool"]), False),
                 ("Node", run["node"] or "Unassigned", True),
                 ("Duration", duration, False), ("Created", stamp(run["created_at_ms"]), False),
             ):
@@ -261,11 +301,11 @@ async def execution_details(event):
 
 @ui.page("/")
 async def dashboard():
-    with shell("dashboard"):
+    with await layout("dashboard"):
         with ui.element("div").classes("summary-grid"):
             node_value, node_detail = summary("dns", "Nodes", "—", "Loading")
             image_value, image_detail = summary("layers", "Images", "—", "Loading")
-            pool_value, pool_detail = summary("science", "Environments", "—", "Loading")
+            pool_value, pool_detail = summary("hub", "Pools", "—", "Loading")
             run_value, run_detail = summary("terminal", "Executions", "—", "Loading")
         with ui.card().classes("panel"):
             with ui.row().classes("items-center w-full"):
@@ -276,19 +316,19 @@ async def dashboard():
             memory_text = ui.label().classes("text-sm")
     async def refresh():
         try:
-            nodes, images, environments, executions = await asyncio.gather(
+            nodes, images, pools, executions = await asyncio.gather(
                 request("GET", "/v1/nodes"), request("GET", "/v1/images"),
-                request("GET", "/v1/environments"), request("GET", "/v1/executions"),
+                request("GET", "/v1/pools"), request("GET", "/v1/executions"),
             )
             ready_nodes = sum(node["status"] == "ready" for node in nodes)
             ready_images = sum(image["ready"] for image in images)
             active = sum(run["status"] in ("queued", "assigned", "running") for run in executions)
             for label, value in ((node_value, len(nodes)), (image_value, len(images)),
-                                 (pool_value, len(environments)), (run_value, len(executions))):
+                                 (pool_value, len(pools)), (run_value, len(executions))):
                 label.text = str(value)
             node_detail.text = f"{ready_nodes} ready"
             image_detail.text = f"{ready_images} distributed"
-            pool_detail.text = "Execution environments"
+            pool_detail.text = f'{sum(bool(pool.get("managed_by")) for pool in pools)} managed by plugins'
             run_detail.text = f"{active} active"
             total_cpu = sum(node["cpu_millis"] for node in nodes)
             used_cpu = sum(node["used_cpu_millis"] for node in nodes)
@@ -308,7 +348,7 @@ async def dashboard():
 
 @ui.page("/nodes")
 async def nodes_page():
-    with shell("nodes"):
+    with await layout("nodes"):
         with ui.row().classes("items-center w-full"):
             ui.label("Cluster nodes").classes("section-title")
             ui.space()
@@ -321,7 +361,7 @@ async def nodes_page():
             {"headerName": "CPU allocation", "field": "cpu", "minWidth": 210},
             {"headerName": "RAM allocation", "field": "memory", "minWidth": 230},
             {"headerName": "Images", "field": "image_count", "maxWidth": 100},
-            {"headerName": "Env caches", "field": "environment_count", "maxWidth": 120},
+            {"headerName": "Disks", "field": "disk_count", "maxWidth": 100},
             {"headerName": "Idle VMs", "field": "idle_count", "maxWidth": 110},
             {"headerName": "Concurrent VM starts", "field": "vm_start_concurrency", "minWidth": 190},
             {"headerName": "Last heartbeat", "field": "last_seen", "minWidth": 190},
@@ -342,7 +382,7 @@ async def nodes_page():
                  "memory": f'{node["used_memory_mib"]} / {node["memory_mib"]} MiB · '
                            f'{(node["used_memory_mib"] / node["memory_mib"] * 100 if node["memory_mib"] else 0):.0f}%',
                  "image_count": len(node["images"]),
-                 "environment_count": len(node.get("environments", [])),
+                 "disk_count": len(node.get("disks", [])),
                  "idle_count": sum(node.get("idle_instances", {}).values()),
                  "vm_start_concurrency": node.get("vm_start_concurrency")
                                          or max(1, node["cpu_millis"] // 2000),
@@ -417,12 +457,14 @@ async def nodes_page():
     ui.timer(1, refresh)
 
 
-async def image_catalog(kind, active, title):
-    import_status_key = f"{kind}_image_import_status"
-    with shell(active):
+@ui.page("/images")
+async def images_page():
+    import_status_key = "image_import_status"
+    with await layout("images"):
         with ui.card().classes("panel"):
             ui.label("Import Docker image").classes("section-title")
-            ui.label(f"Pull a linux/amd64 image and convert it to a {title.lower()[:-1]}.") \
+            ui.label("Pull a linux/amd64 image and convert it to a microVM root filesystem. "
+                     "The image needs /usr/bin/python3 for the guest agent.") \
                 .classes("text-sm muted")
             with ui.row().classes("items-end w-full"):
                 docker_reference = ui.input("Docker image", placeholder="ghcr.io/acme/browser:latest") \
@@ -435,13 +477,12 @@ async def image_catalog(kind, active, title):
             import_status = ui.label(app.storage.general.get(import_status_key, "")) \
                 .classes("text-sm muted")
         with ui.row().classes("items-center w-full"):
-            ui.label(title).classes("section-title")
+            ui.label("Images").classes("section-title")
             ui.space()
             delete_button = ui.button("Delete", icon="delete", color="negative").props("outline no-caps")
         images = table([
             {"headerName": "Name", "field": "name"},
             {"headerName": "Compatible", "field": "compatible", "maxWidth": 130},
-            {"headerName": "Executor", "field": "display_executor", "minWidth": 170},
             {"headerName": "Distributed", "field": "ready", "maxWidth": 140},
             {"headerName": "Size", "field": "display_size", "maxWidth": 120},
             {"headerName": "SHA-256", "field": "short_hash", "cellClass": "mono"},
@@ -450,10 +491,8 @@ async def image_catalog(kind, active, title):
 
     async def refresh():
         data = await request("GET", "/v1/images")
-        data = [image for image in data if image.get("kind") == kind]
-        set_rows(images, [{**image, "display_executor": image.get("executor") or "—",
-                           "display_size": size(image["size"]), "short_hash": image["sha256"][:16]}
-                          for image in data])
+        set_rows(images, [{**image, "display_size": size(image["size"]),
+                           "short_hash": image["sha256"][:16]} for image in data])
 
     async def do_import():
         reference = docker_reference.value.strip()
@@ -469,7 +508,7 @@ async def image_catalog(kind, active, title):
         import_status.set_text(app.storage.general[import_status_key])
         try:
             await request("POST", "/v1/images/import",
-                          json={"name": image_name, "reference": reference, "kind": kind,
+                          json={"name": image_name, "reference": reference,
                                 "username": username or None, "password": password or None}, timeout=None)
             app.storage.general[import_status_key] = f"Imported {image_name} successfully"
             if not import_status.is_deleted:
@@ -506,23 +545,18 @@ async def image_catalog(kind, active, title):
 
 
 @ui.page("/vm-images")
-async def vm_images_page():
-    await image_catalog("micro_vm", "vm-images", "VM Images")
+async def vm_images_redirect():
+    ui.navigate.to("/images")
 
 
 @ui.page("/runtime-images")
-async def runtime_images_page():
-    await image_catalog("runtime", "runtime-images", "Runtime Images")
-
-
-@ui.page("/images")
-async def images_redirect():
-    ui.navigate.to("/vm-images")
+async def runtime_images_redirect():
+    ui.navigate.to("/images")
 
 
 @ui.page("/pools")
 async def pools_page():
-    with shell("pools"):
+    with await layout("pools"):
         images_data = []
         try:
             images_data = await request("GET", "/v1/images")
@@ -533,8 +567,7 @@ async def pools_page():
             with ui.row().classes("w-full items-end gap-2"):
                 name = ui.input("Name").classes("w-48")
                 image = ui.select({item["id"]: item["name"] for item in images_data
-                                   if item["ready"] and item.get("kind") == "micro_vm"},
-                                  label="Image").classes("w-64")
+                                   if item["ready"]}, label="Image").classes("w-64")
                 cpu = ui.number("CPU cores", value=1, min=0.01, step=0.05).classes("w-32")
                 memory = ui.number("Memory MiB", value=256, min=64, step=64).classes("w-32")
                 disk = ui.number("Disk MiB", value=1024, min=64, step=64).classes("w-32")
@@ -610,263 +643,211 @@ async def pools_page():
         notify_error(error)
 
 
-@ui.page("/environments")
-async def environments_page():
-    with shell("environments"):
-        images_data = await request("GET", "/v1/images")
-        runtime_images = [image for image in images_data
-                          if image.get("kind") == "runtime" and image["ready"]]
-        with ui.card().classes("panel"):
-            ui.label("Create execution environment").classes("section-title")
-            ui.label("Packages are built once, distributed as an immutable artifact, and cached on every node.") \
-                .classes("text-sm muted")
-            with ui.row().classes("w-full items-end gap-2"):
-                name = ui.input("Name").classes("w-48")
-                image = ui.select({item["id"]: f'{item["name"]} · {item.get("executor")}'
-                                   for item in runtime_images}, label="Runtime image").classes("w-72")
-                cpu = ui.number("CPU cores", value=1, min=0.01, step=0.05).classes("w-32")
-                memory = ui.number("Memory MiB", value=512, step=64).classes("w-32")
-                disk = ui.number("Disk MiB", value=1024, min=64, step=64).classes("w-32")
-                warm = ui.number("Warm instances", value=0, min=0).classes("w-36")
-                maximum = ui.number("Max instances", value=8, min=1).classes("w-32")
-                timeout = ui.number("Timeout sec", value=300, min=1).classes("w-32")
-                idle_timeout = ui.number("Idle timeout sec", value=30, min=0).classes("w-36")
-                reuse = ui.switch("Reuse VMs", value=True)
-                networking = ui.switch("Networking", value=True)
-            packages = ui.textarea("Python packages", placeholder="httpx==0.28.1\nbeautifulsoup4==4.14.2") \
-                .props("autogrow").classes("w-full")
-            preload = ui.textarea("Preload modules", placeholder="httpx\nbs4") \
-                .props("autogrow").classes("w-full")
-            create_button = ui.button("Create environment", icon="add").props("unelevated no-caps color=teal")
+async def read_upload(event):
+    """Return (name, bytes) from a NiceGUI upload event across NiceGUI versions."""
+    file = getattr(event, "file", None)
+    if file is not None:
+        return file.name, await file.read()
+    return event.name, event.content.read()
+
+
+def install_dialog(on_installed):
+    state = {"upload": None}
+    with ui.dialog().props("persistent") as dialog, ui.card().classes("execution-dialog"):
         with ui.row().classes("items-center w-full"):
-            ui.label("Execution Environments").classes("section-title")
+            ui.label("Install plugin").classes("section-title")
             ui.space()
-            ui.label("Click an environment to edit").classes("text-xs muted")
-        environments = table([
-            {"headerName": "Name", "field": "name", "minWidth": 150},
-            {"headerName": "Runtime", "field": "image_name", "minWidth": 150},
-            {"headerName": "Packages", "field": "package_count", "maxWidth": 110},
-            {"headerName": "Preloaded", "field": "preload_count", "maxWidth": 110},
-            {"headerName": "Cached artifact", "field": "cached", "maxWidth": 150},
-            {"headerName": "Distributed", "field": "ready", "maxWidth": 130},
-            {"headerName": "CPU", "field": "cpu", "maxWidth": 90},
-            {"headerName": "Memory MiB", "field": "memory_mib", "maxWidth": 125},
-            {"headerName": "Warm", "field": "warm", "headerTooltip": "Configured / ready", "maxWidth": 90},
-            {"headerName": "Max", "field": "max_instances", "maxWidth": 80},
-            {"headerName": "Network", "field": "network", "maxWidth": 100},
-            {"headerName": "ID", "field": "id", "cellClass": "mono", "minWidth": 260},
-        ], selection=True, row_key="id")
+            close_button = ui.button(icon="close", on_click=dialog.close).props("flat round")
+        step = ui.label("1. Choose the plugin's .tar.gz archive").classes("text-sm muted")
+        review = ui.column().classes("w-full gap-1")
+        log = ui.code("").classes("json-code w-full")
+        log.set_visibility(False)
+        with ui.row().classes("w-full items-center"):
+            status = ui.label().classes("text-sm muted")
+            ui.space()
+            install_button = ui.button("Install", icon="download_done").props("unelevated no-caps color=teal")
+            install_button.set_visibility(False)
 
-    known = {}
-    initialized = False
-
-    async def refresh():
-        nonlocal known, initialized
-        data, vms = await asyncio.gather(
-            request("GET", "/v1/environments"), request("GET", "/v1/vms")
-        )
-        image_names = {item["id"]: item["name"] for item in images_data}
-        ready = {}
-        for vm in vms:
-            if vm["status"] == "idle":
-                ready[vm["pool"]] = ready.get(vm["pool"], 0) + 1
-        rows = [{
-            **environment,
-            "image_name": image_names.get(environment["image"], environment["image"][:8]),
-            "package_count": len(environment["packages"]),
-            "preload_count": len(environment.get("preload", [])),
-            "cached": size(environment["size"]) if environment["artifact"] else "Base runtime",
-            "cpu": environment["cpu_millis"] / 1000,
-            "warm": f'{environment["warm_instances"]}/{ready.get(environment["pool"], 0)}',
-        } for environment in data]
-        current = {row["id"]: row for row in rows}
-        if not initialized:
-            set_rows(environments, rows)
-            known = current
-            initialized = True
-            return
-        transaction = {
-            "add": [row for key, row in current.items() if key not in known],
-            "update": [row for key, row in current.items() if key in known and row != known[key]],
-            "remove": [row for key, row in known.items() if key not in current],
-        }
-        with environments.props.suspend_updates():
-            environments.options["rowData"] = rows
-        if any(transaction.values()):
-            environments.run_grid_method("applyTransaction", transaction)
-        known = current
-
-    async def create():
-        if not name.value or not image.value:
-            return ui.notify("Name and runtime image are required", type="warning")
-        requested = [item.strip() for item in packages.value.replace(",", "\n").splitlines() if item.strip()]
-        preloaded = [item.strip() for item in preload.value.replace(",", "\n").splitlines() if item.strip()]
-        create_button.disable()
-        try:
-            await request("POST", "/v1/environments", json={
-                "name": name.value, "image": image.value, "packages": requested, "preload": preloaded,
-                "warm_instances": int(warm.value), "max_instances": int(maximum.value),
-                "cpu_millis": round(float(cpu.value) * 1000), "memory_mib": int(memory.value),
-                "disk_mib": int(disk.value), "timeout_secs": int(timeout.value),
-                "idle_timeout_secs": int(idle_timeout.value), "reuse": reuse.value,
-                "network": networking.value,
-            }, timeout=None)
-            ui.notify(f"Created environment {name.value}", type="positive")
-            name.value = ""
-            packages.value = ""
-            preload.value = ""
-            await refresh()
-        except Exception as error:
-            notify_error(error)
-        finally:
-            create_button.enable()
-
-    async def edit_environment(event):
-        current = event.args.get("data")
-        if not current:
-            return
-        try:
-            runs = await request("GET", "/v1/executions?limit=1000")
-        except Exception as error:
-            notify_error(error)
-            runs = []
-        measured = [run for run in runs if run.get("environment") == current["id"]
-                    and (run.get("metrics") or {}).get("samples")]
-        with ui.dialog() as dialog, ui.card().classes("execution-dialog"):
-            with ui.row().classes("items-center w-full"):
-                ui.label("Edit execution environment").classes("section-title")
-                ui.space()
-                ui.button(icon="close", on_click=dialog.close).props("flat round")
-            ui.label(f"Actual utilization · {len(measured)} recent measured executions") \
-                .classes("text-sm muted")
-            if measured:
+        async def uploaded(event):
+            name, data = await read_upload(event)
+            status.set_text(f"Checking {name}…")
+            review.clear()
+            try:
+                staged = await request("POST", "/v1/plugins/uploads", content=data,
+                                       headers={"Content-Type": "application/gzip"}, timeout=None)
+            except Exception as error:
+                status.set_text(f"This archive cannot be installed: {error}")
+                return
+            state["upload"] = staged["upload"]
+            manifest = staged["manifest"]
+            installed = staged.get("installed_version")
+            step.set_text("2. Review the plugin, then install it")
+            with review:
                 with ui.element("div").classes("detail-grid"):
                     for label, value in (
-                        ("Average CPU usage",
-                         f'{sum(run["metrics"]["average_cpu_percent"] for run in measured) / len(measured):.1f}%'),
-                        ("Average RAM usage",
-                         f'{sum(run["metrics"]["average_memory_percent"] for run in measured) / len(measured):.1f}%'),
+                        ("Plugin", manifest["name"]),
+                        ("Version", f'{installed} → {manifest["version"]}' if installed
+                         else manifest["version"]),
+                        ("Adds GUI page", "Yes" if manifest.get("gui") else "No"),
+                        ("Files for microVMs", manifest.get("guest") or "None"),
                     ):
                         with ui.element("div").classes("detail-card"):
                             ui.label(label).classes("detail-label")
                             ui.label(value).classes("detail-value")
-            else:
-                ui.label("Metrics will appear after new executions complete.").classes("text-sm muted")
-            with ui.row().classes("w-full items-end gap-2"):
-                edit_name = ui.input("Name", value=current["name"]).classes("w-48")
-                edit_image = ui.select(
-                    {item["id"]: f'{item["name"]} · {item.get("executor")}'
-                     for item in runtime_images},
-                    label="Runtime image", value=current["image"],
-                ).classes("w-72")
-                edit_cpu = ui.number("CPU cores", value=current["cpu_millis"] / 1000,
-                                     min=0.01, step=0.05).classes("w-32")
-                edit_memory = ui.number("Memory MiB", value=current["memory_mib"],
-                                        step=64).classes("w-32")
-                edit_disk = ui.number("Disk MiB", value=current["disk_mib"],
-                                      min=64, step=64).classes("w-32")
-            with ui.row().classes("w-full items-end gap-2"):
-                edit_warm = ui.number("Warm instances", value=current["warm_instances"],
-                                      min=0).classes("w-36")
-                edit_maximum = ui.number("Max instances", value=current["max_instances"],
-                                         min=1).classes("w-32")
-                edit_timeout = ui.number("Timeout sec", value=current["timeout_secs"],
-                                         min=1).classes("w-32")
-                edit_idle_timeout = ui.number("Idle timeout sec", value=current["idle_timeout_secs"],
-                                              min=0).classes("w-36")
-                edit_reuse = ui.switch("Reuse VMs", value=current["reuse"])
-                edit_networking = ui.switch("Networking", value=current["network"])
-            edit_packages = ui.textarea(
-                "Python packages", value="\n".join(current["packages"]),
-                placeholder="httpx==0.28.1\nbeautifulsoup4==4.14.2",
-            ).props("autogrow").classes("w-full")
-            edit_preload = ui.textarea(
-                "Preload modules", value="\n".join(current.get("preload", [])),
-                placeholder="httpx\nbs4",
-            ).props("autogrow").classes("w-full")
+                if manifest.get("description"):
+                    ui.label(manifest["description"]).classes("text-sm")
+                ui.label(f'Runs: {" ".join(manifest["run"])}').classes("text-xs mono muted")
+                if manifest.get("install"):
+                    ui.label(f'Install step: {" ".join(manifest["install"])}').classes("text-xs mono muted")
+                ui.label("Plugins run with the controller's permissions. Only install plugins you trust.") \
+                    .classes("text-xs muted")
+            if not staged.get("install_enabled", True):
+                status.set_text("Plugin installation is disabled on this controller.")
+                return
+            status.set_text("Ready to install" if not installed else
+                            ("Reinstall the same version" if installed == manifest["version"]
+                             else f"Update from {installed}"))
+            install_button.set_visibility(True)
+
+        async def install():
+            install_button.disable()
+            close_button.disable()
+            upload.disable()
+            status.set_text("Installing… this can take a few minutes if dependencies are downloaded")
+            try:
+                result = await request("POST", f'/v1/plugins/uploads/{state["upload"]}/install',
+                                       timeout=None)
+                status.set_text(f'Installed {result["plugin"]["name"]} {result["plugin"]["version"]}')
+                log.set_content(result.get("log") or "")
+                install_button.set_visibility(False)
+                await on_installed()
+            except Exception as error:
+                status.set_text("Install failed")
+                log.set_content(str(error))
+            finally:
+                log.set_visibility(True)
+                close_button.enable()
+                upload.enable()
+                install_button.enable()
+
+        upload = ui.upload(on_upload=uploaded, auto_upload=True, max_files=1,
+                           label="Drop a plugin .tar.gz here or click to browse") \
+            .props('accept=".tar.gz,.tgz,application/gzip" flat bordered').classes("w-full")
+        upload.move(target_index=2)
+        install_button.on_click(install)
+    return dialog
+
+
+@ui.page("/plugins")
+async def plugins_page():
+    with await layout("plugins"):
+        with ui.row().classes("items-center w-full"):
+            ui.label("Plugins").classes("section-title")
+            ui.space()
+            install_button = ui.button("Install plugin", icon="add").props("unelevated no-caps color=teal")
+        ui.label("Plugins add workload types to this cluster. Click a plugin to manage it.") \
+            .classes("text-sm muted")
+        plugins = table([
+            {"headerName": "Plugin", "field": "name", "minWidth": 140},
+            {"headerName": "Version", "field": "version", "maxWidth": 120},
+            {"headerName": "Status", "field": "status", "maxWidth": 130, ":cellRenderer": "statusRenderer"},
+            {"headerName": "Enabled", "field": "enabled_text", "maxWidth": 110},
+            {"headerName": "Previous", "field": "previous", "maxWidth": 120},
+            {"headerName": "Installed", "field": "installed"},
+            {"headerName": "Description", "field": "description", "minWidth": 260},
+        ], selection=True, row_key="name")
+
+    async def refresh():
+        data = await request("GET", "/v1/plugins")
+        set_rows(plugins, [{**plugin, "previous": plugin.get("previous_version") or "—",
+                            "enabled_text": "Yes" if plugin["enabled"] else "No",
+                            "installed": stamp(plugin["installed_at_ms"])} for plugin in data])
+
+    async def installed():
+        await refresh()
+        ui.navigate.reload()
+
+    async def manage(event):
+        plugin = event.args.get("data")
+        if not plugin:
+            return
+        name = plugin["name"]
+        with ui.dialog() as dialog, ui.card().classes("execution-dialog"):
+            with ui.row().classes("items-center w-full"):
+                ui.label(f'{name} {plugin["version"]}').classes("section-title")
+                ui.label(plugin["status"]).classes(f'status-pill status-{plugin["status"]}')
+                ui.space()
+                ui.button(icon="close", on_click=dialog.close).props("flat round")
+            if plugin.get("message"):
+                ui.label(plugin["message"]).classes("mono text-sm")
+            ui.label("Recent log").classes("section-title")
+            log = ui.code("Loading…").classes("json-code w-full")
+            keep_data = ui.checkbox("Keep the plugin's data when removing it", value=True)
             status = ui.label().classes("text-sm muted")
             with ui.row().classes("w-full items-center"):
-                delete_button = ui.button("Delete", icon="delete", color="negative") \
-                    .props("outline no-caps")
+                remove_button = ui.button("Remove", icon="delete", color="negative").props("outline no-caps")
                 ui.space()
-                restart_button = ui.button("Restart", icon="restart_alt") \
-                    .props("outline no-caps color=orange")
-                ui.button("Cancel", on_click=dialog.close).props("flat no-caps")
-                save_button = ui.button("Save changes", icon="save").props("unelevated no-caps color=teal")
+                if plugin.get("previous_version"):
+                    rollback_button = ui.button(f'Roll back to {plugin["previous_version"]}',
+                                                icon="history").props("outline no-caps color=orange")
+                else:
+                    rollback_button = None
+                toggle_button = ui.button("Disable" if plugin["enabled"] else "Enable",
+                                          icon="pause" if plugin["enabled"] else "play_arrow") \
+                    .props("unelevated no-caps color=teal")
 
-        async def save_environment():
-            if not edit_name.value or not edit_image.value:
-                return ui.notify("Name and runtime image are required", type="warning")
-            requested = [item.strip() for item in edit_packages.value.replace(",", "\n").splitlines()
-                         if item.strip()]
-            preloaded = [item.strip() for item in edit_preload.value.replace(",", "\n").splitlines()
-                         if item.strip()]
-            save_button.disable()
-            status.set_text("Applying changes…")
+        async def act(method, path, done):
+            status.set_text("Working…")
             try:
-                await request("PUT", f'/v1/environments/{current["id"]}', json={
-                    "name": edit_name.value, "image": edit_image.value, "packages": requested,
-                    "preload": preloaded,
-                    "warm_instances": int(edit_warm.value),
-                    "max_instances": int(edit_maximum.value) if edit_maximum.value is not None else None,
-                    "cpu_millis": round(float(edit_cpu.value) * 1000),
-                    "memory_mib": int(edit_memory.value), "disk_mib": int(edit_disk.value),
-                    "timeout_secs": int(edit_timeout.value),
-                    "idle_timeout_secs": int(edit_idle_timeout.value), "reuse": edit_reuse.value,
-                    "network": edit_networking.value,
-                }, timeout=None)
+                await request(method, path, timeout=None)
                 dialog.close()
-                ui.notify(f"Updated environment {edit_name.value}", type="positive")
-                await refresh()
+                ui.notify(done, type="positive")
+                await installed()
             except Exception as error:
-                status.set_text(f"Update failed: {error}")
-                save_button.enable()
+                status.set_text(str(error))
 
-        async def restart_environment():
-            restart_button.disable()
-            status.set_text("Restarting VM pool…")
-            try:
-                await request("POST", f'/v1/environments/{current["id"]}/restart')
-                dialog.close()
-                ui.notify(f'Restarted environment {current["name"]}', type="positive")
-                await refresh()
-            except Exception as error:
-                status.set_text(f"Restart failed: {error}")
-                restart_button.enable()
-
-        async def delete_environment():
-            delete_button.disable()
-            status.set_text("Deleting environment…")
-            try:
-                await request("DELETE", f'/v1/environments/{current["id"]}')
-                dialog.close()
-                ui.notify(f'Deleted environment {current["name"]}', type="positive")
-                await refresh()
-            except Exception as error:
-                status.set_text(f"Delete failed: {error}")
-                delete_button.enable()
-
-        save_button.on_click(save_environment)
-        restart_button.on_click(restart_environment)
-        delete_button.on_click(delete_environment)
+        toggle_button.on_click(lambda: act(
+            "POST", f'/v1/plugins/{quote(name, safe="")}/{"disable" if plugin["enabled"] else "enable"}',
+            f'{"Disabled" if plugin["enabled"] else "Enabled"} {name}'))
+        if rollback_button:
+            rollback_button.on_click(lambda: act(
+                "POST", f'/v1/plugins/{quote(name, safe="")}/rollback', f"Rolled back {name}"))
+        remove_button.on_click(lambda: act(
+            "DELETE", f'/v1/plugins/{quote(name, safe="")}?keep_data={str(keep_data.value).lower()}',
+            f"Removed {name}"))
         dialog.open()
+        try:
+            response = await client.get(f'/v1/plugins/{quote(name, safe="")}/log')
+            log.set_content(response.text or "(empty)")
+        except Exception as error:
+            log.set_content(f"Unavailable: {error}")
 
-    create_button.on_click(create)
-    environments.classes("clickable-grid").on("cellClicked", edit_environment, ["data"])
-    await refresh()
-    ui.timer(1, refresh)
+    install_button.on_click(lambda: install_dialog(installed).open())
+    plugins.classes("clickable-grid").on("cellClicked", manage, ["data"])
+    try:
+        await refresh()
+    except Exception as error:
+        notify_error(error)
+    ui.timer(2, refresh)
+
+
+@ui.page("/plugin/{name}")
+async def plugin_page(name: str):
+    with await layout(f"plugin-{name}"):
+        ui.element("iframe").props(f'src="/plugins/{quote(name, safe="")}/gui/"') \
+            .classes("plugin-frame")
 
 
 @ui.page("/executions")
 async def executions_page():
-    with shell("executions"):
+    with await layout("executions"):
         with ui.row().classes("items-center w-full"):
             ui.label("Execution history").classes("section-title")
             ui.space()
             ui.label("Click an execution for full details").classes("text-xs muted")
         executions = table([
             {"headerName": "ID", "field": "short", "maxWidth": 130, "cellClass": "mono"},
-            {"headerName": "Environment", "field": "environment_name"},
+            {"headerName": "Pool", "field": "pool_name"},
             {"headerName": "Status", "field": "status", "maxWidth": 140, ":cellRenderer": "statusRenderer"},
             {"headerName": "Node", "field": "short_node", "cellClass": "mono"},
             {"headerName": "Created", "field": "created", "tooltipField": "created_exact"},
@@ -879,18 +860,16 @@ async def executions_page():
 
     async def refresh():
         nonlocal known, initialized
-        data, environments_data = await asyncio.gather(
-            request("GET", "/v1/executions?limit=1000"), request("GET", "/v1/environments")
+        data, names = await asyncio.gather(
+            request("GET", "/v1/executions?limit=1000"), pool_names()
         )
-        environment_names = {environment["id"]: environment["name"]
-                             for environment in environments_data}
         data.sort(key=lambda item: item["created_at_ms"], reverse=True)
         rows = []
         for run in data:
             end = run["finished_at_ms"] or int(time.time() * 1000)
             duration = f'{(end - run["started_at_ms"]) / 1000:.2f}s' if run["started_at_ms"] else "—"
             rows.append({**run, "short": run["id"][:8], "short_node": (run["node"] or "—")[:8],
-                         "environment_name": environment_names.get(run.get("environment"), "—"),
+                         "pool_name": names.get(run["pool"], run["pool"]),
                          "created": ago(run["created_at_ms"]), "created_exact": stamp(run["created_at_ms"]),
                          "duration": duration})
         current = {row["id"]: row for row in rows}
@@ -920,7 +899,7 @@ async def executions_page():
 
 @ui.page("/vms")
 async def vms_page():
-    with shell("vms"):
+    with await layout("vms"):
         with ui.row().classes("items-center w-full"):
             ui.label("MicroVMs").classes("section-title")
             ui.space()
@@ -928,9 +907,8 @@ async def vms_page():
         vms = table([
             {"headerName": "ID", "field": "short", "maxWidth": 130, "cellClass": "mono"},
             {"headerName": "Status", "field": "status", "maxWidth": 120, ":cellRenderer": "statusRenderer"},
-            {"headerName": "Resource", "field": "resource", "minWidth": 150},
-            {"headerName": "Environment", "field": "environment_name", "minWidth": 150},
-            {"headerName": "Pool", "field": "pool"},
+            {"headerName": "Owner", "field": "resource", "minWidth": 150},
+            {"headerName": "Pool", "field": "pool_name", "minWidth": 150},
             {"headerName": "Node", "field": "node_name"},
             {"headerName": "Guest IP", "field": "guest_ip", "cellClass": "mono", "minWidth": 130},
             {"headerName": "Published ports", "field": "published_ports", ":cellRenderer": "portsRenderer",
@@ -947,18 +925,16 @@ async def vms_page():
     async def refresh():
         nonlocal known, initialized
         try:
-            data, environments_data = await asyncio.gather(
-                request("GET", "/v1/vms"), request("GET", "/v1/environments")
+            data, pools = await asyncio.gather(
+                request("GET", "/v1/vms"), request("GET", "/v1/pools")
             )
-            environment_names = {environment["id"]: environment["name"]
-                                 for environment in environments_data}
+            pools = {pool["name"]: pool for pool in pools}
             rows = [{
                 "id": vm["id"],
                 "short": vm["id"][:8],
                 "status": vm["status"],
-                "resource": "Execution environment" if vm.get("environment") else "VM pool",
-                "environment_name": environment_names.get(vm.get("environment"), "—"),
-                "pool": vm["pool"],
+                "resource": owner_label(pools.get(vm["pool"], {}).get("managed_by")),
+                "pool_name": pools.get(vm["pool"], {}).get("display_name") or vm["pool"],
                 "node_name": vm["node_name"],
                 "guest_ip": vm.get("guest_ip") or "—",
                 "published_ports": vm.get("ports", []),
@@ -993,7 +969,7 @@ async def vms_page():
 
 @ui.page("/settings")
 async def settings_page():
-    with shell("settings"):
+    with await layout("settings"):
         storage = await request("GET", "/v1/settings/storage")
         with ui.card().classes("panel"):
             ui.label("Execution storage").classes("section-title")
