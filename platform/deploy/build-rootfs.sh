@@ -29,12 +29,7 @@ tar -C "$work" -xf "$work/python.tar.xz"
     make DESTDIR="$work/rootfs" altinstall
 )
 ln -s /usr/local/bin/python3.10 "$work/rootfs/usr/bin/python3"
-chroot "$work/rootfs" /usr/local/bin/python3.10 -m pip install --no-cache-dir cloudpickle==3.1.2
 install -m 0755 "$script/../guest/scraperack-init" "$work/rootfs/sbin/scraperack-init"
-install -Dm 0755 "$script/../guest/scraperack-python-executor" \
-    "$work/rootfs/opt/scraperack/executors/python"
-install -Dm 0644 "$script/../guest/scraperack_runtime.py" \
-    "$work/rootfs/opt/scraperack/runtime/scraperack_runtime.py"
 rm -rf "$work/rootfs/usr/local/lib/python3.10/test" "$work/rootfs/usr/local/lib/python3.10/__pycache__"
 rm -rf "$work/rootfs/var/lib/apt/lists/"* "$work/rootfs/var/cache/apt/archives/"*.deb
 mkdir -p "$(dirname "$output")"

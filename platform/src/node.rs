@@ -28,7 +28,7 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::cluster::{
-    Environment, ExecutionMetricPoint, ExecutionMetrics, Image, MicroVm, Pool, PortProtocol,
+    Disk, ExecutionMetricPoint, ExecutionMetrics, Image, MicroVm, Pool, PortProtocol,
     PublishedPort, VmStatus, Work,
 };
 
@@ -42,12 +42,6 @@ const PORT_END: u16 = 49999;
 struct ImageView {
     #[serde(flatten)]
     image: Image,
-}
-
-#[derive(Deserialize)]
-struct EnvironmentView {
-    #[serde(flatten)]
-    environment: Environment,
 }
 
 #[derive(Deserialize)]
@@ -236,7 +230,7 @@ impl VmState {
             .idle
             .iter()
             .enumerate()
-            .filter(|(_, vm)| vm.pool.name == pool.name)
+            .filter(|(_, vm)| vm.pool.name == pool.name && vm.pool.revision == pool.revision)
             .max_by_key(|(_, vm)| vm.last_used)
             .map(|(index, _)| index)
             .map(|index| self.idle.swap_remove(index)))
@@ -522,7 +516,8 @@ pub async fn run(
     let network = Network::prepare().await?;
     let address = advertise_address.unwrap_or(detect_address()?);
     fs::create_dir_all(data_dir.join("images")).await?;
-    fs::create_dir_all(data_dir.join("environments")).await?;
+    fs::create_dir_all(data_dir.join("disks")).await?;
+    migrate_environment_disks(&data_dir).await?;
     fs::create_dir_all(data_dir.join("working-dirs")).await?;
     fs::create_dir_all(data_dir.join("logs")).await?;
     fs::create_dir_all(data_dir.join("snapshots")).await?;
@@ -603,7 +598,7 @@ pub async fn run(
         memory_mib,
     }));
     sync_images(&client, controller, node.id, &data_dir).await?;
-    sync_environments(&client, controller, node.id, &data_dir).await?;
+    sync_disks(&client, controller, node.id, &data_dir).await?;
     let pools = sync_snapshots(
         &client,
         controller,
@@ -656,7 +651,7 @@ pub async fn run(
                 tracing::info!(vm_start_concurrency, "updated VM start concurrency");
             }
             sync_images(&client, controller, node.id, &data_dir).await?;
-            sync_environments(&client, controller, node.id, &data_dir).await?;
+            sync_disks(&client, controller, node.id, &data_dir).await?;
             let pools = sync_snapshots(
                 &client,
                 controller,
@@ -799,67 +794,79 @@ async fn sync_images(client: &Client, controller: &str, node: Uuid, data_dir: &P
     Ok(())
 }
 
-async fn sync_environments(
-    client: &Client,
-    controller: &str,
-    node: Uuid,
-    data_dir: &Path,
-) -> Result<()> {
-    let environments = client
-        .get(format!("{controller}/v1/environments"))
+/// Move pre-plugin environment artifacts into the generic disk cache.
+async fn migrate_environment_disks(data_dir: &Path) -> Result<()> {
+    let legacy = data_dir.join("environments");
+    let Ok(mut entries) = fs::read_dir(&legacy).await else {
+        return Ok(());
+    };
+    while let Some(entry) = entries.next_entry().await? {
+        let target = data_dir.join("disks").join(entry.file_name());
+        if !target.exists() {
+            fs::rename(entry.path(), target).await?;
+        }
+    }
+    fs::remove_dir_all(legacy).await?;
+    Ok(())
+}
+
+fn valid_disk_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= 128
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
+
+async fn sync_disks(client: &Client, controller: &str, node: Uuid, data_dir: &Path) -> Result<()> {
+    let disks = client
+        .get(format!("{controller}/v1/disks"))
         .send()
         .await?
         .error_for_status()?
-        .json::<Vec<EnvironmentView>>()
+        .json::<Vec<Disk>>()
         .await?;
-    let wanted = environments
+    let wanted = disks
         .iter()
-        .filter_map(|view| view.environment.artifact.clone())
+        .map(|disk| disk.key.clone())
         .collect::<HashSet<_>>();
-    for environment in environments {
-        let Some(artifact) = environment.environment.artifact else {
+    for disk in disks {
+        if !valid_disk_key(&disk.key) {
+            tracing::warn!(key = %disk.key, "ignoring disk with an invalid key");
             continue;
-        };
-        let path = data_dir.join("environments").join(&artifact);
+        }
+        let path = data_dir.join("disks").join(&disk.key);
         let marker = path.with_extension("sha256");
-        let sha256 = environment.environment.sha256.unwrap_or_default();
-        let verified = fs::read_to_string(&marker).await.unwrap_or_default() == sha256;
+        let verified = fs::read_to_string(&marker).await.unwrap_or_default() == disk.sha256;
         if !path.exists() || !verified {
-            if !path.exists() || hash(&path).await? != sha256 {
+            if !path.exists() || hash(&path).await? != disk.sha256 {
                 download(
                     client,
-                    &format!(
-                        "{controller}/v1/environments/{}/artifact",
-                        environment.environment.id
-                    ),
+                    &format!("{controller}/internal/disks/{}", disk.key),
                     &path,
                 )
                 .await?;
-                if hash(&path).await? != sha256 {
-                    bail!(
-                        "environment {} failed checksum verification",
-                        environment.environment.name
-                    );
+                if hash(&path).await? != disk.sha256 {
+                    bail!("disk {} failed checksum verification", disk.key);
                 }
             }
-            fs::write(marker, &sha256).await?;
+            fs::write(marker, &disk.sha256).await?;
         }
         client
             .post(format!(
-                "{controller}/internal/nodes/{node}/environments/{artifact}/ready"
+                "{controller}/internal/nodes/{node}/disks/{}/ready",
+                disk.key
             ))
             .send()
             .await?
             .error_for_status()?;
     }
-    let mut entries = fs::read_dir(data_dir.join("environments")).await?;
+    let mut entries = fs::read_dir(data_dir.join("disks")).await?;
     while let Some(entry) = entries.next_entry().await? {
         let name = entry.file_name().to_string_lossy().to_string();
-        if !name.ends_with(".sha256") && !wanted.contains(&name) {
+        let key = name.strip_suffix(".sha256").unwrap_or(&name);
+        if !wanted.contains(key) {
             fs::remove_file(entry.path()).await?;
-            fs::remove_file(entry.path().with_extension("sha256"))
-                .await
-                .ok();
         }
     }
     Ok(())
@@ -1248,19 +1255,34 @@ async fn maintain_vms(
         .map(|pool| (pool.name.as_str(), pool))
         .collect::<HashMap<_, _>>();
     let mut removed = Vec::new();
+    let mut stale = Vec::new();
     {
         let mut state = vms.lock().await;
         for mut vm in std::mem::take(&mut state.idle) {
-            if let Some(pool) = current.get(vm.pool.name.as_str()) {
-                vm.pool = (*pool).clone();
-                state.idle.push(vm);
-            } else {
-                removed.push(vm);
+            match current.get(vm.pool.name.as_str()) {
+                Some(pool) if pool.revision == vm.pool.revision => {
+                    vm.pool = (*pool).clone();
+                    state.idle.push(vm);
+                }
+                Some(_) => stale.push(vm),
+                None => removed.push(vm),
             }
         }
     }
     for vm in removed {
         destroy_vm(vm, network).await;
+    }
+    for vm in stale {
+        let pool = vm.pool.name.clone();
+        tracing::info!(%pool, vm = %vm.id, "recycling microVM from an older pool revision");
+        destroy_vm(vm, network).await;
+        client
+            .delete(format!(
+                "{controller}/internal/nodes/{node}/pools/{pool}/idle?force=true"
+            ))
+            .send()
+            .await?
+            .error_for_status()?;
     }
 
     let mut idle = {
@@ -1524,10 +1546,11 @@ async fn ensure_snapshot(
     let api_socket = dir.join("api.sock");
     let vsock = dir.join("vsock.sock");
     let image = data_dir.join("images").join(pool.image.to_string());
-    let environment = pool
-        .environment_artifact
-        .as_ref()
-        .map(|artifact| data_dir.join("environments").join(artifact));
+    let disks = pool
+        .disks
+        .iter()
+        .map(|disk| data_dir.join("disks").join(&disk.key))
+        .collect::<Vec<_>>();
     let log = std::fs::File::create(data_dir.join("logs").join(format!("snapshot-{key}.log")))?;
     let mut child = start_firecracker(firecracker, &api_socket, id, log)?;
     let mut snapshot_tap = None;
@@ -1544,7 +1567,7 @@ async fn ensure_snapshot(
             &vsock,
             kernel,
             &image,
-            environment.as_deref(),
+            &disks,
             pool,
             snapshot_tap.as_deref(),
         )
@@ -1559,7 +1582,12 @@ async fn ensure_snapshot(
             Duration::from_secs(30),
             guest_request(
                 &vsock,
-                &json!({"encoding": "scraperack-snapshot", "preload": &pool.preload}),
+                &json!({
+                    "encoding": "scraperack-snapshot",
+                    "preload": &pool.preload,
+                    "disks": pool.disks.iter().map(|disk| &disk.mount).collect::<Vec<_>>(),
+                    "executor": &pool.executor,
+                }),
             ),
         )
         .await
@@ -1599,23 +1627,38 @@ async fn ensure_snapshot(
 }
 
 fn snapshot_key(pool: &Pool) -> String {
-    let preload = if pool.preload.is_empty() {
+    let guest = if pool.preload.is_empty() && pool.disks.is_empty() && pool.executor.is_empty() {
         String::new()
     } else {
         let mut digest = Sha256::new();
-        for module in &pool.preload {
-            digest.update(module.as_bytes());
-            digest.update([0]);
+        digest.update(b"v2");
+        for (kind, values) in [
+            ("preload", pool.preload.clone()),
+            (
+                "disks",
+                pool.disks
+                    .iter()
+                    .flat_map(|disk| [disk.key.clone(), disk.mount.clone()])
+                    .collect(),
+            ),
+            ("executor", pool.executor.clone()),
+        ] {
+            digest.update(kind.as_bytes());
+            for value in values {
+                digest.update([0]);
+                digest.update(value.as_bytes());
+            }
+            digest.update([1]);
         }
         format!("-{}", &hex::encode(digest.finalize())[..16])
     };
+    // Pools without guest extras keep their pre-plugin key, so upgrades reuse snapshots.
     format!(
-        "{}-{}-{}-{}-{}{preload}",
+        "{}-{}-{}-{}-base{guest}",
         pool.image,
         pool.cpu_millis.div_ceil(1000).max(1),
         pool.memory_mib,
         if pool.network { "net1" } else { "none" },
-        pool.environment_artifact.as_deref().unwrap_or("base"),
     )
 }
 
@@ -1643,7 +1686,7 @@ async fn configure_boot(
     vsock: &Path,
     kernel: &Path,
     rootfs: &Path,
-    environment: Option<&Path>,
+    disks: &[PathBuf],
     pool: &Pool,
     tap: Option<&str>,
 ) -> Result<()> {
@@ -1658,19 +1701,6 @@ async fn configure_boot(
         }),
     )
     .await?;
-    if let Some(environment) = environment {
-        firecracker_put(
-            api_socket,
-            "/drives/environment",
-            &json!({
-                "drive_id": "environment",
-                "path_on_host": environment,
-                "is_root_device": false,
-                "is_read_only": true
-            }),
-        )
-        .await?;
-    }
     firecracker_put(
         api_socket,
         "/boot-source",
@@ -1691,6 +1721,21 @@ async fn configure_boot(
         }),
     )
     .await?;
+    // Extra disks appear in the guest as /dev/vdb, /dev/vdc, ... in this order.
+    for (index, disk) in disks.iter().enumerate() {
+        let drive = format!("disk{index}");
+        firecracker_put(
+            api_socket,
+            &format!("/drives/{drive}"),
+            &json!({
+                "drive_id": drive,
+                "path_on_host": disk,
+                "is_root_device": false,
+                "is_read_only": true
+            }),
+        )
+        .await?;
+    }
     firecracker_put(
         api_socket,
         "/vsock",
@@ -1710,6 +1755,36 @@ async fn configure_boot(
         .await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+    use crate::cluster::PoolDisk;
+
+    #[test]
+    fn plain_pools_keep_their_pre_plugin_snapshot_key() {
+        let mut pool = Pool {
+            image: Uuid::nil(),
+            cpu_millis: 1000,
+            memory_mib: 1256,
+            network: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            snapshot_key(&pool),
+            "00000000-0000-0000-0000-000000000000-1-1256-net1-base"
+        );
+        let plain = snapshot_key(&pool);
+        pool.disks.push(PoolDisk {
+            key: "venv".into(),
+            mount: "/tmp/environment".into(),
+        });
+        let with_disk = snapshot_key(&pool);
+        assert_ne!(plain, with_disk);
+        pool.executor = vec!["/bin/executor".into()];
+        assert_ne!(with_disk, snapshot_key(&pool));
+    }
 }
 
 async fn guest_request(vsock: &Path, payload: &Value) -> Result<Completion> {

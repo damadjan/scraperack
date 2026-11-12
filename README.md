@@ -17,72 +17,55 @@ Additional installed machines can join the cluster from **Settings → Join node
 ## Repository layout
 
 ```text
-platform/      Rust controller and node, guest agents, GUI, and deployment files
-sdk/           Installable Python SDK
-images/        Docker build contexts imported as VM and runtime images
-verification/  Local execution checks and benchmarks
+platform/      Rust controller and node, guest agent, GUI, and deployment files
+images/        Docker build contexts imported as VM images
 ```
 
-## Current vertical slice
+Workload types live in plugins, outside this repository. The Python execution environments
+plugin and the `scraperack` Python SDK are in
+[scraperack-plugins](https://github.com/damadjan/scraperack-plugins).
+
+## Core
 
 - One Rust binary with controller and node modes
 - Docker image import, conversion, cluster-wide distribution tracking, and deletion
-- Separate general-purpose VM pools and Python execution environments
-- Immutable, content-addressed Python package environments distributed and cached on nodes
-- Automatic runtime snapshots, live warm instances, idle expiry, reuse, and scale-out limits
+- Pools of microVMs with automatic snapshots, warm instances, idle expiry, reuse, and scale-out limits
+- Pool revisions: changing a pool's VM settings replaces its idle microVMs without dropping work
+- Read-only ext4 disks, content-addressed, distributed to and cached on every node
+- Executions: payloads sent to a pool's executor over virtio-vsock, with stdout, stderr, results, and hard timeouts
+- Invocation-scoped variables and encrypted secrets, content-addressed working directories
 - Per-VM CPU, memory, and disk limits with owner-managed aggregate overcommit
 - Round-robin node scheduling with queue-or-fail submission
 - Persistent execution history and cluster metadata
-- Python SDK with `cloudpickle` and JSON payloads
-- Firecracker process lifecycle through its Unix-socket API
+- Optional per-VM TAP networking with outbound NAT and TCP/UDP host-port publishing
 - Shared read-only golden rootfs with isolated in-memory workspaces
 - cgroup v2 CPU, memory, and PID limits
-- Host-to-guest execution over virtio-vsock
-- Optional per-VM TAP networking with outbound NAT and TCP/UDP host-port publishing
-- Node-local Firecracker memory snapshots and concurrent restores
-- Python source, `cloudpickle`, file bundle, and JSON payloads
-- Guest stdout, stderr, values, tracebacks, and hard timeouts
-- NiceGUI management console with separate execution and infrastructure resources
+- NiceGUI management console
+- Plugins, installed from the GUI
 
-VM images contain only the core `/sbin/scraperack-init` guest agent. Runtime images additionally contain an executor such as Python. Python environments combine a runtime image, an immutable package artifact, resources, and scaling policy. Package artifacts are built once from Docker-imported runtime images, distributed to nodes, mounted read-only, and shared by compatible MicroVMs. Every environment owns an internal VM pool; its MicroVMs remain visible in the GUI and never switch environments.
+VM images contain only the core `/sbin/scraperack-init` guest agent. A pool may attach
+extra read-only disks, mounted in order at the paths it names, and an `executor` command
+that the agent starts to handle execution payloads. Pools without an executor only
+provide microVMs, for example browsers reached through published ports.
 
-The Images pages import `linux/amd64` Docker images by registry reference. The controller accepts an optional registry username and password, permits plain HTTP and untrusted TLS registries by default, injects the core agent, detects `/usr/bin/python3` and `cloudpickle`, and converts the filesystem to ext4. Docker and Skopeo must be available to the controller service.
+The Images page imports `linux/amd64` Docker images by registry reference. The controller accepts an optional registry username and password, permits plain HTTP and untrusted TLS registries by default, injects the core agent, requires `/usr/bin/python3` for it, and converts the filesystem to ext4. Docker and Skopeo must be available to the controller service.
 
 Network-enabled pools give every MicroVM an isolated `/30` address behind node NAT. Port entries use dynamic host ports when `host_port` is `None`; the assigned node endpoints are returned by `/v1/vms` and shown in the GUI.
 
-## Intended API
+## Plugins
 
-```python
-from scraperack import Cluster
+A plugin is a separate program, in any language, that adds a workload type. Pack the
+plugin folder as a `.tar.gz` and install it from **Plugins → Install plugin** in the GUI.
+The controller unpacks it, runs its install step, builds its `guest` folder into a disk
+that nodes download, and runs it as a supervised process with its own Unix sockets.
+Updates keep the previous version and roll back automatically if the new one does not
+start. Plugin pages appear in the GUI sidebar, and plugin APIs are served at
+`/plugins/<name>/api/`.
 
-cluster = Cluster()
-image = cluster.import_image("python-runtime", "registry.example.com/python-runtime:latest")
-environment = cluster.create_environment(
-    "numpy", image["id"], packages=["numpy==2.3.3"],
-    cpu=0.25, memory_mib=256, warm=2, max_instances=8,
-)
-
-def add(a, b):
-    return a + b
-
-execution = cluster.run(
-    environment["id"], add, (2, 3),
-    working_dir="./project",
-    variables={"LOG_LEVEL": "INFO"},
-    secrets={"DATABASE_URL": "postgresql://..."},
-)
-result = cluster.result(execution["id"])
-```
-
-Execution code reads invocation-scoped values with
-`scraperack_runtime.variable("LOG_LEVEL")` and
-`scraperack_runtime.secret("DATABASE_URL")`. Secrets remain encrypted in the
-controller queue, are cleared when execution finishes, and are redacted from
-captured output and errors.
-
-`working_dir` packages local project modules and files into a content-addressed
-archive. The controller, nodes, and warm microVMs cache each version, and the guest
-makes it importable before deserializing the submitted function.
+Plugins run with the controller's permissions. Installation can be turned off with
+`SCRAPERACK_ALLOW_PLUGIN_INSTALL=false` in `/etc/scraperack/controller.env`. The manifest
+format and the API available to plugins are documented in
+[scraperack-plugins](https://github.com/damadjan/scraperack-plugins#write-a-plugin).
 
 ## Development
 
@@ -91,14 +74,13 @@ cd platform
 cargo run -- controller
 cargo run -- node --controller http://127.0.0.1:7070 --name node-1 --kernel /path/to/vmlinux
 cd ..
-pip install -e sdk
 pip install -e platform/gui
 python platform/gui/app.py
 ```
 
 The GUI listens on port `8080` and reads the controller address from `SCRAPERACK_URL`.
 
-Firecracker nodes require Linux, KVM access, and a compatible CPU. The controller and SDK do not.
+Firecracker nodes require Linux, KVM access, and a compatible CPU. The controller does not.
 
 ## Prepare an Ubuntu node
 
@@ -107,7 +89,7 @@ sudo ./platform/deploy/install-firecracker.sh
 sudo ./platform/deploy/build-rootfs.sh python.ext4
 ```
 
-`install-firecracker.sh` installs the latest official Firecracker release and current Firecracker CI kernel. `build-rootfs.sh` creates a minimal Ubuntu 24.04 golden image with CPython 3.10.11 and cloudpickle 3.1.2, without Docker.
+`install-firecracker.sh` installs the latest official Firecracker release and current Firecracker CI kernel. `build-rootfs.sh` creates a minimal Ubuntu 24.04 golden image with CPython 3.10.11 for the guest agent, without Docker.
 
 ## License
 
