@@ -1652,8 +1652,9 @@ fn snapshot_key(pool: &Pool) -> String {
         }
         format!("-{}", &hex::encode(digest.finalize())[..16])
     };
+    // Pools without guest extras keep their pre-plugin key, so upgrades reuse snapshots.
     format!(
-        "{}-{}-{}-{}{guest}",
+        "{}-{}-{}-{}-base{guest}",
         pool.image,
         pool.cpu_millis.div_ceil(1000).max(1),
         pool.memory_mib,
@@ -1754,6 +1755,36 @@ async fn configure_boot(
         .await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+    use crate::cluster::PoolDisk;
+
+    #[test]
+    fn plain_pools_keep_their_pre_plugin_snapshot_key() {
+        let mut pool = Pool {
+            image: Uuid::nil(),
+            cpu_millis: 1000,
+            memory_mib: 1256,
+            network: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            snapshot_key(&pool),
+            "00000000-0000-0000-0000-000000000000-1-1256-net1-base"
+        );
+        let plain = snapshot_key(&pool);
+        pool.disks.push(PoolDisk {
+            key: "venv".into(),
+            mount: "/tmp/environment".into(),
+        });
+        let with_disk = snapshot_key(&pool);
+        assert_ne!(plain, with_disk);
+        pool.executor = vec!["/bin/executor".into()];
+        assert_ne!(with_disk, snapshot_key(&pool));
+    }
 }
 
 async fn guest_request(vsock: &Path, payload: &Value) -> Result<Completion> {
