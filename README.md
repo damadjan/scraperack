@@ -19,11 +19,13 @@ Additional installed machines can join the cluster from **Settings → Join node
 ```text
 platform/      Rust controller and node, guest agent, GUI, and deployment files
 images/        Docker build contexts imported as VM images
+sdk/           `scraperack`, the Python client for the core API
 ```
 
 The core only runs microVMs. Workload types live in plugins, outside this repository: what a
-task's payload means, and the history of what users ran, belong to the plugin. The Python
-plugin (environments and executions) and the `scraperack` Python SDK are in
+task's payload means, and the history of what users ran, belong to the plugin. The core's
+Python client, `scraperack`, is in [`sdk/`](sdk/). The Python plugin (environments and
+executions) and its SDK, `scraperack-python`, are in
 [scraperack-plugins](https://github.com/damadjan/scraperack-plugins).
 
 ## Core

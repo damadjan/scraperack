@@ -7,3 +7,4 @@ __pycache__/
 /.pytest_cache
 v/
 docker_build_commands*.txt
+dist/
