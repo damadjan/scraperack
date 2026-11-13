@@ -39,6 +39,17 @@ function statusRenderer(params) {
   const status = params.value || 'unknown'
   return `<span class="status-pill status-${status}">${status.replaceAll('_', ' ')}</span>`
 }
+function progressRenderer(params) {
+  const row = params.data
+  if (row.kind !== 'import') return ''
+  const escape = value => String(value).replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]))
+  const detail = `<small class="${row.status === 'failed' ? 'status-error' : ''}">${escape(row.detail)}</small>`
+  if (row.status !== 'importing') return `<div class="progress-cell">${detail}</div>`
+  const bar = row.progress == null
+    ? '<div class="progress-bar indeterminate"><span></span></div>'
+    : `<div class="progress-bar"><span style="width:${(row.progress * 100).toFixed(1)}%"></span></div>`
+  return `<div class="progress-cell">${bar}${detail}</div>`
+}
 function portsRenderer(params) {
   const ports = params.value || []
   if (!ports.length) return '<span class="muted">—</span>'
@@ -422,91 +433,295 @@ async def nodes_page():
     ui.timer(1, refresh)
 
 
+def import_detail(job):
+    """What an import row shows under its progress bar."""
+    if job["status"] == "failed":
+        return job.get("error") or "Import failed"
+    detail = job["stage"]
+    if job["stage"] == "Pulling" and job.get("downloaded"):
+        detail += f' · {size(job["downloaded"])}'
+        if job.get("total"):
+            detail += f' / {size(job["total"])}'
+    return detail
+
+
+def image_status(image):
+    if not image["compatible"]:
+        return "incompatible"
+    return "ready" if image["ready"] else "distributing"
+
+
+def image_rows(images, imports):
+    rows = []
+    for job in imports:
+        if job["status"] == "succeeded":
+            continue
+        rows.append({
+            "row_id": job["id"], "kind": "import", "name": job["name"],
+            "status": {"running": "importing"}.get(job["status"], job["status"]),
+            "progress": job.get("progress"), "detail": import_detail(job),
+            "display_size": "—", "short_hash": "—", "id": job["image"],
+        })
+    for image in images:
+        rows.append({
+            "row_id": image["id"], "kind": "image", "name": image["name"],
+            "status": image_status(image), "progress": None, "detail": "",
+            "display_size": size(image["size"]), "short_hash": image["sha256"][:16], "id": image["id"],
+        })
+    return rows
+
+
+def detail_card(label, value, classes=""):
+    with ui.element("div").classes("detail-card"):
+        ui.label(label).classes("detail-label")
+        ui.label(value or "—").classes(f"detail-value {classes}")
+
+
+def log_block(title="Log"):
+    with ui.row().classes("items-center w-full"):
+        ui.label(title).classes("section-title")
+        ui.space()
+        copy = ui.button("Copy log", icon="content_copy").props("flat dense no-caps")
+    log = ui.code("Loading…", language="plaintext").classes("json-code w-full import-log")
+
+    def copy_log():
+        ui.clipboard.write(log.content)
+        ui.notify("Log copied")
+
+    copy.on_click(copy_log)
+    return log
+
+
+async def confirm(title, message, action):
+    with ui.dialog() as dialog, ui.card():
+        ui.label(title).classes("section-title")
+        ui.label(message).classes("text-sm muted")
+        with ui.row().classes("w-full justify-end"):
+            ui.button("Keep", on_click=dialog.close).props("flat no-caps")
+            ui.button(action, color="negative", on_click=lambda: dialog.submit(True)).props("no-caps")
+    return await dialog
+
+
 @ui.page("/images")
 async def images_page():
-    import_status_key = "image_import_status"
     with await layout("images"):
-        with ui.card().classes("panel"):
-            ui.label("Import Docker image").classes("section-title")
-            ui.label("Pull a linux/amd64 image and convert it to a microVM root filesystem. "
-                     "The image needs /usr/bin/python3 for the guest agent.") \
-                .classes("text-sm muted")
-            with ui.row().classes("items-end w-full"):
-                docker_reference = ui.input("Docker image", placeholder="ghcr.io/acme/browser:latest") \
-                    .classes("grow")
-                docker_name = ui.input("Image name", placeholder="browser").classes("w-64")
-                docker_username = ui.input("Username", placeholder="Optional").classes("w-52")
-                docker_password = ui.input("Password", placeholder="Optional").props("type=password") \
-                    .classes("w-52")
-                import_button = ui.button("Import", icon="download").props("no-caps")
-            import_status = ui.label(app.storage.general.get(import_status_key, "")) \
-                .classes("text-sm muted")
         with ui.row().classes("items-center w-full"):
             ui.label("Images").classes("section-title")
             ui.space()
-            delete_button = ui.button("Delete", icon="delete", color="negative").props("outline no-caps")
+            import_button = ui.button("Import image", icon="download").props("unelevated no-caps")
         images = table([
             {"headerName": "Name", "field": "name"},
-            {"headerName": "Compatible", "field": "compatible", "maxWidth": 130},
-            {"headerName": "Distributed", "field": "ready", "maxWidth": 140},
+            {"headerName": "Status", "field": "status", "maxWidth": 140, ":cellRenderer": "statusRenderer"},
+            {"headerName": "Progress", "field": "progress", "minWidth": 220, ":cellRenderer": "progressRenderer",
+             "sortable": False, "filter": False},
             {"headerName": "Size", "field": "display_size", "maxWidth": 120},
             {"headerName": "SHA-256", "field": "short_hash", "cellClass": "mono"},
             {"headerName": "ID", "field": "id", "cellClass": "mono", "minWidth": 260},
-        ], selection=True)
+        ], row_key="row_id")
+    images.classes("clickable-grid")
+    # Dialogs opened from grid clicks must not be built inside the grid element.
+    dialogs = ui.element("div")
+    state = {"images": [], "imports": []}
 
     async def refresh():
-        data = await request("GET", "/v1/images")
-        set_rows(images, [{**image, "display_size": size(image["size"]),
-                           "short_hash": image["sha256"][:16]} for image in data])
+        state["images"], state["imports"] = await asyncio.gather(
+            request("GET", "/v1/images"), request("GET", "/v1/images/imports"))
+        set_rows(images, image_rows(state["images"], state["imports"]))
 
-    async def do_import():
-        reference = docker_reference.value.strip()
-        if not reference:
-            return ui.notify("Docker image is required", type="warning")
-        image_name = docker_name.value.strip() or reference.rsplit("/", 1)[-1].replace(":", "-")
-        username = docker_username.value.strip()
-        password = docker_password.value
-        if bool(username) != bool(password):
-            return ui.notify("Username and password must be provided together", type="warning")
-        import_button.disable()
-        app.storage.general[import_status_key] = f"Importing {reference}…"
-        import_status.set_text(app.storage.general[import_status_key])
+    async def safe_refresh():
         try:
-            await request("POST", "/v1/images/import",
-                          json={"name": image_name, "reference": reference,
-                                "username": username or None, "password": password or None}, timeout=None)
-            app.storage.general[import_status_key] = f"Imported {image_name} successfully"
-            if not import_status.is_deleted:
-                import_status.set_text(app.storage.general[import_status_key])
-                docker_reference.value = ""
-                docker_name.value = ""
-                docker_username.value = ""
-                docker_password.value = ""
-                await refresh()
-        except Exception as error:
-            app.storage.general[import_status_key] = f"Import failed: {error}"
-            if not import_status.is_deleted:
-                import_status.set_text(app.storage.general[import_status_key])
-        finally:
-            if not import_button.is_deleted:
-                import_button.enable()
-
-    async def do_delete():
-        selected = await images.get_selected_row()
-        if not selected:
-            return ui.notify("Select an image first", type="warning")
-        try:
-            await request("DELETE", f'/v1/images/{selected["id"]}')
             await refresh()
         except Exception as error:
             notify_error(error)
 
-    import_button.on_click(do_import)
-    delete_button.on_click(do_delete)
-    try:
-        await refresh()
-    except Exception as error:
-        notify_error(error)
+    def open_import(reference="", name=""):
+        with dialogs, ui.dialog() as dialog, ui.card().classes("detail-dialog import-dialog"):
+            with ui.row().classes("items-center w-full"):
+                ui.label("Import Docker image").classes("section-title")
+                ui.space()
+                ui.button(icon="close", on_click=dialog.close).props("flat round")
+            ui.label("Pull a linux/amd64 image and convert it to a microVM root filesystem. "
+                     "The image needs /usr/bin/python3 for the guest agent. "
+                     "The import keeps running in the background.").classes("text-sm muted")
+            docker_reference = ui.input("Docker image", value=reference,
+                                        placeholder="ghcr.io/acme/browser:latest").classes("w-full")
+            docker_name = ui.input("Image name", value=name, placeholder="browser").classes("w-full")
+            with ui.row().classes("w-full no-wrap"):
+                docker_username = ui.input("Username", placeholder="Optional").classes("grow")
+                docker_password = ui.input("Password", placeholder="Optional") \
+                    .props("type=password").classes("grow")
+            status = ui.label().classes("text-sm status-error")
+            with ui.row().classes("w-full justify-end"):
+                ui.button("Cancel", on_click=dialog.close).props("flat no-caps")
+                submit = ui.button("Import", icon="download").props("unelevated no-caps")
+
+        async def start():
+            image_reference = docker_reference.value.strip()
+            if not image_reference:
+                return status.set_text("Docker image is required")
+            image_name = docker_name.value.strip() \
+                or image_reference.rsplit("/", 1)[-1].replace(":", "-")
+            username = docker_username.value.strip()
+            password = docker_password.value
+            if bool(username) != bool(password):
+                return status.set_text("Username and password must be provided together")
+            submit.disable()
+            try:
+                await request("POST", "/v1/images/imports",
+                              json={"name": image_name, "reference": image_reference,
+                                    "username": username or None, "password": password or None})
+                dialog.close()
+                ui.notify(f"Importing {image_name}", type="positive")
+                await safe_refresh()
+            except Exception as error:
+                status.set_text(str(error))
+                submit.enable()
+
+        submit.on_click(start)
+        dialog.on("hide", dialog.delete)
+        dialog.open()
+
+    def show_import(job_id):
+        with dialogs, ui.dialog() as dialog, ui.card().classes("detail-dialog"):
+            with ui.row().classes("items-center w-full"):
+                with ui.column().classes("gap-0"):
+                    ui.label("Image import").classes("dialog-eyebrow")
+                    title = ui.label().classes("dialog-title")
+                pill = ui.label().classes("status-pill")
+                ui.space()
+                ui.button(icon="close", on_click=dialog.close).props("flat round")
+            stage = ui.label().classes("text-sm")
+            bar = ui.linear_progress(value=0, show_value=False, size="8px", color="primary")
+            error_box = ui.label().classes("error-block mono text-sm w-full")
+            error_box.set_visibility(False)
+            log = log_block()
+            with ui.row().classes("w-full items-center"):
+                remove = ui.button("Cancel import", icon="delete", color="negative").props("outline no-caps")
+                ui.space()
+                retry = ui.button("Retry", icon="refresh").props("outline no-caps")
+                retry.set_visibility(False)
+                ui.button("Close", on_click=dialog.close).props("flat no-caps")
+            timer = ui.timer(1, lambda: load())
+        job = {}
+
+        async def load():
+            try:
+                job.update(await request("GET", f"/v1/images/imports/{job_id}"))
+            except Exception as error:
+                log.set_content(f"Unavailable: {error}")
+                timer.cancel()
+                return
+            running = job["status"] == "running"
+            status = "importing" if running else job["status"]
+            title.set_text(f'{job["name"]} · {job["reference"]}')
+            pill.set_text(status)
+            pill.classes(replace=f"status-pill status-{status}")
+            stage.set_text(import_detail(job) if running
+                           else f'Failed while: {job["stage"]}' if job["status"] == "failed" else job["stage"])
+            bar.set_visibility(running)
+            if job.get("progress") is None:
+                bar.props("indeterminate")
+            else:
+                bar.props(remove="indeterminate")
+                bar.set_value(job["progress"])
+            error_box.set_text(job.get("error") or "")
+            error_box.set_visibility(bool(job.get("error")))
+            if log.content != (job.get("log") or "(empty)"):
+                log.set_content(job.get("log") or "(empty)")
+            remove.set_text("Cancel import" if running else "Dismiss")
+            retry.set_visibility(job["status"] == "failed")
+            if not running:
+                timer.cancel()
+
+        async def do_remove():
+            if job.get("status") == "running" and not await confirm(
+                    f'Cancel importing {job["name"]}?', "The download and conversion stop.", "Cancel import"):
+                return
+            try:
+                await request("DELETE", f"/v1/images/imports/{job_id}")
+                dialog.close()
+                await safe_refresh()
+            except Exception as error:
+                notify_error(error)
+
+        def do_retry():
+            dialog.close()
+            open_import(job["reference"], job["name"])
+
+        remove.on_click(do_remove)
+        retry.on_click(do_retry)
+        dialog.on("hide", dialog.delete)
+        dialog.open()
+
+    async def show_image(image_id):
+        image = next((item for item in state["images"] if item["id"] == image_id), None)
+        if not image:
+            return
+        job = next((item for item in state["imports"] if item["image"] == image_id), None)
+        status = image_status(image)
+        log = None
+        with dialogs, ui.dialog() as dialog, ui.card().classes("detail-dialog"):
+            with ui.row().classes("items-center w-full"):
+                with ui.column().classes("gap-0"):
+                    ui.label("Image").classes("dialog-eyebrow")
+                    ui.label(image["name"]).classes("dialog-title")
+                ui.label(status).classes(f"status-pill status-{status}")
+                ui.space()
+                ui.button(icon="close", on_click=dialog.close).props("flat round")
+            with ui.element("div").classes("detail-grid w-full"):
+                detail_card("Size", size(image["size"]))
+                detail_card("Distributed", "On every node" if image["ready"] else "Syncing to nodes")
+                detail_card("Source", job["reference"] if job else "", "mono")
+                detail_card("ID", image["id"], "mono")
+            with ui.element("div").classes("payload-grid"):
+                detail_card("SHA-256", image["sha256"], "mono")
+                if image.get("docker_source"):
+                    detail_card("Docker image ID", image["docker_source"], "mono")
+            if job:
+                log = log_block("Import log")
+            else:
+                ui.label("No import log. Logs are kept until the controller restarts.") \
+                    .classes("text-sm muted")
+            with ui.row().classes("w-full items-center"):
+                delete = ui.button("Delete", icon="delete", color="negative").props("outline no-caps")
+                ui.space()
+                ui.button("Close", on_click=dialog.close).props("flat no-caps")
+
+        async def do_delete():
+            if not await confirm(f'Delete {image["name"]}?',
+                                 "The image is removed from every node.", "Delete"):
+                return
+            try:
+                await request("DELETE", f'/v1/images/{image["id"]}')
+                dialog.close()
+                ui.notify(f'Deleted {image["name"]}', type="positive")
+                await safe_refresh()
+            except Exception as error:
+                notify_error(error)
+
+        delete.on_click(do_delete)
+        dialog.on("hide", dialog.delete)
+        dialog.open()
+        if log:
+            try:
+                full = await request("GET", f'/v1/images/imports/{job["id"]}')
+                log.set_content(full.get("log") or "(empty)")
+            except Exception as error:
+                log.set_content(f"Unavailable: {error}")
+
+    async def open_row(event):
+        row = event.args.get("data")
+        if not row:
+            return
+        if row["kind"] == "import":
+            show_import(row["row_id"])
+        else:
+            await show_image(row["row_id"])
+
+    import_button.on_click(lambda: open_import())
+    images.on("cellClicked", open_row, ["data"])
+    await safe_refresh()
+    ui.timer(1, refresh)
 
 
 @ui.page("/vm-images")

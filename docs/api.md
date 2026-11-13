@@ -13,6 +13,10 @@ The Python client [`scraperack`](sdk.md) wraps all of these.
 |---|---|---|
 | `GET /v1/images` | | Images with `ready` |
 | `POST /v1/images/import` | `{name, reference, username?, password?}` | Image (blocks until converted) |
+| `POST /v1/images/imports` | same as above | 202, import job (runs in the background) |
+| `GET /v1/images/imports` | | Import jobs, newest first, without logs |
+| `GET /v1/images/imports/{id}` | | Import job with `log` |
+| `DELETE /v1/images/imports/{id}` | | 204; cancels a running import or dismisses a finished one |
 | `PATCH /v1/images/{id}` | `{name}` | Renamed image |
 | `DELETE /v1/images/{id}` | | 204 |
 
