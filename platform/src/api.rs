@@ -52,6 +52,7 @@ pub struct App {
     tasks: Arc<Notify>,
     work: Arc<Notify>,
     pub plugins: Arc<Plugins>,
+    imports: Arc<Imports>,
 }
 
 /// Identifies requests that arrive on a plugin's private core socket.
@@ -260,6 +261,7 @@ pub async fn serve(
         data_dir,
         tasks: Arc::new(Notify::new()),
         work: Arc::new(Notify::new()),
+        imports: Arc::default(),
     };
     app.database.prune(now_ms())?;
     let garbage_collector = app.clone();
@@ -292,6 +294,11 @@ fn router(app: App) -> Router {
         .route("/health", get(|| async { Json(json!({ "ok": true })) }))
         .route("/v1/images", get(list_images))
         .route("/v1/images/import", post(import_image))
+        .route("/v1/images/imports", get(list_imports).post(create_import))
+        .route(
+            "/v1/images/imports/{id}",
+            get(get_import).delete(delete_import),
+        )
         .route(
             "/v1/images/{key}",
             axum::routing::patch(update_image).delete(delete_image),
@@ -404,17 +411,224 @@ struct ImportImage {
     password: Option<String>,
 }
 
+/// Share of the overall import progress spent downloading layers.
+const PULL_SHARE: f64 = 0.7;
+/// Finished imports kept so their logs stay readable.
+const KEPT_IMPORTS: usize = 50;
+const IMPORT_LOG_LIMIT: usize = 256 * 1024;
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ImportStatus {
+    Running,
+    Succeeded,
+    Failed,
+}
+
+/// A Docker image import running in the background, with its progress and log.
+#[derive(Debug, Clone, Serialize)]
+struct ImportJob {
+    id: Uuid,
+    name: String,
+    reference: String,
+    status: ImportStatus,
+    stage: String,
+    /// Overall progress from 0 to 1, absent while it cannot be measured.
+    progress: Option<f64>,
+    downloaded: u64,
+    total: Option<u64>,
+    /// The image this import creates, registered once it succeeds.
+    image: Uuid,
+    error: Option<String>,
+    created_at: u64,
+    updated_at: u64,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    log: String,
+}
+
+struct ImportEntry {
+    job: ImportJob,
+    work: PathBuf,
+    task: Option<tokio::task::AbortHandle>,
+}
+
+#[derive(Default)]
+struct Imports {
+    jobs: std::sync::Mutex<HashMap<Uuid, ImportEntry>>,
+}
+
+/// Reports progress and output of one import.
+#[derive(Clone)]
+struct ImportProgress {
+    imports: Arc<Imports>,
+    id: Uuid,
+    started: std::time::Instant,
+}
+
+impl ImportProgress {
+    fn update(&self, change: impl FnOnce(&mut ImportJob)) {
+        if let Some(entry) = self.imports.jobs.lock().unwrap().get_mut(&self.id) {
+            change(&mut entry.job);
+            entry.job.updated_at = now_ms();
+        }
+    }
+
+    fn log(&self, text: impl AsRef<str>) {
+        let text = text.as_ref().trim_end();
+        if text.is_empty() {
+            return;
+        }
+        let line = format!("[{:>7.1}s] {text}\n", self.started.elapsed().as_secs_f64());
+        self.update(|job| {
+            job.log.push_str(&line);
+            if job.log.len() > IMPORT_LOG_LIMIT {
+                let mut cut = job.log.len() - IMPORT_LOG_LIMIT * 3 / 4;
+                while !job.log.is_char_boundary(cut) {
+                    cut += 1;
+                }
+                job.log.replace_range(..cut, "…\n");
+            }
+        });
+    }
+
+    fn stage(&self, stage: &str, progress: Option<f64>) {
+        self.log(format!("== {stage}"));
+        self.update(|job| {
+            job.stage = stage.into();
+            job.progress = progress;
+        });
+    }
+
+    /// Run a command, recording it and its output in the log.
+    async fn run<I, S>(&self, program: &str, args: I) -> Result<String, String>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let args = args
+            .into_iter()
+            .map(|arg| arg.as_ref().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        self.log(format!("$ {program} {}", args.join(" ")));
+        let result = command(program, &args).await;
+        self.log_output(&result);
+        result
+    }
+
+    fn log_output(&self, result: &Result<String, String>) {
+        match result {
+            Ok(output) => {
+                let mut start = output.len().saturating_sub(4096);
+                while !output.is_char_boundary(start) {
+                    start += 1;
+                }
+                self.log(&output[start..]);
+            }
+            Err(message) => self.log(format!("failed: {message}")),
+        }
+    }
+}
+
+fn import_view(entry: &ImportEntry, with_log: bool) -> ImportJob {
+    let mut job = entry.job.clone();
+    if !with_log {
+        job.log.clear();
+    }
+    job
+}
+
+async fn list_imports(State(app): State<App>) -> Json<Vec<ImportJob>> {
+    let jobs = app.imports.jobs.lock().unwrap();
+    let mut jobs = jobs
+        .values()
+        .map(|entry| import_view(entry, false))
+        .collect::<Vec<_>>();
+    jobs.sort_by_key(|job| std::cmp::Reverse(job.created_at));
+    Json(jobs)
+}
+
+async fn get_import(
+    State(app): State<App>,
+    AxumPath(id): AxumPath<Uuid>,
+) -> ApiResult<Json<ImportJob>> {
+    app.imports
+        .jobs
+        .lock()
+        .unwrap()
+        .get(&id)
+        .map(|entry| Json(import_view(entry, true)))
+        .ok_or_else(|| error(StatusCode::NOT_FOUND, "import not found"))
+}
+
+/// Cancel a running import, or dismiss a finished one.
+async fn delete_import(
+    State(app): State<App>,
+    AxumPath(id): AxumPath<Uuid>,
+) -> ApiResult<StatusCode> {
+    let entry = app
+        .imports
+        .jobs
+        .lock()
+        .unwrap()
+        .remove(&id)
+        .ok_or_else(|| error(StatusCode::NOT_FOUND, "import not found"))?;
+    if entry.job.status == ImportStatus::Running {
+        if let Some(task) = entry.task {
+            task.abort();
+        }
+        fs::remove_dir_all(&entry.work).await.ok();
+        if !app
+            .cluster
+            .read()
+            .await
+            .images
+            .contains_key(&entry.job.image)
+        {
+            fs::remove_file(
+                app.data_dir
+                    .join("images")
+                    .join(entry.job.image.to_string()),
+            )
+            .await
+            .ok();
+        }
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Start an import in the background and return it at once.
+async fn create_import(
+    State(app): State<App>,
+    Json(request): Json<ImportImage>,
+) -> ApiResult<(StatusCode, Json<ImportJob>)> {
+    let (job, _) = start_import(&app, request).await?;
+    Ok((StatusCode::ACCEPTED, Json(job)))
+}
+
+/// Import an image and wait until it is converted.
 async fn import_image(
     State(app): State<App>,
     Json(request): Json<ImportImage>,
 ) -> ApiResult<(StatusCode, Json<Image>)> {
-    let name = request.name.trim();
-    let reference = request
-        .reference
-        .trim()
+    let (_, task) = start_import(&app, request).await?;
+    match task.await {
+        Ok(Ok(image)) => Ok((StatusCode::CREATED, Json(image))),
+        Ok(Err(message)) => Err(error(StatusCode::BAD_REQUEST, message)),
+        Err(_) => Err(error(StatusCode::CONFLICT, "import was cancelled")),
+    }
+}
+
+async fn start_import(
+    app: &App,
+    request: ImportImage,
+) -> ApiResult<(ImportJob, tokio::task::JoinHandle<Result<Image, String>>)> {
+    let name = request.name.trim().to_owned();
+    let reference = request.reference.trim();
+    let reference = reference
         .strip_prefix("http://")
-        .or_else(|| request.reference.trim().strip_prefix("https://"))
-        .unwrap_or(request.reference.trim());
+        .or_else(|| reference.strip_prefix("https://"))
+        .unwrap_or(reference)
+        .to_owned();
     if name.is_empty() || reference.is_empty() {
         return Err(error(
             StatusCode::BAD_REQUEST,
@@ -423,60 +637,134 @@ async fn import_image(
     }
     let username = request
         .username
-        .as_deref()
-        .map(str::trim)
+        .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty());
-    let password = request
-        .password
-        .as_deref()
-        .filter(|value| !value.is_empty());
+    let password = request.password.filter(|value| !value.is_empty());
     if username.is_some() != password.is_some() {
         return Err(error(
             StatusCode::BAD_REQUEST,
             "registry username and password must be provided together",
         ));
     }
-    if app
-        .cluster
-        .read()
-        .await
-        .images
-        .values()
-        .any(|image| image.name == name)
-    {
-        return Err(error(StatusCode::CONFLICT, "image name already exists"));
-    }
-    let work = app
-        .data_dir
-        .join("imports")
-        .join(Uuid::new_v4().to_string());
-    fs::create_dir_all(&work)
-        .await
-        .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let (artifact, docker_source) =
-        match build_docker_image(reference, &work, username, password).await {
-            Ok(built) => built,
-            Err(message) => {
-                fs::remove_dir_all(&work).await.ok();
-                return Err(error(StatusCode::BAD_REQUEST, message));
-            }
-        };
     let id = Uuid::new_v4();
+    let work = app.data_dir.join("imports").join(id.to_string());
+    let job = {
+        let cluster = app.cluster.read().await;
+        let mut jobs = app.imports.jobs.lock().unwrap();
+        if cluster.images.values().any(|image| image.name == name)
+            || jobs
+                .values()
+                .any(|entry| entry.job.status == ImportStatus::Running && entry.job.name == name)
+        {
+            return Err(error(StatusCode::CONFLICT, "image name already exists"));
+        }
+        let now = now_ms();
+        let job = ImportJob {
+            id,
+            name: name.clone(),
+            reference: reference.clone(),
+            status: ImportStatus::Running,
+            stage: "Queued".into(),
+            progress: None,
+            downloaded: 0,
+            total: None,
+            image: Uuid::new_v4(),
+            error: None,
+            created_at: now,
+            updated_at: now,
+            log: String::new(),
+        };
+        let mut finished = jobs
+            .values()
+            .filter(|entry| entry.job.status != ImportStatus::Running)
+            .map(|entry| (entry.job.created_at, entry.job.id))
+            .collect::<Vec<_>>();
+        finished.sort();
+        for (_, old) in finished.iter().rev().skip(KEPT_IMPORTS - 1) {
+            jobs.remove(old);
+        }
+        jobs.insert(
+            id,
+            ImportEntry {
+                job: job.clone(),
+                work: work.clone(),
+                task: None,
+            },
+        );
+        job
+    };
+    let progress = ImportProgress {
+        imports: app.imports.clone(),
+        id,
+        started: std::time::Instant::now(),
+    };
+    progress.log(format!("Importing {reference} as {name}"));
+    let image_id = job.image;
+    let task_app = app.clone();
+    let task = tokio::spawn(async move {
+        let result = run_import(
+            &task_app,
+            &progress,
+            &name,
+            &reference,
+            &work,
+            image_id,
+            username.as_deref(),
+            password.as_deref(),
+        )
+        .await;
+        fs::remove_dir_all(&work).await.ok();
+        match &result {
+            Ok(_) => {
+                progress.log("Imported successfully");
+                progress.update(|job| {
+                    job.status = ImportStatus::Succeeded;
+                    job.stage = "Imported".into();
+                    job.progress = Some(1.0);
+                });
+            }
+            Err(message) => {
+                progress.log(format!("Import failed: {message}"));
+                progress.update(|job| {
+                    job.status = ImportStatus::Failed;
+                    job.error = Some(message.clone());
+                });
+            }
+        }
+        result
+    });
+    if let Some(entry) = app.imports.jobs.lock().unwrap().get_mut(&id) {
+        entry.task = Some(task.abort_handle());
+    }
+    Ok((job, task))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_import(
+    app: &App,
+    progress: &ImportProgress,
+    name: &str,
+    reference: &str,
+    work: &Path,
+    id: Uuid,
+    username: Option<&str>,
+    password: Option<&str>,
+) -> Result<Image, String> {
+    fs::create_dir_all(work).await.map_err(|e| e.to_string())?;
+    let (artifact, docker_source) =
+        build_docker_image(progress, reference, work, username, password).await?;
     let path = app.data_dir.join("images").join(id.to_string());
     fs::rename(&artifact, &path)
         .await
-        .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    fs::remove_dir_all(&work).await.ok();
-    let size = fs::metadata(&path)
-        .await
-        .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .len();
+        .map_err(|e| e.to_string())?;
+    progress.stage("Hashing image", Some(0.96));
+    let size = fs::metadata(&path).await.map_err(|e| e.to_string())?.len();
+    let sha256 = hash_file(&path).await.map_err(|e| e.to_string())?;
+    progress.log(format!("{size} bytes, sha256 {sha256}"));
     let image = Image {
         id,
         name: name.into(),
-        sha256: hash_file(&path)
-            .await
-            .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+        sha256,
         size,
         compatible: true,
         kind: ImageKind::MicroVm,
@@ -484,79 +772,106 @@ async fn import_image(
         docker_source: Some(docker_source),
     };
     let mut cluster = app.cluster.write().await;
+    if cluster.images.values().any(|image| image.name == name) {
+        drop(cluster);
+        fs::remove_file(&path).await.ok();
+        return Err("image name already exists".into());
+    }
     for node in cluster.nodes.values_mut() {
         node.status = NodeStatus::Syncing;
     }
     cluster.images.insert(id, image.clone());
-    save(&app, &cluster).await?;
-    Ok((StatusCode::CREATED, Json(image)))
+    save(app, &cluster)
+        .await
+        .map_err(|(_, Json(body))| body["error"].as_str().unwrap_or("save failed").to_owned())?;
+    Ok(image)
 }
 
 async fn build_docker_image(
+    progress: &ImportProgress,
     reference: &str,
     work: &Path,
     username: Option<&str>,
     password: Option<&str>,
 ) -> Result<(PathBuf, String), String> {
-    pull_docker_image(reference, work, username, password).await?;
-    let inspect = command("docker", ["image", "inspect", reference]).await?;
-    let inspect: Vec<Value> = serde_json::from_str(&inspect).map_err(|e| e.to_string())?;
+    pull_docker_image(progress, reference, work, username, password).await?;
+    progress.stage("Checking image", Some(0.78));
+    progress.log(format!("$ docker image inspect {reference}"));
+    let inspect = command("docker", ["image", "inspect", reference]).await;
+    if let Err(message) = &inspect {
+        progress.log(format!("failed: {message}"));
+    }
+    let inspect: Vec<Value> = serde_json::from_str(&inspect?).map_err(|e| e.to_string())?;
     let platform = inspect.first().ok_or("Docker image was not found")?;
     let docker_source = platform["Id"]
         .as_str()
         .ok_or("Docker image has no content ID")?
         .to_owned();
+    progress.log(format!(
+        "{}/{} {docker_source}",
+        platform["Os"].as_str().unwrap_or("?"),
+        platform["Architecture"].as_str().unwrap_or("?")
+    ));
     if platform["Os"].as_str() != Some("linux")
         || platform["Architecture"].as_str() != Some("amd64")
     {
         return Err("Docker image must be linux/amd64".into());
     }
-    command(
-        "docker",
-        [
-            "run",
-            "--rm",
-            "--entrypoint",
-            "/usr/bin/python3",
-            reference,
-            "-c",
-            "import sys",
-        ],
-    )
-    .await
-    .map_err(|_| {
-        "Docker image must contain /usr/bin/python3 for the Scraperack guest agent".to_string()
-    })?;
+    progress
+        .run(
+            "docker",
+            [
+                "run",
+                "--rm",
+                "--entrypoint",
+                "/usr/bin/python3",
+                reference,
+                "-c",
+                "import sys",
+            ],
+        )
+        .await
+        .map_err(|_| {
+            "Docker image must contain /usr/bin/python3 for the Scraperack guest agent".to_string()
+        })?;
+    progress.stage("Exporting filesystem", Some(0.8));
     // The container is only exported, never started. Docker refuses to create one for an
     // image without an entrypoint or command, so give it the interpreter checked above.
-    let container = command(
-        "docker",
-        ["create", "--entrypoint", "/usr/bin/python3", reference],
-    )
-    .await?;
+    let container = progress
+        .run(
+            "docker",
+            ["create", "--entrypoint", "/usr/bin/python3", reference],
+        )
+        .await?;
     let container = container.trim();
     let archive = work.join("rootfs.tar");
-    let exported = command("docker", ["export", "--output", path(&archive)?, container]).await;
+    let exported = progress
+        .run("docker", ["export", "--output", path(&archive)?, container])
+        .await;
     let _ = command("docker", ["rm", "-f", container]).await;
     exported?;
+    progress.stage("Unpacking filesystem", Some(0.85));
     let root = work.join("rootfs");
     let state = work.join("fakeroot.state");
     fs::create_dir(&root).await.map_err(|e| e.to_string())?;
-    command(
-        "fakeroot",
-        [
-            "-s",
-            path(&state)?,
-            "--",
-            "tar",
-            "--numeric-owner",
-            "-xf",
-            path(&archive)?,
-            "-C",
-            path(&root)?,
-        ],
-    )
-    .await?;
+    progress
+        .run(
+            "fakeroot",
+            [
+                "-s",
+                path(&state)?,
+                "--",
+                "tar",
+                "--numeric-owner",
+                "-xf",
+                path(&archive)?,
+                "-C",
+                path(&root)?,
+            ],
+        )
+        .await?;
+    fs::remove_file(&archive).await.ok();
+    progress.stage("Installing guest agent", Some(0.88));
     let agent = work.join("scraperack-init");
     fs::write(&agent, include_bytes!("../guest/scraperack-init"))
         .await
@@ -576,6 +891,7 @@ async fn build_docker_image(
             .as_array()
             .is_some_and(|value| !value.is_empty())
     {
+        progress.log(format!("Service: {service}"));
         let service_path = work.join("scraperack-service.json");
         fs::write(&service_path, serde_json::to_vec(&service).unwrap())
             .await
@@ -588,7 +904,8 @@ async fn build_docker_image(
         )
         .await?;
     }
-    let used = command("du", ["-sb", path(&root)?]).await?;
+    progress.stage("Building root filesystem", Some(0.9));
+    let used = progress.run("du", ["-sb", path(&root)?]).await?;
     let used = used
         .split_whitespace()
         .next()
@@ -607,66 +924,173 @@ async fn build_docker_image(
         .set_len(size)
         .await
         .map_err(|e| e.to_string())?;
-    command(
-        "fakeroot",
-        [
-            "-i",
-            path(&state)?,
-            "--",
-            "mkfs.ext4",
-            "-q",
-            "-F",
-            "-d",
-            path(&root)?,
-            path(&artifact)?,
-        ],
-    )
-    .await?;
+    progress
+        .run(
+            "fakeroot",
+            [
+                "-i",
+                path(&state)?,
+                "--",
+                "mkfs.ext4",
+                "-q",
+                "-F",
+                "-d",
+                path(&root)?,
+                path(&artifact)?,
+            ],
+        )
+        .await?;
     Ok((artifact, docker_source))
 }
 
 async fn pull_docker_image(
+    progress: &ImportProgress,
     reference: &str,
     work: &Path,
     username: Option<&str>,
     password: Option<&str>,
 ) -> Result<(), String> {
     let authfile = work.join("registry-auth.json");
+    let result = pull_layers(progress, reference, work, &authfile, username, password).await;
+    fs::remove_file(authfile).await.ok();
+    result
+}
+
+async fn pull_layers(
+    progress: &ImportProgress,
+    reference: &str,
+    work: &Path,
+    authfile: &Path,
+    username: Option<&str>,
+    password: Option<&str>,
+) -> Result<(), String> {
+    let mut auth = Vec::new();
     if let (Some(username), Some(password)) = (username, password) {
-        command_input(
+        progress.stage("Signing in to registry", Some(0.0));
+        let registry = registry(reference);
+        progress.log(format!(
+            "$ skopeo login --username {username} --password-stdin {registry}"
+        ));
+        let login = command_input(
             "skopeo",
             [
                 "login",
                 "--tls-verify=false",
                 "--authfile",
-                path(&authfile)?,
+                path(authfile)?,
                 "--username",
                 username,
                 "--password-stdin",
-                registry(reference),
+                registry,
             ],
             password,
         )
-        .await?;
+        .await;
+        progress.log_output(&login);
+        login?;
+        auth = vec!["--authfile".to_owned(), path(authfile)?.to_owned()];
     }
-    let mut args = vec!["copy".to_owned(), "--src-tls-verify=false".to_owned()];
-    if username.is_some() {
-        args.extend(["--src-authfile".to_owned(), path(&authfile)?.to_owned()]);
-    }
-    let archive = work.join("docker-image.tar");
-    args.extend([
-        format!("docker://{reference}"),
-        format!("docker-archive:{}:{reference}", path(&archive)?),
-    ]);
-    let result = match command("skopeo", args).await {
-        Ok(_) => command("docker", ["load", "--input", path(&archive)?])
-            .await
-            .map(|_| ()),
-        Err(error) => Err(error),
+    progress.stage("Pulling", None);
+    // Layer sizes give the download a total to measure progress against.
+    let mut inspect = vec![
+        "inspect".to_owned(),
+        "--override-os=linux".to_owned(),
+        "--override-arch=amd64".to_owned(),
+        "--tls-verify=false".to_owned(),
+    ];
+    inspect.extend(auth.iter().cloned());
+    inspect.push(format!("docker://{reference}"));
+    let total = match command("skopeo", &inspect).await {
+        Ok(output) => serde_json::from_str::<Value>(&output)
+            .ok()
+            .and_then(|value| {
+                value["LayersData"].as_array().map(|layers| {
+                    (
+                        layers.len(),
+                        layers
+                            .iter()
+                            .filter_map(|layer| layer["Size"].as_u64())
+                            .sum::<u64>(),
+                    )
+                })
+            }),
+        Err(message) => {
+            progress.log(format!("Could not read the layer sizes: {message}"));
+            None
+        }
     };
-    fs::remove_file(authfile).await.ok();
+    if let Some((layers, bytes)) = total {
+        progress.log(format!("{layers} layers, {bytes} bytes to download"));
+        progress.update(|job| {
+            job.total = Some(bytes).filter(|bytes| *bytes > 0);
+            job.progress = job.total.map(|_| 0.0);
+        });
+    }
+    let layers = work.join("layers");
+    fs::create_dir_all(&layers)
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut copy = vec!["copy".to_owned(), "--src-tls-verify=false".to_owned()];
+    if !auth.is_empty() {
+        copy.extend(["--src-authfile".to_owned(), path(authfile)?.to_owned()]);
+    }
+    copy.extend([
+        format!("docker://{reference}"),
+        format!("dir:{}", path(&layers)?),
+    ]);
+    let pulling = progress.run("skopeo", copy);
+    tokio::pin!(pulling);
+    let pulled = loop {
+        tokio::select! {
+            result = &mut pulling => break result,
+            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                let downloaded = directory_size(&layers).await;
+                progress.update(|job| {
+                    job.downloaded = downloaded;
+                    if let Some(total) = job.total {
+                        job.progress = Some(PULL_SHARE * (downloaded as f64 / total as f64).min(1.0));
+                    }
+                });
+            }
+        }
+    };
+    pulled?;
+    let downloaded = directory_size(&layers).await;
+    progress.update(|job| {
+        job.downloaded = downloaded;
+        job.total = job.total.map(|total| total.max(downloaded));
+    });
+    progress.stage("Loading into Docker", Some(PULL_SHARE));
+    let archive = work.join("docker-image.tar");
+    let packed = progress
+        .run(
+            "skopeo",
+            [
+                "copy".to_owned(),
+                format!("dir:{}", path(&layers)?),
+                format!("docker-archive:{}:{reference}", path(&archive)?),
+            ],
+        )
+        .await;
+    fs::remove_dir_all(&layers).await.ok();
+    packed?;
+    let loaded = progress
+        .run("docker", ["load", "--input", path(&archive)?])
+        .await;
     fs::remove_file(archive).await.ok();
-    result
+    loaded.map(|_| ())
+}
+
+async fn directory_size(directory: &Path) -> u64 {
+    let mut total = 0;
+    if let Ok(mut entries) = fs::read_dir(directory).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            if let Ok(metadata) = entry.metadata().await {
+                total += metadata.len();
+            }
+        }
+    }
+    total
 }
 
 fn registry(reference: &str) -> &str {
@@ -713,6 +1137,7 @@ where
 {
     let output = Command::new(program)
         .args(args)
+        .kill_on_drop(true)
         .output()
         .await
         .map_err(|e| format!("{program}: {e}"))?;
@@ -732,6 +1157,7 @@ where
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .kill_on_drop(true)
         .spawn()
         .map_err(|e| format!("{program}: {e}"))?;
     child
@@ -905,6 +1331,11 @@ async fn delete_image(
     }
     save(&app, &cluster).await?;
     drop(cluster);
+    app.imports
+        .jobs
+        .lock()
+        .unwrap()
+        .retain(|_, entry| entry.job.image != id);
     fs::remove_file(app.data_dir.join("images").join(id.to_string()))
         .await
         .ok();
@@ -2146,6 +2577,7 @@ mod tests {
             data_dir,
             tasks: Arc::new(Notify::new()),
             work: Arc::new(Notify::new()),
+            imports: Arc::default(),
         }
     }
 
@@ -2431,6 +2863,63 @@ mod tests {
         )
         .await;
         assert_eq!(result.unwrap_err().0, StatusCode::FORBIDDEN);
+        fs::remove_dir_all(app.data_dir).await.unwrap();
+    }
+
+    fn import_request(name: &str) -> ImportImage {
+        ImportImage {
+            name: name.into(),
+            reference: "https://registry.invalid/acme/browser:latest".into(),
+            username: None,
+            password: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn imports_run_in_the_background_and_keep_their_log() {
+        let app = app().await;
+        let (StatusCode::ACCEPTED, Json(job)) =
+            create_import(State(app.clone()), Json(import_request("browser")))
+                .await
+                .unwrap()
+        else {
+            panic!("import should be accepted");
+        };
+        assert_eq!(job.reference, "registry.invalid/acme/browser:latest");
+        let taken = create_import(State(app.clone()), Json(import_request("browser")))
+            .await
+            .unwrap_err();
+        assert!(
+            taken.0 == StatusCode::CONFLICT
+                || app.imports.jobs.lock().unwrap()[&job.id].job.status != ImportStatus::Running,
+            "a running import reserves its name"
+        );
+        let finished = loop {
+            let Json(current) = get_import(State(app.clone()), AxumPath(job.id))
+                .await
+                .unwrap();
+            if current.status != ImportStatus::Running {
+                break current;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        assert_eq!(finished.status, ImportStatus::Failed);
+        assert!(finished.error.is_some());
+        assert!(finished.log.contains("Import failed"));
+        assert!(
+            !app.cluster
+                .read()
+                .await
+                .images
+                .contains_key(&finished.image)
+        );
+        let Json(listed) = list_imports(State(app.clone())).await;
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].log.is_empty(), "lists leave the log out");
+        delete_import(State(app.clone()), AxumPath(job.id))
+            .await
+            .unwrap();
+        assert!(list_imports(State(app.clone())).await.0.is_empty());
         fs::remove_dir_all(app.data_dir).await.unwrap();
     }
 }

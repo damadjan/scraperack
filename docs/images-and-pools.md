@@ -4,7 +4,8 @@
 
 An image is the root filesystem of a microVM, imported from a Docker image.
 
-**Images → Import** in the GUI, or `POST /v1/images/import`:
+**Images → Import image** in the GUI, or `POST /v1/images/imports` (background) or
+`POST /v1/images/import` (waits until done):
 
 ```json
 {"name": "python-runtime", "reference": "registry.example.com/python-runtime:3.10",
@@ -16,6 +17,11 @@ allowed), injects the guest agent, and converts the filesystem to ext4. Images n
 `/usr/bin/python3`, which the guest agent uses. The image's Docker entrypoint and command,
 if any, are started inside each microVM as its service, for example a browser listening on
 a port.
+
+An import job reports its `status` (`running`, `succeeded`, `failed`), `stage`, overall
+`progress` from 0 to 1 (layer download measured in bytes), and a log of every step. The GUI
+shows running imports as rows with a progress bar; clicking a row opens its log. Jobs are
+kept in controller memory (the last 50 finished ones) and are lost on restart.
 
 Nodes download images in the background. A pool can use an image once `ready` is true,
 meaning every ready node has it. Images can be renamed (`PATCH`) or deleted when no pool
