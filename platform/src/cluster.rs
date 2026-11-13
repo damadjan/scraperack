@@ -126,6 +126,12 @@ pub struct PluginRecord {
     /// Guest disk of `previous_version`, kept so a rollback can use it.
     #[serde(default)]
     pub previous_guest_disk: Option<String>,
+    /// Content digest of the guest folder `guest_disk` was built from; an
+    /// update with the same files reuses the disk so microVMs keep running.
+    #[serde(default)]
+    pub guest_digest: Option<String>,
+    #[serde(default)]
+    pub previous_guest_digest: Option<String>,
     pub installed_at_ms: u64,
 }
 
