@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scraperack"
+version = "0.3.0a1"
+description = "Python client for the ScrapeRack core API: microVM pools, images, disks and tasks"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["httpx>=0.27"]
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+classifiers = ["Development Status :: 3 - Alpha"]
+
+[project.urls]
+Repository = "https://github.com/damadjan/scraperack"
+Issues = "https://github.com/damadjan/scraperack/issues"
+
+[tool.setuptools]
+packages = ["scraperack"]
+
+[tool.setuptools.package-data]
+scraperack = ["py.typed"]

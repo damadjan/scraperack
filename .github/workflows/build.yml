@@ -54,9 +54,14 @@ jobs:
       - name: Check Python
         run: |
           pip install ruff
-          ruff check --select E4,E7,E9,F platform/gui platform/guest/scraperack-init
+          ruff check --select E4,E7,E9,F platform/gui platform/guest/scraperack-init sdk
           python -m compileall -q platform/gui
           python -m py_compile platform/guest/scraperack-init
+
+      - name: Test SDK
+        run: |
+          pip install ./sdk
+          (cd sdk && python -m unittest discover -s tests)
 
       - name: Check shell scripts
         run: sh -n install.sh platform/deploy/*.sh
