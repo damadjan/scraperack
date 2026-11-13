@@ -1,4 +1,4 @@
-"""Python client for the ScrapeRack core API.
+"""Python client for the Scraperack core API.
 
 Workload SDKs build on it; Python functions are run with ``scraperack-python``.
 """

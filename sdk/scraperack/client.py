@@ -1,4 +1,4 @@
-"""Clients for the ScrapeRack core API: microVMs, pools, images, disks and tasks.
+"""Clients for the Scraperack core API: microVMs, pools, images, disks and tasks.
 
 Language plugins ship their own SDKs on top of this one; for Python code see
 ``scraperack-python``.
@@ -137,7 +137,7 @@ def _task_query(limit: int | None, pool: str | Sequence[str] | None, owner: str 
 
 
 class Cluster:
-    """Synchronous client for a ScrapeRack controller."""
+    """Synchronous client for a Scraperack controller."""
 
     def __init__(self, url: str = DEFAULT_URL, *, client: httpx.Client | None = None) -> None:
         self.url = url.rstrip("/")
@@ -274,7 +274,7 @@ class Cluster:
 
 
 class AsyncCluster:
-    """Asynchronous client for a ScrapeRack controller."""
+    """Asynchronous client for a Scraperack controller."""
 
     def __init__(self, url: str = DEFAULT_URL, *, client: httpx.AsyncClient | None = None) -> None:
         self.url = url.rstrip("/")

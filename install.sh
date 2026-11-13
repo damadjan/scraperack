@@ -41,7 +41,7 @@ fi
 usermod -aG docker,kvm "$user"
 group=$(id -gn "$user")
 
-echo "Downloading ScrapeRack $release"
+echo "Downloading Scraperack $release"
 base="https://github.com/$repo/releases/download/$release"
 archive=scraperack-linux-x86_64.tar.gz
 curl -fsSL "$base/$archive" -o "$work/$archive"
@@ -137,7 +137,7 @@ systemctl daemon-reload
 if [ "$role" = node ]; then
     systemctl disable --now scraperack-controller scraperack-gui
     systemctl enable --now scraperack-dns scraperack-node
-    echo "ScrapeRack node is running"
+    echo "Scraperack node is running"
     exit
 fi
 systemctl enable --now scraperack-controller scraperack-dns scraperack-node scraperack-gui
@@ -154,6 +154,6 @@ until [ "$(curl -fsS http://127.0.0.1:7070/v1/nodes 2>/dev/null)" != "[]" ] && \
 done
 
 address=$(hostname -I | awk '{ print $1 }')
-echo "ScrapeRack is running"
+echo "Scraperack is running"
 echo "Controller: http://$address:7070"
 echo "GUI:        http://$address:8080"

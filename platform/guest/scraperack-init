@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""ScrapeRack guest agent.
+"""Scraperack guest agent.
 
 Runs as PID 1 inside every microVM. It is workload-agnostic: the pool tells it,
 in the first ``scraperack-snapshot`` request, which extra disks to mount and

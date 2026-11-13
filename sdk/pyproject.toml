@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "scraperack"
 version = "0.3.0a2"
-description = "Python client for the ScrapeRack core API: microVM pools, images, disks and tasks"
+description = "Python client for the Scraperack core API: microVM pools, images, disks and tasks"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = ["httpx>=0.27,<1"]

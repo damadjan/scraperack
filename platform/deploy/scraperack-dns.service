@@ -1,5 +1,5 @@
 [Unit]
-Description=ScrapeRack node-local DNS proxy
+Description=Scraperack node-local DNS proxy
 After=network-online.target
 Wants=network-online.target
 

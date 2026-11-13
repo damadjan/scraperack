@@ -859,7 +859,7 @@ async def settings_page():
             save_storage.on_click(update_storage)
         with ui.card().classes("panel"):
             ui.label("Join nodes").classes("section-title")
-            ui.label("Generate a single-use command for an existing ScrapeRack installation.") \
+            ui.label("Generate a single-use command for an existing Scraperack installation.") \
                 .classes("text-sm muted")
             with ui.row().classes("items-end w-full"):
                 controller_url = ui.input(
