@@ -73,4 +73,5 @@ unused images and pools to free it; nodes remove snapshots of pools that no long
 | `image is still distributing` | Wait for **Images** to show it on every ready node |
 | Node stuck `syncing` | It is still downloading images or disks; check its free space |
 | No network inside VMs | `network` must be on for the pool; `systemctl status scraperack-dns`; `sysctl net.ipv4.ip_forward` |
+| Slow VM starts, node log says `/dev/userfaultfd is not usable` | The node service gives group `kvm` access to `/dev/userfaultfd` (Linux 6.1+); check `ls -l /dev/userfaultfd` |
 | 507 on submit | Task storage is full of active tasks; raise the limit or lower concurrency |

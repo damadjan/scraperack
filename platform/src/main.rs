@@ -4,6 +4,7 @@ mod join;
 mod node;
 mod plugins;
 mod storage;
+mod uffd;
 
 use std::{
     net::{IpAddr, SocketAddr},

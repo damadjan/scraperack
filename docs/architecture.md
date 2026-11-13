@@ -71,3 +71,10 @@ preload modules, then snapshots it. Every later VM of that pool is restored from
 snapshot. Changing a VM-affecting pool setting (image, CPU, memory, disk size, disks,
 executor, network, ports, preload, reuse) bumps the pool's `revision`: idle VMs are replaced and running ones finish
 first.
+
+Restores are fast because the guest does not fault its memory in page by page. Firecracker
+hands the guest memory to the node over userfaultfd; the first restore of each snapshot
+records which pages it touches in its first 15 seconds (`working-set.json` next to the
+snapshot), and later restores copy exactly those pages in before the VM resumes. The
+restored guest then gets its clock, network and preload in one request. Set
+`SCRAPERACK_NODE_PREFAULT=0` in `/etc/scraperack/node.env` to map the memory file instead.
