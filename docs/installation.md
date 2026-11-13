@@ -33,7 +33,7 @@ Pin a release instead of the rolling build with `SCRAPERACK_RELEASE=<tag>`.
 
 ## Add nodes
 
-1. Install ScrapeRack on the new machine with the same command.
+1. Install Scraperack on the new machine with the same command.
 2. In the GUI open **Settings → Join nodes**, check the controller URL, optionally name the
    node, and generate the command. It is single-use and valid for ten minutes.
 3. Run the command on the new machine.

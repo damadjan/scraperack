@@ -1,4 +1,4 @@
-# ScrapeRack documentation
+# Scraperack documentation
 
 | Page | What it covers |
 |---|---|

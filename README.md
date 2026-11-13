@@ -1,6 +1,6 @@
-# ScrapeRack
+# Scraperack
 
-Self-hosted Firecracker microVMs for dense, short-lived workloads. ScrapeRack keeps pools of
+Self-hosted Firecracker microVMs for dense, short-lived workloads. Scraperack keeps pools of
 warm microVMs across a cluster of Linux machines, restores new ones from snapshots in a few
 hundred milliseconds, and sends work to them. The core only runs microVMs; plugins decide
 what runs inside them, such as Python functions or browser fleets.

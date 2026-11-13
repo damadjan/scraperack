@@ -1,6 +1,6 @@
 # Architecture
 
-ScrapeRack runs short-lived workloads in Firecracker microVMs across a cluster of Linux
+Scraperack runs short-lived workloads in Firecracker microVMs across a cluster of Linux
 machines. The core knows nothing about what runs inside the VMs: it schedules microVMs and
 moves opaque payloads to them. Plugins give the payloads a meaning.
 

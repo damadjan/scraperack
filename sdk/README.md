@@ -1,12 +1,12 @@
-# ScrapeRack core SDK
+# Scraperack core SDK
 
-Python client for the ScrapeRack core API: images, microVM pools, disks, tasks, and live
+Python client for the Scraperack core API: images, microVM pools, disks, tasks, and live
 inventory. The core only runs microVMs; what runs inside them is up to plugins.
 
 To run Python functions, use [`scraperack-python`](https://github.com/damadjan/scraperack-plugins/tree/main/python/sdk),
 the Python plugin's SDK, which builds on this package.
 
-> ScrapeRack is alpha software. Use it on trusted infrastructure and expect breaking changes.
+> Scraperack is alpha software. Use it on trusted infrastructure and expect breaking changes.
 
 ```sh
 pip install scraperack
