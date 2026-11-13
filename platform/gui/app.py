@@ -159,12 +159,12 @@ PLUGIN_ICONS = {
 
 def shell(active, plugins=()):
     """Page layout; ``plugins`` lists installed plugins for their sidebar entries."""
-    ui.colors(primary="#14b8a6")
+    ui.colors(primary="#d946ef")
     ui.dark_mode().enable()
     drawer = ui.left_drawer(value=True).props("width=220 breakpoint=800").classes("compact-drawer")
     with drawer:
         with ui.row().classes("items-center gap-2 px-2 py-2"):
-            ui.icon("developer_board", size="28px").classes("text-cyan-300")
+            ui.icon("developer_board", size="28px").classes("text-primary")
             with ui.column().classes("gap-0"):
                 ui.label("SCRAPERACK").classes("text-lg font-semibold text-white tracking-wide")
                 ui.label("MicroVM cluster").classes("text-xs muted")
@@ -227,7 +227,7 @@ def summary(icon, label, value, detail):
                 ui.label(label).classes("text-sm muted")
                 value_label = ui.label(value).classes("metric")
                 detail_label = ui.label(detail).classes("text-xs muted")
-            ui.icon(icon, size="30px").classes("text-teal-600")
+            ui.icon(icon, size="30px").classes("text-primary")
     return value_label, detail_label
 
 
@@ -543,7 +543,7 @@ async def pools_page():
                 reuse = ui.switch("Reuse VMs", value=True)
                 networking = ui.switch("Networking", value=True)
                 ports = ui.input("Ports", placeholder="vnc=5900, cdp=9222").classes("w-72")
-                create_button = ui.button("Create", icon="add").props("unelevated no-caps color=teal")
+                create_button = ui.button("Create", icon="add").props("unelevated no-caps color=primary")
         with ui.row().classes("items-center w-full"):
             ui.label("VM Pools").classes("section-title")
             ui.space()
@@ -630,7 +630,7 @@ def install_dialog(on_installed):
         with ui.row().classes("w-full items-center"):
             status = ui.label().classes("text-sm muted")
             ui.space()
-            install_button = ui.button("Install", icon="download_done").props("unelevated no-caps color=teal")
+            install_button = ui.button("Install", icon="download_done").props("unelevated no-caps color=primary")
             install_button.set_visibility(False)
 
         async def uploaded(event):
@@ -709,7 +709,7 @@ async def plugins_page():
         with ui.row().classes("items-center w-full"):
             ui.label("Plugins").classes("section-title")
             ui.space()
-            install_button = ui.button("Install plugin", icon="add").props("unelevated no-caps color=teal")
+            install_button = ui.button("Install plugin", icon="add").props("unelevated no-caps color=primary")
         ui.label("Plugins add workload types to this cluster. Click a plugin to manage it.") \
             .classes("text-sm muted")
         plugins = table([
@@ -759,7 +759,7 @@ async def plugins_page():
                     rollback_button = None
                 toggle_button = ui.button("Disable" if plugin["enabled"] else "Enable",
                                           icon="pause" if plugin["enabled"] else "play_arrow") \
-                    .props("unelevated no-caps color=teal")
+                    .props("unelevated no-caps color=primary")
 
         async def act(method, path, done):
             status.set_text("Working…")
@@ -886,7 +886,7 @@ async def settings_page():
                                       min=1, max=24, suffix="hours").classes("w-48")
                 limit = ui.number("Maximum storage", value=storage["max_storage_bytes"] / 1024**3,
                                   min=.1, step=.1, suffix="GiB").classes("w-56")
-                save_storage = ui.button("Save", icon="save").props("unelevated no-caps color=teal")
+                save_storage = ui.button("Save", icon="save").props("unelevated no-caps color=primary")
             usage = ui.label(
                 f'{size(storage["used_storage_bytes"])} used of {size(storage["max_storage_bytes"])}'
             ).classes("text-sm muted")
@@ -921,7 +921,7 @@ async def settings_page():
                 ).classes("grow")
                 node_name = ui.input("Node name", placeholder="Defaults to its hostname").classes("w-64")
                 generate = ui.button("Generate command", icon="add_link").props(
-                    "unelevated no-caps color=teal"
+                    "unelevated no-caps color=primary"
                 )
             command = ui.textarea("Join command").props("readonly autogrow").classes("w-full")
             command.set_visibility(False)
