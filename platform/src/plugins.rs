@@ -37,7 +37,7 @@ use crate::api::{
     ApiResult, App, Caller, error, internal_error, now_ms, remove_unused_disk, save,
     store_disk_file,
 };
-use crate::cluster::{ExecutionStatus, PluginRecord};
+use crate::cluster::{PluginRecord, TaskStatus};
 
 const MANIFEST: &str = "scraperack-plugin.toml";
 const MAX_UPLOAD_BYTES: usize = 256 * 1024 * 1024;
@@ -925,16 +925,16 @@ pub async fn remove_plugin(
             .filter(|pool| pool.managed_by.as_deref() == Some(owner.as_str()))
             .map(|pool| pool.name.clone())
             .collect::<Vec<_>>();
-        if cluster.executions.values().any(|execution| {
-            owned.contains(&execution.pool)
+        if cluster.tasks.values().any(|task| {
+            owned.contains(&task.pool)
                 && matches!(
-                    execution.status,
-                    ExecutionStatus::Queued | ExecutionStatus::Assigned | ExecutionStatus::Running
+                    task.status,
+                    TaskStatus::Queued | TaskStatus::Assigned | TaskStatus::Running
                 )
         }) {
             return Err(error(
                 StatusCode::CONFLICT,
-                "plugin pools have active executions",
+                "plugin pools have active tasks",
             ));
         }
     }

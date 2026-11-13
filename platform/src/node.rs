@@ -28,8 +28,8 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::cluster::{
-    Disk, ExecutionMetricPoint, ExecutionMetrics, Image, MicroVm, Pool, PortProtocol,
-    PublishedPort, VmStatus, Work,
+    Disk, Image, MicroVm, Pool, PortProtocol, PublishedPort, TaskMetricPoint, TaskMetrics,
+    VmStatus, Work,
 };
 
 const GUEST_PORT: u32 = 5000;
@@ -141,7 +141,7 @@ struct Completion {
     error: Option<String>,
     timed_out: bool,
     #[serde(default)]
-    metrics: Option<ExecutionMetrics>,
+    metrics: Option<TaskMetrics>,
     #[serde(default)]
     keep_idle: bool,
 }
@@ -202,7 +202,7 @@ impl VmState {
                 id: vm.id,
                 pool: vm.pool.name.clone(),
                 status: VmStatus::Idle,
-                execution: None,
+                task: None,
                 pid: vm.child.id(),
                 cpu_millis: vm.pool.cpu_millis,
                 memory_mib: vm.pool.memory_mib,
@@ -699,8 +699,8 @@ pub async fn run(
             let network = network.clone();
             let vms = vms.clone();
             tokio::spawn(async move {
-                let execution = &work.execution;
-                let completion = run_execution(
+                let task = &work.task;
+                let completion = run_task(
                     &client,
                     &controller,
                     &firecracker,
@@ -715,16 +715,13 @@ pub async fn run(
                 )
                 .await;
                 if let Err(error) = client
-                    .post(format!(
-                        "{controller}/internal/executions/{}/complete",
-                        execution.id
-                    ))
+                    .post(format!("{controller}/internal/tasks/{}/complete", task.id))
                     .json(&completion)
                     .send()
                     .await
                     .and_then(reqwest::Response::error_for_status)
                 {
-                    tracing::error!(id = %execution.id, %error, "failed to report completion");
+                    tracing::error!(id = %task.id, %error, "failed to report completion");
                 }
             });
         }
@@ -913,7 +910,7 @@ async fn ensure_working_dir(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_execution(
+async fn run_task(
     client: &Client,
     controller: &str,
     firecracker: &Path,
@@ -927,7 +924,7 @@ async fn run_execution(
     vms: &Mutex<VmState>,
 ) -> Completion {
     let working_dir = work
-        .execution
+        .task
         .payload
         .get("working_dir")
         .and_then(Value::as_str)
@@ -1012,8 +1009,8 @@ async fn run_execution(
         None
     };
     tracing::info!(
-        id = %work.execution.id,
-        pool = %work.execution.pool,
+        id = %work.task.id,
+        pool = %work.task.pool,
         vm = %vm.id,
         reused,
         "executing in microVM"
@@ -1024,7 +1021,7 @@ async fn run_execution(
             id: vm.id,
             pool: work.pool.name.clone(),
             status: VmStatus::Running,
-            execution: Some(work.execution.id),
+            task: Some(work.task.id),
             pid: vm.child.id(),
             cpu_millis: work.pool.cpu_millis,
             memory_mib: work.pool.memory_mib,
@@ -1037,7 +1034,7 @@ async fn run_execution(
             environment: work.pool.environment,
         },
     );
-    let mut payload = work.execution.payload.clone();
+    let mut payload = work.task.payload.clone();
     if let Some(payload) = payload.as_object_mut() {
         payload.remove("working_dir");
     }
@@ -1053,11 +1050,11 @@ async fn run_execution(
     {
         payload.remove("function");
     }
-    if !work.execution.variables.is_empty() || !work.secrets.is_empty() || working_dir.is_some() {
+    if !work.task.variables.is_empty() || !work.secrets.is_empty() || working_dir.is_some() {
         payload = json!({
             "encoding": "scraperack-invocation",
             "payload": payload,
-            "variables": &work.execution.variables,
+            "variables": &work.task.variables,
             "secrets": &work.secrets,
             "working_dir": working_dir.as_ref().map(|digest| json!({
                 "hash": digest,
@@ -1138,7 +1135,7 @@ async fn run_execution(
         Err(_) => (
             Completion {
                 result: None,
-                error: Some("execution timed out".into()),
+                error: Some("task timed out".into()),
                 timed_out: true,
                 metrics: None,
                 keep_idle: false,
@@ -1147,7 +1144,7 @@ async fn run_execution(
         ),
     };
     completion.metrics = cgroup.map(|_| {
-        execution_metrics(
+        task_metrics(
             &before,
             &after,
             wall_time_usec,
@@ -1881,16 +1878,16 @@ async fn firecracker_request(method: &str, socket: &Path, path: &str, body: &Val
     Ok(())
 }
 
-fn execution_metrics(
+fn task_metrics(
     before: &VmCounters,
     after: &VmCounters,
     wall_time_usec: u64,
     memory_total: u128,
     memory_count: u64,
-    samples: Vec<ExecutionMetricPoint>,
+    samples: Vec<TaskMetricPoint>,
     pool: &Pool,
-) -> ExecutionMetrics {
-    ExecutionMetrics {
+) -> TaskMetrics {
+    TaskMetrics {
         average_cpu_percent: cpu_percent(
             after.cpu_usage_usec.saturating_sub(before.cpu_usage_usec),
             wall_time_usec,
@@ -1909,7 +1906,7 @@ fn execution_metrics(
 }
 
 fn push_metric_sample(
-    samples: &mut Vec<ExecutionMetricPoint>,
+    samples: &mut Vec<TaskMetricPoint>,
     before: &VmCounters,
     after: &VmCounters,
     before_elapsed_us: u64,
@@ -1936,8 +1933,8 @@ fn metric_point(
     cpu_percent: f32,
     memory_bytes: u64,
     pool: &Pool,
-) -> ExecutionMetricPoint {
-    ExecutionMetricPoint {
+) -> TaskMetricPoint {
+    TaskMetricPoint {
         elapsed_ms,
         cpu_percent,
         memory_percent: memory_percent(memory_bytes, pool.memory_mib),

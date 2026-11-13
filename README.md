@@ -21,8 +21,9 @@ platform/      Rust controller and node, guest agent, GUI, and deployment files
 images/        Docker build contexts imported as VM images
 ```
 
-Workload types live in plugins, outside this repository. The Python execution environments
-plugin and the `scraperack` Python SDK are in
+The core only runs microVMs. Workload types live in plugins, outside this repository: what a
+task's payload means, and the history of what users ran, belong to the plugin. The Python
+plugin (environments and executions) and the `scraperack` Python SDK are in
 [scraperack-plugins](https://github.com/damadjan/scraperack-plugins).
 
 ## Core
@@ -32,11 +33,11 @@ plugin and the `scraperack` Python SDK are in
 - Pools of microVMs with automatic snapshots, warm instances, idle expiry, reuse, and scale-out limits
 - Pool revisions: changing a pool's VM settings replaces its idle microVMs without dropping work
 - Read-only ext4 disks, content-addressed, distributed to and cached on every node
-- Executions: payloads sent to a pool's executor over virtio-vsock, with stdout, stderr, results, and hard timeouts
-- Invocation-scoped variables and encrypted secrets, content-addressed working directories
+- Tasks (`/v1/tasks`): opaque payloads queued, scheduled onto a warm microVM, and sent to its pool's executor over virtio-vsock, with stdout, stderr, results, metrics, and hard timeouts. Each task records its pool's owner so plugins can list their own (`?owner=plugin:<name>` or `?pool=a,b`)
+- Task-scoped variables and encrypted secrets, content-addressed working directories
 - Per-VM CPU, memory, and disk limits with owner-managed aggregate overcommit
 - Round-robin node scheduling with queue-or-fail submission
-- Persistent execution history and cluster metadata
+- Short-lived task storage (retention and size limits) and persistent cluster metadata
 - Optional per-VM TAP networking with outbound NAT and TCP/UDP host-port publishing
 - Shared read-only golden rootfs with isolated in-memory workspaces
 - cgroup v2 CPU, memory, and PID limits
@@ -45,7 +46,7 @@ plugin and the `scraperack` Python SDK are in
 
 VM images contain only the core `/sbin/scraperack-init` guest agent. A pool may attach
 extra read-only disks, mounted in order at the paths it names, and an `executor` command
-that the agent starts to handle execution payloads. Pools without an executor only
+that the agent starts to handle task payloads. Pools without an executor only
 provide microVMs, for example browsers reached through published ports.
 
 The Images page imports `linux/amd64` Docker images by registry reference. The controller accepts an optional registry username and password, permits plain HTTP and untrusted TLS registries by default, injects the core agent, requires `/usr/bin/python3` for it, and converts the filesystem to ext4. Docker and Skopeo must be available to the controller service.

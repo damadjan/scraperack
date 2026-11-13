@@ -16,7 +16,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::cluster::{Cluster, Execution, ExecutionStatus, ExecutionView};
+use crate::cluster::{Cluster, Task, TaskStatus, TaskView};
 
 const DEFAULT_RETENTION_MS: u64 = 24 * 60 * 60 * 1000;
 const DEFAULT_STORAGE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -37,7 +37,7 @@ impl SecretCipher {
         let mut key = [0; 32];
         SystemRandom::new()
             .fill(&mut key)
-            .map_err(|_| anyhow::anyhow!("could not generate execution secret key"))?;
+            .map_err(|_| anyhow::anyhow!("could not generate task secret key"))?;
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -59,38 +59,40 @@ impl SecretCipher {
     }
 
     fn from_bytes(value: &[u8]) -> Result<Self> {
-        Ok(Self(value.try_into().map_err(|_| {
-            anyhow::anyhow!("invalid execution secret key")
-        })?))
+        Ok(Self(
+            value
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("invalid task secret key"))?,
+        ))
     }
 
-    pub fn encrypt(&self, execution: Uuid, secrets: &HashMap<String, String>) -> Result<Vec<u8>> {
+    pub fn encrypt(&self, task: Uuid, secrets: &HashMap<String, String>) -> Result<Vec<u8>> {
         if secrets.is_empty() {
             return Ok(Vec::new());
         }
         let mut nonce = [0; 12];
         SystemRandom::new()
             .fill(&mut nonce)
-            .map_err(|_| anyhow::anyhow!("could not generate execution secret nonce"))?;
+            .map_err(|_| anyhow::anyhow!("could not generate task secret nonce"))?;
         let mut encrypted = serde_json::to_vec(secrets)?;
         self.key()?
             .seal_in_place_append_tag(
                 Nonce::assume_unique_for_key(nonce),
-                Aad::from(execution.as_bytes()),
+                Aad::from(task.as_bytes()),
                 &mut encrypted,
             )
-            .map_err(|_| anyhow::anyhow!("could not encrypt execution secrets"))?;
+            .map_err(|_| anyhow::anyhow!("could not encrypt task secrets"))?;
         let mut result = nonce.to_vec();
         result.extend(encrypted);
         Ok(result)
     }
 
-    pub fn decrypt(&self, execution: Uuid, encrypted: &[u8]) -> Result<HashMap<String, String>> {
+    pub fn decrypt(&self, task: Uuid, encrypted: &[u8]) -> Result<HashMap<String, String>> {
         if encrypted.is_empty() {
             return Ok(HashMap::new());
         }
         if encrypted.len() < 12 {
-            anyhow::bail!("invalid encrypted execution secrets");
+            anyhow::bail!("invalid encrypted task secrets");
         }
         let (nonce, encrypted) = encrypted.split_at(12);
         let mut plaintext = encrypted.to_vec();
@@ -98,17 +100,17 @@ impl SecretCipher {
             .key()?
             .open_in_place(
                 Nonce::assume_unique_for_key(nonce.try_into().unwrap()),
-                Aad::from(execution.as_bytes()),
+                Aad::from(task.as_bytes()),
                 &mut plaintext,
             )
-            .map_err(|_| anyhow::anyhow!("could not decrypt execution secrets"))?;
+            .map_err(|_| anyhow::anyhow!("could not decrypt task secrets"))?;
         Ok(serde_json::from_slice(plaintext)?)
     }
 
     fn key(&self) -> Result<LessSafeKey> {
         Ok(LessSafeKey::new(
             UnboundKey::new(&AES_256_GCM, &self.0)
-                .map_err(|_| anyhow::anyhow!("invalid execution secret key"))?,
+                .map_err(|_| anyhow::anyhow!("invalid task secret key"))?,
         ))
     }
 }
@@ -135,12 +137,20 @@ impl Database {
         if new {
             connection.execute_batch("PRAGMA auto_vacuum=INCREMENTAL; VACUUM;")?;
         }
+        if table_exists(&connection, "executions")? && !table_exists(&connection, "tasks")? {
+            connection.execute_batch(
+                "ALTER TABLE executions RENAME TO tasks;
+                 DROP INDEX IF EXISTS executions_created;
+                 DROP INDEX IF EXISTS executions_finished;
+                 DROP INDEX IF EXISTS executions_status;",
+            )?;
+        }
         connection.execute_batch(
             "CREATE TABLE IF NOT EXISTS metadata (
                 key TEXT PRIMARY KEY,
                 value BLOB NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS executions (
+            CREATE TABLE IF NOT EXISTS tasks (
                 id TEXT PRIMARY KEY,
                 pool TEXT NOT NULL,
                 node TEXT,
@@ -151,25 +161,34 @@ impl Database {
                 created_at_ms INTEGER NOT NULL,
                 started_at_ms INTEGER,
                 finished_at_ms INTEGER,
-                environment TEXT,
                 metrics BLOB,
                 variables BLOB NOT NULL DEFAULT X'7B7D',
                 secrets BLOB,
                 size_bytes INTEGER NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS executions_created ON executions(created_at_ms DESC);
-            CREATE INDEX IF NOT EXISTS executions_finished ON executions(finished_at_ms);
-            CREATE INDEX IF NOT EXISTS executions_status ON executions(status);",
+            CREATE INDEX IF NOT EXISTS tasks_created ON tasks(created_at_ms DESC);
+            CREATE INDEX IF NOT EXISTS tasks_finished ON tasks(finished_at_ms);
+            CREATE INDEX IF NOT EXISTS tasks_status ON tasks(status);",
         )?;
-        if !column_exists(&connection, "executions", "variables")? {
+        if !column_exists(&connection, "tasks", "variables")? {
             connection.execute(
-                "ALTER TABLE executions ADD COLUMN variables BLOB NOT NULL DEFAULT X'7B7D'",
+                "ALTER TABLE tasks ADD COLUMN variables BLOB NOT NULL DEFAULT X'7B7D'",
                 [],
             )?;
         }
-        if !column_exists(&connection, "executions", "secrets")? {
-            connection.execute("ALTER TABLE executions ADD COLUMN secrets BLOB", [])?;
+        if !column_exists(&connection, "tasks", "secrets")? {
+            connection.execute("ALTER TABLE tasks ADD COLUMN secrets BLOB", [])?;
         }
+        if column_exists(&connection, "tasks", "environment")? {
+            connection.execute("ALTER TABLE tasks DROP COLUMN environment", [])?;
+        }
+        if !column_exists(&connection, "tasks", "owner")? {
+            connection.execute("ALTER TABLE tasks ADD COLUMN owner TEXT", [])?;
+        }
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS tasks_owner ON tasks(owner, created_at_ms DESC)",
+            [],
+        )?;
         let database = Self(Arc::new(Mutex::new(connection)));
         database.set_default("retention_ms", DEFAULT_RETENTION_MS)?;
         database.set_default("max_storage_bytes", DEFAULT_STORAGE_BYTES)?;
@@ -231,41 +250,38 @@ impl Database {
         Ok(())
     }
 
-    pub fn load_active_executions(&self) -> Result<Vec<Execution>> {
+    pub fn load_active_tasks(&self) -> Result<Vec<Task>> {
         let connection = self.connection()?;
         connection.execute(
-            "UPDATE executions SET status = 'queued', node = NULL, started_at_ms = NULL
+            "UPDATE tasks SET status = 'queued', node = NULL, started_at_ms = NULL
              WHERE status IN ('queued', 'assigned', 'running')",
             [],
         )?;
         let mut statement = connection.prepare(
             "SELECT id, pool, node, status, payload, result, error, created_at_ms,
-                    started_at_ms, finished_at_ms, environment, metrics, variables
-             FROM executions WHERE status = 'queued' ORDER BY created_at_ms",
+                    started_at_ms, finished_at_ms, metrics, variables, owner
+             FROM tasks WHERE status = 'queued' ORDER BY created_at_ms",
         )?;
-        let rows = statement.query_map([], execution_from_row)?;
+        let rows = statement.query_map([], task_from_row)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
 
-    pub fn insert_execution(&self, execution: &Execution, secrets: &[u8]) -> Result<bool> {
+    pub fn insert_task(&self, task: &Task, secrets: &[u8]) -> Result<bool> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
-        upsert_execution(&transaction, execution)?;
+        upsert_task(&transaction, task)?;
         if !secrets.is_empty() {
             transaction.execute(
-                "UPDATE executions SET secrets = ?2, size_bytes = size_bytes + length(?2)
+                "UPDATE tasks SET secrets = ?2, size_bytes = size_bytes + length(?2)
                  WHERE id = ?1",
-                params![execution.id.to_string(), secrets],
+                params![task.id.to_string(), secrets],
             )?;
         }
-        prune(&transaction, execution.created_at_ms, Some(execution.id))?;
+        prune(&transaction, task.created_at_ms, Some(task.id))?;
         let limit = setting(&transaction, "max_storage_bytes")?;
         if storage_used(&transaction)? > limit {
-            transaction.execute(
-                "DELETE FROM executions WHERE id = ?1",
-                [execution.id.to_string()],
-            )?;
+            transaction.execute("DELETE FROM tasks WHERE id = ?1", [task.id.to_string()])?;
             transaction.commit()?;
             return Ok(false);
         }
@@ -273,94 +289,117 @@ impl Database {
         Ok(true)
     }
 
-    pub fn save_execution(&self, execution: &Execution) -> Result<()> {
+    pub fn save_task(&self, task: &Task) -> Result<()> {
         let connection = self.connection()?;
-        upsert_execution(&connection, execution)
+        upsert_task(&connection, task)
     }
 
-    pub fn save_executions(&self, executions: &[Execution]) -> Result<()> {
+    pub fn save_tasks(&self, tasks: &[Task]) -> Result<()> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
-        for execution in executions {
-            upsert_execution(&transaction, execution)?;
+        for task in tasks {
+            upsert_task(&transaction, task)?;
         }
         transaction.commit()?;
         Ok(())
     }
 
-    pub fn complete_execution(&self, execution: &Execution) -> Result<Execution> {
+    pub fn complete_task(&self, task: &Task) -> Result<Task> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
-        upsert_execution(&transaction, execution)?;
+        upsert_task(&transaction, task)?;
         transaction.execute(
-            "UPDATE executions SET size_bytes = size_bytes - COALESCE(length(secrets), 0),
+            "UPDATE tasks SET size_bytes = size_bytes - COALESCE(length(secrets), 0),
              secrets = NULL WHERE id = ?1",
-            [execution.id.to_string()],
+            [task.id.to_string()],
         )?;
         prune(
             &transaction,
-            execution.finished_at_ms.unwrap_or(execution.created_at_ms),
-            Some(execution.id),
+            task.finished_at_ms.unwrap_or(task.created_at_ms),
+            Some(task.id),
         )?;
-        let mut saved = execution.clone();
+        let mut saved = task.clone();
         if storage_used(&transaction)? > setting(&transaction, "max_storage_bytes")? {
-            saved.status = ExecutionStatus::Failed;
+            saved.status = TaskStatus::Failed;
             saved.result = None;
-            saved.error = Some("controller execution storage is full".into());
-            upsert_execution(&transaction, &saved)?;
+            saved.error = Some("controller task storage is full".into());
+            upsert_task(&transaction, &saved)?;
         }
         transaction.commit()?;
         Ok(saved)
     }
 
-    pub fn delete_execution(&self, id: Uuid) -> Result<()> {
+    pub fn delete_task(&self, id: Uuid) -> Result<()> {
         self.connection()?
-            .execute("DELETE FROM executions WHERE id = ?1", [id.to_string()])?;
+            .execute("DELETE FROM tasks WHERE id = ?1", [id.to_string()])?;
         Ok(())
     }
 
-    pub fn list_executions(&self, limit: Option<usize>) -> Result<Vec<ExecutionView>> {
+    /// Newest tasks first, optionally only those on the given pools or owner.
+    pub fn list_tasks(
+        &self,
+        limit: Option<usize>,
+        pools: Option<&[String]>,
+        owner: Option<&str>,
+    ) -> Result<Vec<TaskView>> {
         let connection = self.connection()?;
-        if let Some(limit) = limit {
-            let mut statement = connection.prepare(
-                "SELECT id, pool, node, status, error, created_at_ms, started_at_ms,
-                        finished_at_ms, environment, metrics
-                 FROM executions ORDER BY created_at_ms DESC LIMIT ?1",
-            )?;
-            statement
-                .query_map([limit as u64], execution_view_from_row)?
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(Into::into)
-        } else {
-            let mut statement = connection.prepare(
-                "SELECT id, pool, node, status, error, created_at_ms, started_at_ms,
-                        finished_at_ms, environment, metrics
-                 FROM executions ORDER BY created_at_ms DESC",
-            )?;
-            statement
-                .query_map([], execution_view_from_row)?
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(Into::into)
+        let mut sql = String::from(
+            "SELECT id, pool, node, status, error, created_at_ms, started_at_ms,
+                    finished_at_ms, metrics, owner
+             FROM tasks WHERE 1 = 1",
+        );
+        let mut values: Vec<rusqlite::types::Value> = Vec::new();
+        if let Some(pools) = pools {
+            if pools.is_empty() {
+                return Ok(Vec::new());
+            }
+            sql.push_str(" AND pool IN (");
+            sql.push_str(&vec!["?"; pools.len()].join(", "));
+            sql.push(')');
+            values.extend(pools.iter().cloned().map(Into::into));
         }
+        if let Some(owner) = owner {
+            sql.push_str(" AND owner = ?");
+            values.push(owner.to_owned().into());
+        }
+        sql.push_str(" ORDER BY created_at_ms DESC");
+        if let Some(limit) = limit {
+            sql.push_str(" LIMIT ?");
+            values.push((limit as i64).into());
+        }
+        let mut statement = connection.prepare(&sql)?;
+        statement
+            .query_map(rusqlite::params_from_iter(values), task_view_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
-    pub fn execution(&self, id: Uuid) -> Result<Option<Execution>> {
+    /// Record the pool's owner on older tasks that were stored without one.
+    pub fn backfill_task_owner(&self, pool: &str, owner: &str) -> Result<()> {
+        self.connection()?.execute(
+            "UPDATE tasks SET owner = ?2 WHERE pool = ?1 AND owner IS NULL",
+            params![pool, owner],
+        )?;
+        Ok(())
+    }
+
+    pub fn task(&self, id: Uuid) -> Result<Option<Task>> {
         self.connection()?
             .query_row(
                 "SELECT id, pool, node, status, payload, result, error, created_at_ms,
-                        started_at_ms, finished_at_ms, environment, metrics, variables
-                 FROM executions WHERE id = ?1",
+                        started_at_ms, finished_at_ms, metrics, variables, owner
+                 FROM tasks WHERE id = ?1",
                 [id.to_string()],
-                execution_from_row,
+                task_from_row,
             )
             .optional()
             .map_err(Into::into)
     }
 
-    pub fn execution_secrets(&self, id: Uuid) -> Result<Option<Vec<u8>>> {
+    pub fn task_secrets(&self, id: Uuid) -> Result<Option<Vec<u8>>> {
         self.connection()?
             .query_row(
-                "SELECT COALESCE(secrets, X'') FROM executions WHERE id = ?1",
+                "SELECT COALESCE(secrets, X'') FROM tasks WHERE id = ?1",
                 [id.to_string()],
                 |row| row.get(0),
             )
@@ -407,58 +446,51 @@ impl Database {
     }
 }
 
-fn upsert_execution(connection: &Connection, execution: &Execution) -> Result<()> {
-    let payload = serde_json::to_vec(&execution.payload)?;
-    let variables = serde_json::to_vec(&execution.variables)?;
-    let result = execution
-        .result
-        .as_ref()
-        .map(serde_json::to_vec)
-        .transpose()?;
-    let metrics = execution
-        .metrics
-        .as_ref()
-        .map(serde_json::to_vec)
-        .transpose()?;
+fn upsert_task(connection: &Connection, task: &Task) -> Result<()> {
+    let payload = serde_json::to_vec(&task.payload)?;
+    let variables = serde_json::to_vec(&task.variables)?;
+    let result = task.result.as_ref().map(serde_json::to_vec).transpose()?;
+    let metrics = task.metrics.as_ref().map(serde_json::to_vec).transpose()?;
     let size = payload.len()
         + variables.len()
         + result.as_ref().map_or(0, Vec::len)
         + metrics.as_ref().map_or(0, Vec::len)
-        + execution.error.as_ref().map_or(0, String::len);
+        + task.error.as_ref().map_or(0, String::len);
     connection.execute(
-        "INSERT INTO executions(
+        "INSERT INTO tasks(
             id, pool, node, status, payload, result, error, created_at_ms,
-            started_at_ms, finished_at_ms, environment, metrics, variables, size_bytes
+            started_at_ms, finished_at_ms, metrics, variables, size_bytes, owner
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
          ON CONFLICT(id) DO UPDATE SET
-            pool = excluded.pool, node = excluded.node, status = excluded.status,
+            pool = excluded.pool, owner = excluded.owner, node = excluded.node,
+            status = excluded.status,
             payload = excluded.payload, result = excluded.result, error = excluded.error,
             started_at_ms = excluded.started_at_ms, finished_at_ms = excluded.finished_at_ms,
-            environment = excluded.environment, metrics = excluded.metrics,
+            metrics = excluded.metrics,
             variables = excluded.variables,
-            size_bytes = excluded.size_bytes + COALESCE(length(executions.secrets), 0)",
+            size_bytes = excluded.size_bytes + COALESCE(length(tasks.secrets), 0)",
         params![
-            execution.id.to_string(),
-            execution.pool,
-            execution.node.map(|id| id.to_string()),
-            status_name(&execution.status),
+            task.id.to_string(),
+            task.pool,
+            task.node.map(|id| id.to_string()),
+            status_name(&task.status),
             payload,
             result,
-            execution.error,
-            execution.created_at_ms,
-            execution.started_at_ms,
-            execution.finished_at_ms,
-            execution.environment.map(|id| id.to_string()),
+            task.error,
+            task.created_at_ms,
+            task.started_at_ms,
+            task.finished_at_ms,
             metrics,
             variables,
             size as u64,
+            task.owner,
         ],
     )?;
     Ok(())
 }
 
-fn execution_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Execution> {
-    Ok(Execution {
+fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
+    Ok(Task {
         id: uuid(row.get::<_, String>(0)?)?,
         pool: row.get(1)?,
         node: optional_uuid(row.get(2)?)?,
@@ -469,10 +501,21 @@ fn execution_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Execution> {
         created_at_ms: row.get(7)?,
         started_at_ms: row.get(8)?,
         finished_at_ms: row.get(9)?,
-        environment: optional_uuid(row.get(10)?)?,
-        metrics: optional_json(row.get(11)?)?,
-        variables: json(row.get::<_, Vec<u8>>(12)?)?,
+        metrics: optional_json(row.get(10)?)?,
+        variables: json(row.get::<_, Vec<u8>>(11)?)?,
+        owner: row.get(12)?,
     })
+}
+
+fn table_exists(connection: &Connection, table: &str) -> Result<bool> {
+    Ok(connection
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
 }
 
 fn column_exists(connection: &Connection, table: &str, column: &str) -> Result<bool> {
@@ -483,8 +526,8 @@ fn column_exists(connection: &Connection, table: &str, column: &str) -> Result<b
     Ok(columns.iter().any(|name| name == column))
 }
 
-fn execution_view_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ExecutionView> {
-    Ok(ExecutionView {
+fn task_view_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskView> {
+    Ok(TaskView {
         id: uuid(row.get::<_, String>(0)?)?,
         pool: row.get(1)?,
         node: optional_uuid(row.get(2)?)?,
@@ -493,15 +536,15 @@ fn execution_view_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Executio
         created_at_ms: row.get(5)?,
         started_at_ms: row.get(6)?,
         finished_at_ms: row.get(7)?,
-        environment: optional_uuid(row.get(8)?)?,
-        metrics: optional_json(row.get(9)?)?,
+        metrics: optional_json(row.get(8)?)?,
+        owner: row.get(9)?,
     })
 }
 
 fn prune(connection: &Connection, now_ms: u64, protected: Option<Uuid>) -> Result<()> {
     let retention = setting(connection, "retention_ms")?;
     connection.execute(
-        "DELETE FROM executions
+        "DELETE FROM tasks
          WHERE status IN ('succeeded', 'failed', 'timed_out')
            AND finished_at_ms IS NOT NULL AND finished_at_ms <= ?1",
         [now_ms.saturating_sub(retention)],
@@ -513,7 +556,7 @@ fn prune(connection: &Connection, now_ms: u64, protected: Option<Uuid>) -> Resul
     }
     let protected = protected.map(|id| id.to_string());
     let mut statement = connection.prepare(
-        "SELECT id, size_bytes FROM executions
+        "SELECT id, size_bytes FROM tasks
          WHERE status IN ('succeeded', 'failed', 'timed_out') AND (?1 IS NULL OR id != ?1)
          ORDER BY finished_at_ms, created_at_ms",
     )?;
@@ -524,7 +567,7 @@ fn prune(connection: &Connection, now_ms: u64, protected: Option<Uuid>) -> Resul
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(statement);
     for (id, size) in candidates {
-        connection.execute("DELETE FROM executions WHERE id = ?1", [id])?;
+        connection.execute("DELETE FROM tasks WHERE id = ?1", [id])?;
         used = used.saturating_sub(size);
         if used <= limit {
             break;
@@ -543,32 +586,32 @@ fn setting(connection: &Connection, key: &str) -> Result<u64> {
 
 fn storage_used(connection: &Connection) -> Result<u64> {
     Ok(connection.query_row(
-        "SELECT COALESCE(SUM(size_bytes), 0) FROM executions",
+        "SELECT COALESCE(SUM(size_bytes), 0) FROM tasks",
         [],
         |row| row.get(0),
     )?)
 }
 
-fn status_name(status: &ExecutionStatus) -> &'static str {
+fn status_name(status: &TaskStatus) -> &'static str {
     match status {
-        ExecutionStatus::Queued => "queued",
-        ExecutionStatus::Assigned => "assigned",
-        ExecutionStatus::Running => "running",
-        ExecutionStatus::Succeeded => "succeeded",
-        ExecutionStatus::Failed => "failed",
-        ExecutionStatus::TimedOut => "timed_out",
+        TaskStatus::Queued => "queued",
+        TaskStatus::Assigned => "assigned",
+        TaskStatus::Running => "running",
+        TaskStatus::Succeeded => "succeeded",
+        TaskStatus::Failed => "failed",
+        TaskStatus::TimedOut => "timed_out",
     }
 }
 
-fn status(value: &str) -> rusqlite::Result<ExecutionStatus> {
+fn status(value: &str) -> rusqlite::Result<TaskStatus> {
     match value {
-        "queued" => Ok(ExecutionStatus::Queued),
-        "assigned" => Ok(ExecutionStatus::Assigned),
-        "running" => Ok(ExecutionStatus::Running),
-        "succeeded" => Ok(ExecutionStatus::Succeeded),
-        "failed" => Ok(ExecutionStatus::Failed),
-        "timed_out" => Ok(ExecutionStatus::TimedOut),
-        _ => Err(conversion("invalid execution status")),
+        "queued" => Ok(TaskStatus::Queued),
+        "assigned" => Ok(TaskStatus::Assigned),
+        "running" => Ok(TaskStatus::Running),
+        "succeeded" => Ok(TaskStatus::Succeeded),
+        "failed" => Ok(TaskStatus::Failed),
+        "timed_out" => Ok(TaskStatus::TimedOut),
+        _ => Err(conversion("invalid task status")),
     }
 }
 
@@ -604,12 +647,13 @@ mod tests {
 
     use super::*;
 
-    fn execution(created_at_ms: u64) -> Execution {
-        Execution {
+    fn task(created_at_ms: u64) -> Task {
+        Task {
             id: Uuid::new_v4(),
             pool: "python".into(),
+            owner: None,
             node: None,
-            status: ExecutionStatus::Queued,
+            status: TaskStatus::Queued,
             payload: json!({"encoding": "json", "data": "input"}),
             variables: HashMap::new(),
             result: None,
@@ -617,9 +661,68 @@ mod tests {
             created_at_ms,
             started_at_ms: None,
             finished_at_ms: None,
-            environment: None,
             metrics: None,
         }
+    }
+
+    #[test]
+    fn filters_tasks_by_pool_and_owner() {
+        let (database, path) = database();
+        let mut other = task(2);
+        other.pool = "chrome".into();
+        database.insert_task(&task(1), &[]).unwrap();
+        database.insert_task(&other, &[]).unwrap();
+        let pools = ["chrome".to_owned()];
+        let listed = database.list_tasks(None, Some(&pools), None).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].pool, "chrome");
+        assert!(
+            database
+                .list_tasks(None, Some(&[]), None)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(database.list_tasks(Some(1), None, None).unwrap().len(), 1);
+        database
+            .backfill_task_owner("python", "plugin:python")
+            .unwrap();
+        let owned = database
+            .list_tasks(None, None, Some("plugin:python"))
+            .unwrap();
+        assert_eq!(owned.len(), 1);
+        assert_eq!(owned[0].owner.as_deref(), Some("plugin:python"));
+        drop(database);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn migrates_legacy_executions_table() {
+        let path = std::env::temp_dir().join(format!("scraperack-{}.db", Uuid::new_v4()));
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE executions (
+                        id TEXT PRIMARY KEY, pool TEXT NOT NULL, node TEXT, status TEXT NOT NULL,
+                        payload BLOB NOT NULL, result BLOB, error TEXT,
+                        created_at_ms INTEGER NOT NULL, started_at_ms INTEGER,
+                        finished_at_ms INTEGER, environment TEXT, metrics BLOB,
+                        size_bytes INTEGER NOT NULL
+                    );
+                    CREATE INDEX executions_created ON executions(created_at_ms DESC);
+                    INSERT INTO executions(id, pool, status, payload, created_at_ms,
+                        environment, size_bytes)
+                    VALUES ('6f1c1b9e-58a4-4f2b-9d36-3f1f5f0b7f10', 'python', 'queued', X'7B7D', 1,
+                        '6f1c1b9e-58a4-4f2b-9d36-3f1f5f0b7f11', 2);",
+                )
+                .unwrap();
+        }
+        let database = Database::open(&path).unwrap();
+        let tasks = database.load_active_tasks().unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].pool, "python");
+        drop(database);
+        std::fs::remove_file(path).unwrap();
     }
 
     fn database() -> (Database, std::path::PathBuf) {
@@ -628,28 +731,26 @@ mod tests {
     }
 
     #[test]
-    fn stores_execution_data_outside_metadata_views() {
+    fn stores_task_data_outside_metadata_views() {
         let (database, path) = database();
-        let mut execution = execution(1);
-        database.insert_execution(&execution, &[]).unwrap();
-        execution.status = ExecutionStatus::Succeeded;
-        execution.finished_at_ms = Some(2);
-        execution.result = Some(json!({"value": {"encoding": "json", "data": "output"}}));
-        database.complete_execution(&execution).unwrap();
+        let mut task = task(1);
+        database.insert_task(&task, &[]).unwrap();
+        task.status = TaskStatus::Succeeded;
+        task.finished_at_ms = Some(2);
+        task.result = Some(json!({"value": {"encoding": "json", "data": "output"}}));
+        database.complete_task(&task).unwrap();
 
-        let view = serde_json::to_value(&database.list_executions(None).unwrap()[0]).unwrap();
+        let view =
+            serde_json::to_value(&database.list_tasks(None, None, None).unwrap()[0]).unwrap();
         assert!(view.get("payload").is_none());
         assert!(view.get("result").is_none());
-        assert_eq!(
-            database.execution(execution.id).unwrap().unwrap().result,
-            execution.result
-        );
+        assert_eq!(database.task(task.id).unwrap().unwrap().result, task.result);
         drop(database);
         std::fs::remove_file(path).unwrap();
     }
 
     #[test]
-    fn retention_removes_completed_but_not_active_executions() {
+    fn retention_removes_completed_but_not_active_tasks() {
         let (database, path) = database();
         database
             .update_settings(&StorageSettings {
@@ -657,17 +758,17 @@ mod tests {
                 max_storage_bytes: DEFAULT_STORAGE_BYTES,
             })
             .unwrap();
-        let active = execution(1);
-        database.insert_execution(&active, &[]).unwrap();
-        let mut completed = execution(1);
-        database.insert_execution(&completed, &[]).unwrap();
-        completed.status = ExecutionStatus::Succeeded;
+        let active = task(1);
+        database.insert_task(&active, &[]).unwrap();
+        let mut completed = task(1);
+        database.insert_task(&completed, &[]).unwrap();
+        completed.status = TaskStatus::Succeeded;
         completed.finished_at_ms = Some(2);
-        database.complete_execution(&completed).unwrap();
+        database.complete_task(&completed).unwrap();
 
         database.prune(3_600_003).unwrap();
-        assert!(database.execution(active.id).unwrap().is_some());
-        assert!(database.execution(completed.id).unwrap().is_none());
+        assert!(database.task(active.id).unwrap().is_some());
+        assert!(database.task(completed.id).unwrap().is_none());
         drop(database);
         std::fs::remove_file(path).unwrap();
     }
@@ -676,28 +777,22 @@ mod tests {
     fn encrypts_queued_secrets_and_clears_them_on_completion() {
         let (database, path) = database();
         let cipher = SecretCipher::from_bytes(&[7; 32]).unwrap();
-        let mut execution = execution(1);
+        let mut task = task(1);
         let secrets = HashMap::from([("TOKEN".into(), "do-not-store-plainly".into())]);
-        let encrypted = cipher.encrypt(execution.id, &secrets).unwrap();
+        let encrypted = cipher.encrypt(task.id, &secrets).unwrap();
         assert!(
             !encrypted
                 .windows("do-not-store-plainly".len())
                 .any(|value| value == b"do-not-store-plainly")
         );
-        database.insert_execution(&execution, &encrypted).unwrap();
-        let stored = database.execution_secrets(execution.id).unwrap().unwrap();
-        assert_eq!(cipher.decrypt(execution.id, &stored).unwrap(), secrets);
+        database.insert_task(&task, &encrypted).unwrap();
+        let stored = database.task_secrets(task.id).unwrap().unwrap();
+        assert_eq!(cipher.decrypt(task.id, &stored).unwrap(), secrets);
 
-        execution.status = ExecutionStatus::Succeeded;
-        execution.finished_at_ms = Some(2);
-        database.complete_execution(&execution).unwrap();
-        assert!(
-            database
-                .execution_secrets(execution.id)
-                .unwrap()
-                .unwrap()
-                .is_empty()
-        );
+        task.status = TaskStatus::Succeeded;
+        task.finished_at_ms = Some(2);
+        database.complete_task(&task).unwrap();
+        assert!(database.task_secrets(task.id).unwrap().unwrap().is_empty());
         drop(database);
         std::fs::remove_file(path).unwrap();
     }

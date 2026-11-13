@@ -1,5 +1,4 @@
 import asyncio
-import json
 import os
 import shlex
 import time
@@ -129,9 +128,6 @@ def shell(active, plugins=()):
                         for plugin in plugins if plugin.get("gui") and plugin.get("enabled")]
         groups = [
             (None, [("dashboard", "/", "home", "Home")]),
-            ("Execution", [
-                ("executions", "/executions", "terminal", "Executions"),
-            ]),
             ("Plugins", [*plugin_links, ("plugins", "/plugins", "extension", "Manage plugins")]),
             ("Virtualization", [
                 ("vms", "/vms", "memory", "MicroVMs"),
@@ -216,89 +212,6 @@ def set_rows(element, rows):
         element.update()
 
 
-async def execution_details(event):
-    run = event.args.get("data")
-    if not run:
-        return
-    try:
-        run, names, payload, logs = await asyncio.gather(
-            request("GET", f'/v1/executions/{run["id"]}'),
-            pool_names(),
-            request("GET", f'/v1/executions/{run["id"]}/payload'),
-            request("GET", f'/v1/executions/{run["id"]}/logs'),
-        )
-        outcome = {"value": None}
-        if run["status"] in ("succeeded", "failed", "timed_out"):
-            outcome = await request("GET", f'/v1/executions/{run["id"]}/result')
-    except Exception as error:
-        notify_error(error)
-        return
-    end = run["finished_at_ms"] or int(time.time() * 1000)
-    duration = f'{(end - run["started_at_ms"]) / 1000:.2f}s' if run["started_at_ms"] else "—"
-    with ui.dialog() as dialog, ui.card().classes("execution-dialog"):
-        with ui.row().classes("items-start w-full gap-2"):
-            with ui.column().classes("gap-1 grow"):
-                ui.label("Execution details").classes("dialog-eyebrow")
-                ui.label(run["id"]).classes("dialog-title mono")
-            ui.label(run["status"].replace("_", " ").title()).classes(f'status-pill status-{run["status"]}')
-            ui.button(icon="close", on_click=dialog.close).props("flat round")
-        with ui.element("div").classes("detail-grid"):
-            for label, value, mono in (
-                ("Pool", names.get(run["pool"], run["pool"]), False),
-                ("Node", run["node"] or "Unassigned", True),
-                ("Duration", duration, False), ("Created", stamp(run["created_at_ms"]), False),
-            ):
-                with ui.element("div").classes("detail-card"):
-                    ui.label(label).classes("detail-label")
-                    ui.label(value).classes(f'detail-value {"mono" if mono else ""}')
-        metrics = run.get("metrics")
-        if metrics and metrics.get("samples"):
-            ui.label("Lifetime utilization").classes("section-title")
-            with ui.element("div").classes("metric-charts"):
-                for title, field, color in (
-                    ("CPU usage", "cpu_percent", "#22d3ee"),
-                    ("RAM usage", "memory_percent", "#2dd4bf"),
-                ):
-                    data = [[point["elapsed_ms"] / 1000, round(point[field], 2)]
-                            for point in metrics["samples"]]
-                    ui.echart({
-                        "backgroundColor": "transparent",
-                        "title": {"text": title, "textStyle": {"color": "#ededed", "fontSize": 13}},
-                        "tooltip": {"trigger": "axis"},
-                        "grid": {"left": 48, "right": 18, "top": 42, "bottom": 38},
-                        "xAxis": {"type": "value", "name": "seconds", "axisLine": {"lineStyle": {"color": "#777"}}},
-                        "yAxis": {"type": "value", "min": 0, "max": 100,
-                                  "axisLabel": {"formatter": "{value}%"}},
-                        "series": [{"type": "line", "data": data, "showSymbol": False,
-                                    "lineStyle": {"color": color, "width": 2},
-                                    "areaStyle": {"color": color, "opacity": .12}}],
-                    }).classes("metric-chart")
-        ui.label("Lifecycle").classes("section-title")
-        with ui.element("div").classes("timeline"):
-            for label, value in (
-                ("Created", run["created_at_ms"]),
-                ("Started", run["started_at_ms"]),
-                ("Finished", run["finished_at_ms"]),
-            ):
-                with ui.element("div").classes("timeline-item"):
-                    ui.icon("check_circle" if value else "radio_button_unchecked", size="18px")
-                    with ui.column().classes("gap-0"):
-                        ui.label(label).classes("detail-label")
-                        ui.label(stamp(value)).classes("text-sm")
-        with ui.element("div").classes("payload-grid"):
-            for label, value in (("Payload", payload), ("Result", outcome["value"]),
-                                 ("stdout", logs["stdout"]), ("stderr", logs["stderr"])):
-                with ui.element("div").classes("data-block"):
-                    ui.label(label).classes("section-title")
-                    text = value if isinstance(value, str) else json.dumps(value, indent=2, ensure_ascii=False)
-                    ui.code(text if value is not None else "—").classes("json-code")
-        if run["error"]:
-            with ui.element("div").classes("error-block"):
-                ui.label("Error").classes("section-title")
-                ui.label(run["error"]).classes("mono whitespace-pre-wrap")
-    dialog.open()
-
-
 @ui.page("/")
 async def dashboard():
     with await layout("dashboard"):
@@ -306,7 +219,7 @@ async def dashboard():
             node_value, node_detail = summary("dns", "Nodes", "—", "Loading")
             image_value, image_detail = summary("layers", "Images", "—", "Loading")
             pool_value, pool_detail = summary("hub", "Pools", "—", "Loading")
-            run_value, run_detail = summary("terminal", "Executions", "—", "Loading")
+            vm_value, vm_detail = summary("memory", "MicroVMs", "—", "Loading")
         with ui.card().classes("panel"):
             with ui.row().classes("items-center w-full"):
                 ui.label("Cluster allocation").classes("section-title")
@@ -316,20 +229,20 @@ async def dashboard():
             memory_text = ui.label().classes("text-sm")
     async def refresh():
         try:
-            nodes, images, pools, executions = await asyncio.gather(
+            nodes, images, pools, vms = await asyncio.gather(
                 request("GET", "/v1/nodes"), request("GET", "/v1/images"),
-                request("GET", "/v1/pools"), request("GET", "/v1/executions"),
+                request("GET", "/v1/pools"), request("GET", "/v1/vms"),
             )
             ready_nodes = sum(node["status"] == "ready" for node in nodes)
             ready_images = sum(image["ready"] for image in images)
-            active = sum(run["status"] in ("queued", "assigned", "running") for run in executions)
+            running = sum(vm["status"] == "running" for vm in vms)
             for label, value in ((node_value, len(nodes)), (image_value, len(images)),
-                                 (pool_value, len(pools)), (run_value, len(executions))):
+                                 (pool_value, len(pools)), (vm_value, len(vms))):
                 label.text = str(value)
             node_detail.text = f"{ready_nodes} ready"
             image_detail.text = f"{ready_images} distributed"
             pool_detail.text = f'{sum(bool(pool.get("managed_by")) for pool in pools)} managed by plugins'
-            run_detail.text = f"{active} active"
+            vm_detail.text = f"{running} running"
             total_cpu = sum(node["cpu_millis"] for node in nodes)
             used_cpu = sum(node["used_cpu_millis"] for node in nodes)
             total_mem = sum(node["memory_mib"] for node in nodes)
@@ -412,7 +325,7 @@ async def nodes_page():
         selected = event.args.get("data")
         if not selected:
             return
-        with ui.dialog() as dialog, ui.card().classes("execution-dialog"):
+        with ui.dialog() as dialog, ui.card().classes("detail-dialog"):
             with ui.row().classes("items-center w-full"):
                 ui.label(f'{selected["name"]} settings').classes("section-title")
                 ui.space()
@@ -653,7 +566,7 @@ async def read_upload(event):
 
 def install_dialog(on_installed):
     state = {"upload": None}
-    with ui.dialog().props("persistent") as dialog, ui.card().classes("execution-dialog"):
+    with ui.dialog().props("persistent") as dialog, ui.card().classes("detail-dialog"):
         with ui.row().classes("items-center w-full"):
             ui.label("Install plugin").classes("section-title")
             ui.space()
@@ -772,7 +685,7 @@ async def plugins_page():
         if not plugin:
             return
         name = plugin["name"]
-        with ui.dialog() as dialog, ui.card().classes("execution-dialog"):
+        with ui.dialog() as dialog, ui.card().classes("detail-dialog"):
             with ui.row().classes("items-center w-full"):
                 ui.label(f'{name} {plugin["version"]}').classes("section-title")
                 ui.label(plugin["status"]).classes(f'status-pill status-{plugin["status"]}')
@@ -838,65 +751,6 @@ async def plugin_page(name: str):
             .classes("plugin-frame")
 
 
-@ui.page("/executions")
-async def executions_page():
-    with await layout("executions"):
-        with ui.row().classes("items-center w-full"):
-            ui.label("Execution history").classes("section-title")
-            ui.space()
-            ui.label("Click an execution for full details").classes("text-xs muted")
-        executions = table([
-            {"headerName": "ID", "field": "short", "maxWidth": 130, "cellClass": "mono"},
-            {"headerName": "Pool", "field": "pool_name"},
-            {"headerName": "Status", "field": "status", "maxWidth": 140, ":cellRenderer": "statusRenderer"},
-            {"headerName": "Node", "field": "short_node", "cellClass": "mono"},
-            {"headerName": "Created", "field": "created", "tooltipField": "created_exact"},
-            {"headerName": "Duration", "field": "duration", "maxWidth": 120},
-        ], row_key="id", full_height=True)
-        executions.classes("clickable-grid").on("cellClicked", execution_details, ["data"])
-
-    known = {}
-    initialized = False
-
-    async def refresh():
-        nonlocal known, initialized
-        data, names = await asyncio.gather(
-            request("GET", "/v1/executions?limit=1000"), pool_names()
-        )
-        data.sort(key=lambda item: item["created_at_ms"], reverse=True)
-        rows = []
-        for run in data:
-            end = run["finished_at_ms"] or int(time.time() * 1000)
-            duration = f'{(end - run["started_at_ms"]) / 1000:.2f}s' if run["started_at_ms"] else "—"
-            rows.append({**run, "short": run["id"][:8], "short_node": (run["node"] or "—")[:8],
-                         "pool_name": names.get(run["pool"], run["pool"]),
-                         "created": ago(run["created_at_ms"]), "created_exact": stamp(run["created_at_ms"]),
-                         "duration": duration})
-        current = {row["id"]: row for row in rows}
-        if not initialized:
-            set_rows(executions, rows)
-            known = current
-            initialized = True
-            return
-        transaction = {
-            "add": [row for row in rows if row["id"] not in known],
-            "update": [row for row in rows if row["id"] in known and row != known[row["id"]]],
-            "remove": [row for key, row in known.items() if key not in current],
-            "addIndex": 0,
-        }
-        with executions.props.suspend_updates():
-            executions.options["rowData"] = rows
-        if transaction["add"] or transaction["update"] or transaction["remove"]:
-            executions.run_grid_method("applyTransaction", transaction)
-        known = current
-
-    try:
-        await refresh()
-    except Exception as error:
-        notify_error(error)
-    ui.timer(.5, refresh)
-
-
 @ui.page("/vms")
 async def vms_page():
     with await layout("vms"):
@@ -916,7 +770,7 @@ async def vms_page():
             {"headerName": "CPU", "field": "cpu", "maxWidth": 110},
             {"headerName": "Memory", "field": "memory", "maxWidth": 130},
             {"headerName": "PID", "field": "pid", "maxWidth": 100},
-            {"headerName": "Execution", "field": "short_execution", "cellClass": "mono"},
+            {"headerName": "Task", "field": "short_task", "cellClass": "mono"},
         ], row_key="id")
 
     known = {}
@@ -942,7 +796,7 @@ async def vms_page():
                 "cpu": f'{vm["cpu_millis"] / 1000:g} cores',
                 "memory": f'{vm["memory_mib"]} MiB',
                 "pid": vm["pid"] or "—",
-                "short_execution": (vm["execution"] or "—")[:8],
+                "short_task": (vm.get("task") or "—")[:8],
             } for vm in data]
             current = {row["id"]: row for row in rows}
             if not initialized:
@@ -972,8 +826,8 @@ async def settings_page():
     with await layout("settings"):
         storage = await request("GET", "/v1/settings/storage")
         with ui.card().classes("panel"):
-            ui.label("Execution storage").classes("section-title")
-            ui.label("Completed executions are a temporary buffer and may be evicted early when full.") \
+            ui.label("Task storage").classes("section-title")
+            ui.label("Completed tasks are a temporary buffer and may be evicted early when full.") \
                 .classes("text-sm muted")
             with ui.row().classes("items-end w-full"):
                 retention = ui.number("Retention", value=storage["retention_hours"],

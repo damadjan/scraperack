@@ -32,8 +32,8 @@ use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
 use crate::cluster::{
-    Cluster, Disk, Execution, ExecutionMetrics, ExecutionStatus, ExecutionView, Image, ImageKind,
-    JoinToken, MicroVm, Node, NodeStatus, Pool, PoolDisk, Work,
+    Cluster, Disk, Image, ImageKind, JoinToken, MicroVm, Node, NodeStatus, Pool, PoolDisk, Task,
+    TaskMetrics, TaskStatus, TaskView, Work,
 };
 use crate::plugins::{self, Plugins};
 use crate::storage::{Database, SecretCipher, StorageSettings, StorageView};
@@ -49,7 +49,7 @@ pub struct App {
     secrets: SecretCipher,
     controller_id: Uuid,
     pub data_dir: PathBuf,
-    executions: Arc<Notify>,
+    tasks: Arc<Notify>,
     work: Arc<Notify>,
     pub plugins: Arc<Plugins>,
 }
@@ -193,10 +193,8 @@ pub async fn save(app: &App, cluster: &Cluster) -> ApiResult<()> {
     app.database.save_cluster(cluster).map_err(internal_error)
 }
 
-async fn save_execution(app: &App, execution: &Execution) -> ApiResult<()> {
-    app.database
-        .save_execution(execution)
-        .map_err(internal_error)
+async fn save_task(app: &App, task: &Task) -> ApiResult<()> {
+    app.database.save_task(task).map_err(internal_error)
 }
 
 pub fn internal_error(cause: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
@@ -213,7 +211,12 @@ pub async fn serve(
     fs::create_dir_all(data_dir.join("plugins")).await?;
     fs::create_dir_all(data_dir.join("working-dirs")).await?;
     let database = Database::open(&data_dir.join("scraperack.db"))?;
-    let secrets = SecretCipher::load(&data_dir.join("execution-secrets.key"))?;
+    let secrets_key = data_dir.join("task-secrets.key");
+    let legacy_secrets_key = data_dir.join("execution-secrets.key");
+    if !secrets_key.exists() && legacy_secrets_key.exists() {
+        fs::rename(&legacy_secrets_key, &secrets_key).await?;
+    }
+    let secrets = SecretCipher::load(&secrets_key)?;
     let controller_id_path = data_dir.join("controller-id");
     let legacy_controller_id = match fs::read_to_string(&controller_id_path).await {
         Ok(id) => Some(Uuid::parse_str(id.trim())?),
@@ -232,10 +235,15 @@ pub async fn serve(
             Err(error) => return Err(error.into()),
         },
     };
-    for execution in database.load_active_executions()? {
-        cluster.executions.insert(execution.id, execution);
-    }
     migrate_environments(&mut cluster, &data_dir).await?;
+    for pool in cluster.pools.values() {
+        if let Some(owner) = &pool.managed_by {
+            database.backfill_task_owner(&pool.name, owner)?;
+        }
+    }
+    for task in database.load_active_tasks()? {
+        cluster.tasks.insert(task.id, task);
+    }
     database.save_cluster(&cluster)?;
     if fresh {
         fs::remove_file(state_path).await.ok();
@@ -250,7 +258,7 @@ pub async fn serve(
         controller_id,
         plugins: Arc::new(Plugins::new(data_dir.join("plugins"), allow_plugin_install)),
         data_dir,
-        executions: Arc::new(Notify::new()),
+        tasks: Arc::new(Notify::new()),
         work: Arc::new(Notify::new()),
     };
     app.database.prune(now_ms())?;
@@ -260,7 +268,7 @@ pub async fn serve(
         loop {
             interval.tick().await;
             if let Err(error) = garbage_collector.database.prune(now_ms()) {
-                tracing::error!(%error, "execution garbage collection failed");
+                tracing::error!(%error, "task garbage collection failed");
             }
         }
     });
@@ -335,15 +343,12 @@ fn router(app: App) -> Router {
         .route("/v1/join-tokens", post(create_join_token))
         .route("/v1/join-tokens/{id}", get(get_join_token))
         .route("/v1/vms", get(list_vms))
-        .route(
-            "/v1/executions",
-            get(list_executions).post(create_execution),
-        )
-        .route("/v1/executions/{id}", get(get_execution))
-        .route("/v1/executions/{id}/wait", get(wait_execution))
-        .route("/v1/executions/{id}/payload", get(get_execution_payload))
-        .route("/v1/executions/{id}/result", get(get_execution_result))
-        .route("/v1/executions/{id}/logs", get(get_execution_logs))
+        .route("/v1/tasks", get(list_tasks).post(create_task))
+        .route("/v1/tasks/{id}", get(get_task))
+        .route("/v1/tasks/{id}/wait", get(wait_task))
+        .route("/v1/tasks/{id}/payload", get(get_task_payload))
+        .route("/v1/tasks/{id}/result", get(get_task_result))
+        .route("/v1/tasks/{id}/logs", get(get_task_logs))
         .route("/internal/nodes/register", post(register_node))
         .route("/internal/identity", get(controller_identity))
         .route("/internal/join", post(join_cluster))
@@ -360,10 +365,7 @@ fn router(app: App) -> Router {
                 .delete(remove_idle_instance),
         )
         .route("/internal/nodes/{id}/work", get(next_work))
-        .route(
-            "/internal/executions/{id}/complete",
-            post(complete_execution),
-        )
+        .route("/internal/tasks/{id}/complete", post(complete_task))
         .layer(DefaultBodyLimit::disable())
         .with_state(app)
 }
@@ -1079,7 +1081,7 @@ async fn create_pool(
     save(&app, &cluster).await?;
     drop(cluster);
     app.database
-        .save_executions(&scheduled)
+        .save_tasks(&scheduled)
         .map_err(internal_error)?;
     app.work.notify_waiters();
     Ok((StatusCode::CREATED, Json(pool)))
@@ -1135,7 +1137,7 @@ async fn update_pool(
     save(&app, &cluster).await?;
     drop(cluster);
     app.database
-        .save_executions(&scheduled)
+        .save_tasks(&scheduled)
         .map_err(internal_error)?;
     app.work.notify_waiters();
     Ok(Json(pool))
@@ -1184,14 +1186,14 @@ async fn delete_pool(
         .get(&name)
         .ok_or_else(|| error(StatusCode::NOT_FOUND, "pool not found"))?;
     check_owner(pool, &owner_of(&caller))?;
-    if cluster.executions.values().any(|execution| {
-        execution.pool == name
+    if cluster.tasks.values().any(|task| {
+        task.pool == name
             && matches!(
-                execution.status,
-                ExecutionStatus::Queued | ExecutionStatus::Assigned | ExecutionStatus::Running
+                task.status,
+                TaskStatus::Queued | TaskStatus::Assigned | TaskStatus::Running
             )
     }) {
-        return Err(error(StatusCode::CONFLICT, "pool has active executions"));
+        return Err(error(StatusCode::CONFLICT, "pool has active tasks"));
     }
     remove_pool(&mut cluster, &name);
     save(&app, &cluster).await?;
@@ -1523,14 +1525,10 @@ async fn delete_node(
     AxumPath(id): AxumPath<Uuid>,
 ) -> ApiResult<StatusCode> {
     let mut cluster = app.cluster.write().await;
-    if cluster.executions.values().any(|execution| {
-        execution.node == Some(id)
-            && matches!(
-                execution.status,
-                ExecutionStatus::Assigned | ExecutionStatus::Running
-            )
+    if cluster.tasks.values().any(|task| {
+        task.node == Some(id) && matches!(task.status, TaskStatus::Assigned | TaskStatus::Running)
     }) {
-        return Err(error(StatusCode::CONFLICT, "node has active executions"));
+        return Err(error(StatusCode::CONFLICT, "node has active tasks"));
     }
     if cluster.nodes.remove(&id).is_none() && !cluster.node_credentials.contains_key(&id) {
         return Err(error(StatusCode::NOT_FOUND, "node not found"));
@@ -1539,7 +1537,7 @@ async fn delete_node(
     let scheduled = cluster.schedule_queued();
     save(&app, &cluster).await?;
     app.database
-        .save_executions(&scheduled)
+        .save_tasks(&scheduled)
         .map_err(internal_error)?;
     app.work.notify_waiters();
     Ok(StatusCode::NO_CONTENT)
@@ -1598,11 +1596,8 @@ async fn update_storage_settings(
 }
 
 #[derive(Deserialize)]
-struct CreateExecution {
-    #[serde(default)]
-    pool: Option<String>,
-    #[serde(default)]
-    environment: Option<String>,
+struct CreateTask {
+    pool: String,
     payload: Value,
     #[serde(default)]
     variables: HashMap<String, String>,
@@ -1616,10 +1611,10 @@ fn default_queue() -> bool {
     true
 }
 
-async fn create_execution(
+async fn create_task(
     State(app): State<App>,
-    Json(request): Json<CreateExecution>,
-) -> ApiResult<(StatusCode, Json<ExecutionView>)> {
+    Json(request): Json<CreateTask>,
+) -> ApiResult<(StatusCode, Json<TaskView>)> {
     if let Some(working_dir) = request.payload.get("working_dir") {
         let digest = working_dir.as_str().ok_or_else(|| {
             error(
@@ -1635,11 +1630,7 @@ async fn create_execution(
         }
     }
     let mut cluster = app.cluster.write().await;
-    let target = request
-        .pool
-        .as_deref()
-        .or(request.environment.as_deref())
-        .ok_or_else(|| error(StatusCode::BAD_REQUEST, "pool is required"))?;
+    let target = request.pool.as_str();
     let pool = cluster
         .find_pool(target)
         .ok_or_else(|| error(StatusCode::BAD_REQUEST, format!("unknown pool {target}")))?;
@@ -1650,13 +1641,14 @@ async fn create_execution(
         ));
     }
     let pool_name = pool.name.clone();
-    let environment_id = pool.environment;
+    let owner = pool.managed_by.clone();
     let id = Uuid::new_v4();
-    let execution = Execution {
+    let task = Task {
         id,
         pool: pool_name,
+        owner,
         node: None,
-        status: ExecutionStatus::Queued,
+        status: TaskStatus::Queued,
         payload: request.payload,
         variables: request.variables,
         result: None,
@@ -1664,7 +1656,6 @@ async fn create_execution(
         created_at_ms: now_ms(),
         started_at_ms: None,
         finished_at_ms: None,
-        environment: environment_id,
         metrics: None,
     };
     let secrets = app
@@ -1673,140 +1664,152 @@ async fn create_execution(
         .map_err(internal_error)?;
     if !app
         .database
-        .insert_execution(&execution, &secrets)
+        .insert_task(&task, &secrets)
         .map_err(internal_error)?
     {
         return Err(error(
             StatusCode::INSUFFICIENT_STORAGE,
-            "controller execution storage is full",
+            "controller task storage is full",
         ));
     }
-    cluster.executions.insert(id, execution);
+    cluster.tasks.insert(id, task);
     if !cluster.schedule(id) && !request.queue {
-        cluster.executions.remove(&id);
-        app.database.delete_execution(id).map_err(internal_error)?;
+        cluster.tasks.remove(&id);
+        app.database.delete_task(id).map_err(internal_error)?;
         return Err(error(StatusCode::SERVICE_UNAVAILABLE, "cluster is full"));
     }
-    let execution = cluster.executions[&id].clone();
-    save_execution(&app, &execution).await?;
+    let task = cluster.tasks[&id].clone();
+    save_task(&app, &task).await?;
     drop(cluster);
     app.work.notify_waiters();
-    Ok((StatusCode::ACCEPTED, Json(ExecutionView::from(&execution))))
+    Ok((StatusCode::ACCEPTED, Json(TaskView::from(&task))))
 }
 
 #[derive(Deserialize)]
-struct ListExecutions {
+struct ListTasks {
     limit: Option<usize>,
+    /// Comma-separated pool names.
+    pool: Option<String>,
+    /// Pool owner, such as `plugin:python`.
+    owner: Option<String>,
 }
 
-async fn list_executions(
+async fn list_tasks(
     State(app): State<App>,
-    Query(query): Query<ListExecutions>,
-) -> ApiResult<Json<Vec<ExecutionView>>> {
+    Query(query): Query<ListTasks>,
+) -> ApiResult<Json<Vec<TaskView>>> {
+    let pools = query.pool.as_deref().map(|pools| {
+        pools
+            .split(',')
+            .map(str::trim)
+            .filter(|pool| !pool.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    });
     app.database
-        .list_executions(query.limit)
+        .list_tasks(query.limit, pools.as_deref(), query.owner.as_deref())
         .map(Json)
         .map_err(internal_error)
 }
 
-async fn get_execution(
+async fn get_task(
     State(app): State<App>,
     AxumPath(id): AxumPath<Uuid>,
-) -> ApiResult<Json<ExecutionView>> {
+) -> ApiResult<Json<TaskView>> {
     app.database
-        .execution(id)
+        .task(id)
         .map_err(internal_error)?
-        .map(|execution| Json(ExecutionView::from(&execution)))
-        .ok_or_else(|| error(StatusCode::NOT_FOUND, "execution not found"))
+        .map(|task| Json(TaskView::from(&task)))
+        .ok_or_else(|| error(StatusCode::NOT_FOUND, "task not found"))
 }
 
-async fn wait_execution(
+async fn wait_task(
     State(app): State<App>,
     AxumPath(id): AxumPath<Uuid>,
-) -> ApiResult<Json<ExecutionView>> {
+) -> ApiResult<Json<TaskView>> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(25);
     loop {
-        let notified = app.executions.notified();
-        let execution = app
+        let notified = app.tasks.notified();
+        let task = app
             .database
-            .execution(id)
+            .task(id)
             .map_err(internal_error)?
-            .ok_or_else(|| error(StatusCode::NOT_FOUND, "execution not found"))?;
+            .ok_or_else(|| error(StatusCode::NOT_FOUND, "task not found"))?;
         if matches!(
-            execution.status,
-            ExecutionStatus::Succeeded | ExecutionStatus::Failed | ExecutionStatus::TimedOut
+            task.status,
+            TaskStatus::Succeeded | TaskStatus::Failed | TaskStatus::TimedOut
         ) || tokio::time::Instant::now() >= deadline
         {
-            return Ok(Json(ExecutionView::from(&execution)));
+            return Ok(Json(TaskView::from(&task)));
         }
         if tokio::time::timeout_at(deadline, notified).await.is_err() {
-            return get_execution(State(app), AxumPath(id)).await;
+            return get_task(State(app), AxumPath(id)).await;
         }
     }
 }
 
 #[derive(Serialize)]
-struct ExecutionResult {
-    status: ExecutionStatus,
+struct TaskResult {
+    status: TaskStatus,
     value: Option<Value>,
     error: Option<String>,
 }
 
 #[derive(Serialize)]
-struct ExecutionLogs {
+struct TaskLogs {
     stdout: String,
     stderr: String,
 }
 
-async fn get_execution_payload(
+async fn get_task_payload(
     State(app): State<App>,
     AxumPath(id): AxumPath<Uuid>,
 ) -> ApiResult<Json<Value>> {
     app.database
-        .execution(id)
+        .task(id)
         .map_err(internal_error)?
-        .map(|execution| Json(execution.payload))
-        .ok_or_else(|| error(StatusCode::NOT_FOUND, "execution not found"))
+        .map(|task| Json(task.payload))
+        .ok_or_else(|| error(StatusCode::NOT_FOUND, "task not found"))
 }
 
-async fn get_execution_result(
+async fn get_task_result(
     State(app): State<App>,
     AxumPath(id): AxumPath<Uuid>,
-) -> ApiResult<Json<ExecutionResult>> {
-    let execution = app
+) -> ApiResult<Json<TaskResult>> {
+    let task = app
         .database
-        .execution(id)
+        .task(id)
         .map_err(internal_error)?
-        .ok_or_else(|| error(StatusCode::NOT_FOUND, "execution not found"))?;
+        .ok_or_else(|| error(StatusCode::NOT_FOUND, "task not found"))?;
     if !matches!(
-        execution.status,
-        ExecutionStatus::Succeeded | ExecutionStatus::Failed | ExecutionStatus::TimedOut
+        task.status,
+        TaskStatus::Succeeded | TaskStatus::Failed | TaskStatus::TimedOut
     ) {
-        return Err(error(StatusCode::CONFLICT, "execution is not finished"));
+        return Err(error(StatusCode::CONFLICT, "task is not finished"));
     }
-    let value = execution
+    let value = task
         .result
         .as_ref()
         .and_then(|result| result.get("value"))
         .cloned();
-    Ok(Json(ExecutionResult {
-        status: execution.status,
+    Ok(Json(TaskResult {
+        status: task.status,
         value,
-        error: execution.error,
+        error: task.error,
     }))
 }
 
-async fn get_execution_logs(
+async fn get_task_logs(
     State(app): State<App>,
     AxumPath(id): AxumPath<Uuid>,
-) -> ApiResult<Json<ExecutionLogs>> {
-    let execution = app
+) -> ApiResult<Json<TaskLogs>> {
+    let task = app
         .database
-        .execution(id)
+        .task(id)
         .map_err(internal_error)?
-        .ok_or_else(|| error(StatusCode::NOT_FOUND, "execution not found"))?;
-    let output = execution.result.as_ref();
-    Ok(Json(ExecutionLogs {
+        .ok_or_else(|| error(StatusCode::NOT_FOUND, "task not found"))?;
+    let output = task.result.as_ref();
+    Ok(Json(TaskLogs {
         stdout: output
             .and_then(|result| result.get("stdout"))
             .and_then(Value::as_str)
@@ -1880,7 +1883,7 @@ async fn register_node(
     let node = cluster.nodes[&id].clone();
     save(&app, &cluster).await?;
     app.database
-        .save_executions(&scheduled)
+        .save_tasks(&scheduled)
         .map_err(internal_error)?;
     app.work.notify_waiters();
     Ok(Json(node))
@@ -1907,7 +1910,7 @@ async fn image_ready(
     let scheduled = cluster.schedule_queued();
     save(&app, &cluster).await?;
     app.database
-        .save_executions(&scheduled)
+        .save_tasks(&scheduled)
         .map_err(internal_error)?;
     app.work.notify_waiters();
     Ok(StatusCode::NO_CONTENT)
@@ -1935,7 +1938,7 @@ async fn disk_ready(
     let scheduled = cluster.schedule_queued();
     save(&app, &cluster).await?;
     app.database
-        .save_executions(&scheduled)
+        .save_tasks(&scheduled)
         .map_err(internal_error)?;
     app.work.notify_waiters();
     Ok(StatusCode::NO_CONTENT)
@@ -1968,7 +1971,7 @@ async fn add_warm_instance(
         let scheduled = cluster.schedule_queued();
         save(&app, &cluster).await?;
         app.database
-            .save_executions(&scheduled)
+            .save_tasks(&scheduled)
             .map_err(internal_error)?;
         app.work.notify_waiters();
     }
@@ -2000,7 +2003,7 @@ async fn remove_idle_instance(
         let scheduled = cluster.schedule_queued();
         save(&app, &cluster).await?;
         app.database
-            .save_executions(&scheduled)
+            .save_tasks(&scheduled)
             .map_err(internal_error)?;
         app.work.notify_waiters();
     }
@@ -2025,33 +2028,31 @@ async fn next_work(
             if !cluster.nodes.contains_key(&id) {
                 return Err(error(StatusCode::NOT_FOUND, "node not found"));
             }
-            let execution = cluster
-                .executions
+            let task = cluster
+                .tasks
                 .values_mut()
-                .find(|execution| {
-                    execution.node == Some(id) && execution.status == ExecutionStatus::Assigned
-                })
-                .map(|execution| {
-                    execution.status = ExecutionStatus::Running;
-                    execution.started_at_ms = Some(now_ms());
-                    execution.clone()
+                .find(|task| task.node == Some(id) && task.status == TaskStatus::Assigned)
+                .map(|task| {
+                    task.status = TaskStatus::Running;
+                    task.started_at_ms = Some(now_ms());
+                    task.clone()
                 });
-            execution.map(|execution| Work {
-                pool: cluster.pools[&execution.pool].clone(),
-                execution,
+            task.map(|task| Work {
+                pool: cluster.pools[&task.pool].clone(),
+                task,
                 secrets: HashMap::new(),
             })
         };
         if let Some(mut work) = work {
-            save_execution(&app, &work.execution).await?;
+            save_task(&app, &work.task).await?;
             let encrypted = app
                 .database
-                .execution_secrets(work.execution.id)
+                .task_secrets(work.task.id)
                 .map_err(internal_error)?
                 .unwrap_or_default();
             work.secrets = app
                 .secrets
-                .decrypt(work.execution.id, &encrypted)
+                .decrypt(work.task.id, &encrypted)
                 .map_err(internal_error)?;
             return Ok(Json(Some(work)));
         }
@@ -2068,58 +2069,53 @@ struct NextWork {
 }
 
 #[derive(Deserialize)]
-struct CompleteExecution {
+struct CompleteTask {
     result: Option<Value>,
     error: Option<String>,
     timed_out: Option<bool>,
     #[serde(default)]
-    metrics: Option<ExecutionMetrics>,
+    metrics: Option<TaskMetrics>,
     #[serde(default)]
     keep_idle: bool,
 }
 
-async fn complete_execution(
+async fn complete_task(
     State(app): State<App>,
     headers: HeaderMap,
     AxumPath(id): AxumPath<Uuid>,
-    Json(request): Json<CompleteExecution>,
+    Json(request): Json<CompleteTask>,
 ) -> ApiResult<StatusCode> {
     let node = authenticated_node(&app, &headers).await?;
     let mut cluster = app.cluster.write().await;
-    let execution = cluster
-        .executions
+    let task = cluster
+        .tasks
         .get_mut(&id)
-        .ok_or_else(|| error(StatusCode::NOT_FOUND, "execution not found"))?;
-    if execution.node != Some(node) {
-        return Err(error(
-            StatusCode::FORBIDDEN,
-            "execution belongs to another node",
-        ));
+        .ok_or_else(|| error(StatusCode::NOT_FOUND, "task not found"))?;
+    if task.node != Some(node) {
+        return Err(error(StatusCode::FORBIDDEN, "task belongs to another node"));
     }
-    execution.status = if request.timed_out.unwrap_or(false) {
-        ExecutionStatus::TimedOut
+    task.status = if request.timed_out.unwrap_or(false) {
+        TaskStatus::TimedOut
     } else if request.error.is_some() {
-        ExecutionStatus::Failed
+        TaskStatus::Failed
     } else {
-        ExecutionStatus::Succeeded
+        TaskStatus::Succeeded
     };
-    execution.result = request.result;
-    execution.error = request.error;
-    execution.metrics = request.metrics;
-    execution.finished_at_ms = Some(now_ms());
+    task.result = request.result;
+    task.error = request.error;
+    task.metrics = request.metrics;
+    task.finished_at_ms = Some(now_ms());
     cluster.release(id, request.keep_idle);
     let scheduled = cluster.schedule_queued();
-    let execution = cluster.executions[&id].clone();
-    cluster.executions.remove(&id);
+    let task = cluster.tasks[&id].clone();
+    cluster.tasks.remove(&id);
     save(&app, &cluster).await?;
     drop(cluster);
     app.database
-        .save_executions(&scheduled)
+        .save_tasks(&scheduled)
         .map_err(internal_error)?;
-    app.database
-        .complete_execution(&execution)
-        .map_err(internal_error)?;
-    app.executions.notify_waiters();
+    app.database.complete_task(&task).map_err(internal_error)?;
+    app.tasks.notify_waiters();
     app.work.notify_waiters();
     Ok(StatusCode::NO_CONTENT)
 }
@@ -2133,7 +2129,7 @@ mod tests {
         let data_dir = std::env::temp_dir().join(format!("scraperack-test-{}", Uuid::new_v4()));
         fs::create_dir_all(&data_dir).await.unwrap();
         let database = Database::open(&data_dir.join("scraperack.db")).unwrap();
-        let secrets = SecretCipher::load(&data_dir.join("execution-secrets.key")).unwrap();
+        let secrets = SecretCipher::load(&data_dir.join("task-secrets.key")).unwrap();
         App {
             cluster: Arc::new(RwLock::new(Cluster::default())),
             database,
@@ -2141,7 +2137,7 @@ mod tests {
             controller_id: Uuid::new_v4(),
             plugins: Arc::new(Plugins::new(data_dir.join("plugins"), true)),
             data_dir,
-            executions: Arc::new(Notify::new()),
+            tasks: Arc::new(Notify::new()),
             work: Arc::new(Notify::new()),
         }
     }
@@ -2227,7 +2223,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn executions_resolve_pool_aliases_and_require_an_executor() {
+    async fn tasks_resolve_pool_aliases_and_require_an_executor() {
         let app = app().await;
         let image = with_image(&app).await;
         let mut vm_pool = pool("browsers", image);
@@ -2235,28 +2231,40 @@ mod tests {
         let mut runner = pool("runner", image);
         runner.executor = vec!["/bin/executor".into()];
         runner.aliases = vec!["jobs".into()];
+        runner.managed_by = Some("plugin:python".into());
         {
             let mut cluster = app.cluster.write().await;
             cluster.pools.insert(vm_pool.name.clone(), vm_pool);
             cluster.pools.insert(runner.name.clone(), runner);
         }
-        let request = |target: &str| CreateExecution {
-            pool: None,
-            environment: Some(target.into()),
+        let request = |target: &str| CreateTask {
+            pool: target.into(),
             payload: json!({"encoding": "json", "data": 1}),
             variables: HashMap::new(),
             secrets: HashMap::new(),
             queue: true,
         };
-        let (_, Json(execution)) = create_execution(State(app.clone()), Json(request("jobs")))
+        let (_, Json(task)) = create_task(State(app.clone()), Json(request("jobs")))
             .await
             .unwrap();
-        assert_eq!(execution.pool, "runner");
-        let rejected = create_execution(State(app.clone()), Json(request("chrome")))
+        assert_eq!(task.pool, "runner");
+        assert_eq!(task.owner.as_deref(), Some("plugin:python"));
+        let Json(owned) = list_tasks(
+            State(app.clone()),
+            Query(ListTasks {
+                limit: None,
+                pool: None,
+                owner: Some("plugin:python".into()),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(owned.len(), 1);
+        let rejected = create_task(State(app.clone()), Json(request("chrome")))
             .await
             .unwrap_err();
         assert_eq!(rejected.0, StatusCode::BAD_REQUEST);
-        let unknown = create_execution(State(app.clone()), Json(request("missing")))
+        let unknown = create_task(State(app.clone()), Json(request("missing")))
             .await
             .unwrap_err();
         assert_eq!(unknown.0, StatusCode::BAD_REQUEST);

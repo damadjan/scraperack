@@ -75,10 +75,10 @@ pub struct Pool {
     /// Extra read-only disks attached after the root filesystem, in order.
     #[serde(default)]
     pub disks: Vec<PoolDisk>,
-    /// Command the guest agent starts to handle execution payloads.
+    /// Command the guest agent starts to handle task payloads.
     #[serde(default)]
     pub executor: Vec<String>,
-    /// Extra names that resolve to this pool when submitting executions.
+    /// Extra names that resolve to this pool when submitting tasks.
     #[serde(default)]
     pub aliases: Vec<String>,
     #[serde(default)]
@@ -207,7 +207,7 @@ pub struct MicroVm {
     pub id: Uuid,
     pub pool: String,
     pub status: VmStatus,
-    pub execution: Option<Uuid>,
+    pub task: Option<Uuid>,
     pub pid: Option<u32>,
     pub cpu_millis: u32,
     pub memory_mib: u32,
@@ -254,7 +254,7 @@ pub struct JoinToken {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum ExecutionStatus {
+pub enum TaskStatus {
     Queued,
     Assigned,
     Running,
@@ -265,7 +265,7 @@ pub enum ExecutionStatus {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
-pub struct ExecutionMetricPoint {
+pub struct TaskMetricPoint {
     pub elapsed_ms: u64,
     pub cpu_percent: f32,
     pub memory_percent: f32,
@@ -273,19 +273,22 @@ pub struct ExecutionMetricPoint {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
-pub struct ExecutionMetrics {
+pub struct TaskMetrics {
     pub average_cpu_percent: f32,
     pub average_memory_percent: f32,
     pub peak_memory_percent: f32,
-    pub samples: Vec<ExecutionMetricPoint>,
+    pub samples: Vec<TaskMetricPoint>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Execution {
+pub struct Task {
     pub id: Uuid,
     pub pool: String,
+    /// Who managed the pool when the task was created, such as `plugin:python`.
+    #[serde(default)]
+    pub owner: Option<String>,
     pub node: Option<Uuid>,
-    pub status: ExecutionStatus,
+    pub status: TaskStatus,
     pub payload: Value,
     #[serde(default)]
     pub variables: HashMap<String, String>,
@@ -295,45 +298,43 @@ pub struct Execution {
     pub started_at_ms: Option<u64>,
     pub finished_at_ms: Option<u64>,
     #[serde(default)]
-    pub environment: Option<Uuid>,
-    #[serde(default)]
-    pub metrics: Option<ExecutionMetrics>,
+    pub metrics: Option<TaskMetrics>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExecutionView {
+pub struct TaskView {
     pub id: Uuid,
     pub pool: String,
+    pub owner: Option<String>,
     pub node: Option<Uuid>,
-    pub status: ExecutionStatus,
+    pub status: TaskStatus,
     pub error: Option<String>,
     pub created_at_ms: u64,
     pub started_at_ms: Option<u64>,
     pub finished_at_ms: Option<u64>,
-    pub environment: Option<Uuid>,
-    pub metrics: Option<ExecutionMetrics>,
+    pub metrics: Option<TaskMetrics>,
 }
 
-impl From<&Execution> for ExecutionView {
-    fn from(execution: &Execution) -> Self {
+impl From<&Task> for TaskView {
+    fn from(task: &Task) -> Self {
         Self {
-            id: execution.id,
-            pool: execution.pool.clone(),
-            node: execution.node,
-            status: execution.status.clone(),
-            error: execution.error.clone(),
-            created_at_ms: execution.created_at_ms,
-            started_at_ms: execution.started_at_ms,
-            finished_at_ms: execution.finished_at_ms,
-            environment: execution.environment,
-            metrics: execution.metrics.clone(),
+            id: task.id,
+            pool: task.pool.clone(),
+            owner: task.owner.clone(),
+            node: task.node,
+            status: task.status.clone(),
+            error: task.error.clone(),
+            created_at_ms: task.created_at_ms,
+            started_at_ms: task.started_at_ms,
+            finished_at_ms: task.finished_at_ms,
+            metrics: task.metrics.clone(),
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Work {
-    pub execution: Execution,
+    pub task: Task,
     pub pool: Pool,
     #[serde(default)]
     pub secrets: HashMap<String, String>,
@@ -345,7 +346,7 @@ pub struct Cluster {
     pub pools: HashMap<String, Pool>,
     pub nodes: HashMap<Uuid, Node>,
     #[serde(default, skip_serializing)]
-    pub executions: HashMap<Uuid, Execution>,
+    pub tasks: HashMap<Uuid, Task>,
     /// Legacy Python environments, migrated to the Python plugin on startup.
     #[serde(default, skip_serializing)]
     pub environments: HashMap<Uuid, Environment>,
@@ -391,22 +392,19 @@ impl Cluster {
         }
     }
 
-    pub fn schedule(&mut self, execution_id: Uuid) -> bool {
-        let Some(execution) = self.executions.get(&execution_id) else {
+    pub fn schedule(&mut self, task_id: Uuid) -> bool {
+        let Some(task) = self.tasks.get(&task_id) else {
             return false;
         };
-        let Some(pool) = self.pools.get(&execution.pool) else {
+        let Some(pool) = self.pools.get(&task.pool) else {
             return false;
         };
         let active = self
-            .executions
+            .tasks
             .values()
-            .filter(|execution| {
-                execution.pool == pool.name
-                    && matches!(
-                        execution.status,
-                        ExecutionStatus::Assigned | ExecutionStatus::Running
-                    )
+            .filter(|task| {
+                task.pool == pool.name
+                    && matches!(task.status, TaskStatus::Assigned | TaskStatus::Running)
             })
             .count();
         if pool
@@ -464,37 +462,37 @@ impl Cluster {
             node.used_cpu_millis = node.used_cpu_millis.saturating_add(pool.cpu_millis);
             node.used_memory_mib = node.used_memory_mib.saturating_add(pool.memory_mib);
         }
-        let execution = self.executions.get_mut(&execution_id).unwrap();
-        execution.node = Some(node_id);
-        execution.status = ExecutionStatus::Assigned;
+        let task = self.tasks.get_mut(&task_id).unwrap();
+        task.node = Some(node_id);
+        task.status = TaskStatus::Assigned;
         true
     }
 
-    pub fn schedule_queued(&mut self) -> Vec<Execution> {
+    pub fn schedule_queued(&mut self) -> Vec<Task> {
         let mut queued = self
-            .executions
+            .tasks
             .values()
-            .filter(|execution| execution.status == ExecutionStatus::Queued)
-            .map(|execution| (execution.created_at_ms, execution.id))
+            .filter(|task| task.status == TaskStatus::Queued)
+            .map(|task| (task.created_at_ms, task.id))
             .collect::<Vec<_>>();
         queued.sort();
         let mut scheduled = Vec::new();
         for (_, id) in queued {
             if self.schedule(id) {
-                scheduled.push(self.executions[&id].clone());
+                scheduled.push(self.tasks[&id].clone());
             }
         }
         scheduled
     }
 
-    pub fn release(&mut self, execution_id: Uuid, keep_idle: bool) {
-        let Some(execution) = self.executions.get(&execution_id) else {
+    pub fn release(&mut self, task_id: Uuid, keep_idle: bool) {
+        let Some(task) = self.tasks.get(&task_id) else {
             return;
         };
-        let Some(node_id) = execution.node else {
+        let Some(node_id) = task.node else {
             return;
         };
-        let Some(pool) = self.pools.get(&execution.pool) else {
+        let Some(pool) = self.pools.get(&task.pool) else {
             return;
         };
         if let Some(node) = self.nodes.get_mut(&node_id) {
@@ -516,14 +514,11 @@ impl Cluster {
             return false;
         };
         let active = self
-            .executions
+            .tasks
             .values()
-            .filter(|execution| {
-                execution.pool == pool.name
-                    && matches!(
-                        execution.status,
-                        ExecutionStatus::Assigned | ExecutionStatus::Running
-                    )
+            .filter(|task| {
+                task.pool == pool.name
+                    && matches!(task.status, TaskStatus::Assigned | TaskStatus::Running)
             })
             .count() as u32;
         let idle = self
@@ -562,14 +557,11 @@ impl Cluster {
             return false;
         };
         let active = self
-            .executions
+            .tasks
             .values()
-            .filter(|execution| {
-                execution.pool == pool.name
-                    && matches!(
-                        execution.status,
-                        ExecutionStatus::Assigned | ExecutionStatus::Running
-                    )
+            .filter(|task| {
+                task.pool == pool.name
+                    && matches!(task.status, TaskStatus::Assigned | TaskStatus::Running)
             })
             .count() as u32;
         let idle = self
@@ -590,14 +582,11 @@ impl Cluster {
         let targets = self.warm_targets(pool);
         let target = targets.get(&node_id).copied().unwrap_or(0);
         let active = self
-            .executions
+            .tasks
             .values()
-            .filter(|execution| {
-                execution.pool == pool.name
-                    && matches!(
-                        execution.status,
-                        ExecutionStatus::Assigned | ExecutionStatus::Running
-                    )
+            .filter(|task| {
+                task.pool == pool.name
+                    && matches!(task.status, TaskStatus::Assigned | TaskStatus::Running)
             })
             .count() as u32;
         let idle = self
@@ -648,14 +637,11 @@ impl Cluster {
 
     fn warm_targets(&self, pool: &Pool) -> HashMap<Uuid, u32> {
         let active = self
-            .executions
+            .tasks
             .values()
-            .filter(|execution| {
-                execution.pool == pool.name
-                    && matches!(
-                        execution.status,
-                        ExecutionStatus::Assigned | ExecutionStatus::Running
-                    )
+            .filter(|task| {
+                task.pool == pool.name
+                    && matches!(task.status, TaskStatus::Assigned | TaskStatus::Running)
             })
             .count() as u32;
         let target = if pool.reuse {
@@ -706,15 +692,12 @@ impl Cluster {
             return idle;
         }
         idle + self
-            .executions
+            .tasks
             .values()
-            .filter(|execution| {
-                execution.pool == pool.name
-                    && execution.node == Some(node_id)
-                    && matches!(
-                        execution.status,
-                        ExecutionStatus::Assigned | ExecutionStatus::Running
-                    )
+            .filter(|task| {
+                task.pool == pool.name
+                    && task.node == Some(node_id)
+                    && matches!(task.status, TaskStatus::Assigned | TaskStatus::Running)
             })
             .count() as u32
     }
@@ -793,13 +776,14 @@ mod tests {
 
         for expected in [first, second] {
             let id = Uuid::new_v4();
-            cluster.executions.insert(
+            cluster.tasks.insert(
                 id,
-                Execution {
+                Task {
                     id,
                     pool: "p".into(),
+                    owner: None,
                     node: None,
-                    status: ExecutionStatus::Queued,
+                    status: TaskStatus::Queued,
                     payload: Value::Null,
                     variables: HashMap::new(),
                     result: None,
@@ -807,22 +791,22 @@ mod tests {
                     created_at_ms: 0,
                     started_at_ms: None,
                     finished_at_ms: None,
-                    environment: None,
                     metrics: None,
                 },
             );
             assert!(cluster.schedule(id));
-            assert_eq!(cluster.executions[&id].node, Some(expected));
+            assert_eq!(cluster.tasks[&id].node, Some(expected));
         }
 
         let id = Uuid::new_v4();
-        cluster.executions.insert(
+        cluster.tasks.insert(
             id,
-            Execution {
+            Task {
                 id,
                 pool: "p".into(),
+                owner: None,
                 node: None,
-                status: ExecutionStatus::Queued,
+                status: TaskStatus::Queued,
                 payload: Value::Null,
                 variables: HashMap::new(),
                 result: None,
@@ -830,12 +814,11 @@ mod tests {
                 created_at_ms: 0,
                 started_at_ms: None,
                 finished_at_ms: None,
-                environment: None,
                 metrics: None,
             },
         );
         assert!(cluster.schedule(id));
-        assert_eq!(cluster.executions[&id].node, Some(first));
+        assert_eq!(cluster.tasks[&id].node, Some(first));
         assert_eq!(cluster.nodes[&first].used_memory_mib, 1024);
         cluster.pools.get_mut("p").unwrap().warm_instances = 4;
         assert!(cluster.add_warm_instance(second, "p"));
@@ -921,7 +904,7 @@ mod tests {
     fn rejects_an_instance_larger_than_a_node() {
         let image = Uuid::new_v4();
         let node_id = Uuid::new_v4();
-        let execution_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
         let mut cluster = Cluster::default();
         cluster.nodes.insert(node_id, node(node_id, image));
         cluster.pools.insert(
@@ -946,13 +929,14 @@ mod tests {
                 ..Default::default()
             },
         );
-        cluster.executions.insert(
-            execution_id,
-            Execution {
-                id: execution_id,
+        cluster.tasks.insert(
+            task_id,
+            Task {
+                id: task_id,
                 pool: "p".into(),
+                owner: None,
                 node: None,
-                status: ExecutionStatus::Queued,
+                status: TaskStatus::Queued,
                 payload: Value::Null,
                 variables: HashMap::new(),
                 result: None,
@@ -960,12 +944,11 @@ mod tests {
                 created_at_ms: 0,
                 started_at_ms: None,
                 finished_at_ms: None,
-                environment: None,
                 metrics: None,
             },
         );
 
-        assert!(!cluster.schedule(execution_id));
+        assert!(!cluster.schedule(task_id));
         assert!(!cluster.add_warm_instance(node_id, "p"));
     }
 
@@ -973,7 +956,7 @@ mod tests {
     fn reuses_idle_capacity_without_reserving_it_twice() {
         let image = Uuid::new_v4();
         let node_id = Uuid::new_v4();
-        let execution_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
         let mut cluster = Cluster::default();
         let mut worker = node(node_id, image);
         worker.used_cpu_millis = 250;
@@ -1002,13 +985,14 @@ mod tests {
                 ..Default::default()
             },
         );
-        cluster.executions.insert(
-            execution_id,
-            Execution {
-                id: execution_id,
+        cluster.tasks.insert(
+            task_id,
+            Task {
+                id: task_id,
                 pool: "p".into(),
+                owner: None,
                 node: None,
-                status: ExecutionStatus::Queued,
+                status: TaskStatus::Queued,
                 payload: Value::Null,
                 variables: HashMap::new(),
                 result: None,
@@ -1016,15 +1000,14 @@ mod tests {
                 created_at_ms: 0,
                 started_at_ms: None,
                 finished_at_ms: None,
-                environment: None,
                 metrics: None,
             },
         );
 
-        assert!(cluster.schedule(execution_id));
+        assert!(cluster.schedule(task_id));
         assert_eq!(cluster.nodes[&node_id].idle_instances["p"], 0);
         assert_eq!(cluster.nodes[&node_id].used_memory_mib, 256);
-        cluster.release(execution_id, true);
+        cluster.release(task_id, true);
         assert_eq!(cluster.nodes[&node_id].idle_instances["p"], 1);
         assert_eq!(cluster.nodes[&node_id].used_memory_mib, 256);
     }
