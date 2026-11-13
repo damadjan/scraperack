@@ -31,6 +31,7 @@ use crate::cluster::{
     Disk, Image, MicroVm, Pool, PortProtocol, PublishedPort, TaskMetricPoint, TaskMetrics,
     VmStatus, Work,
 };
+use crate::uffd;
 
 const GUEST_PORT: u32 = 5000;
 const NETWORK: &str = "10.240.0.0/16";
@@ -1387,14 +1388,28 @@ async fn start_vm(
     let mut child = start_firecracker(firecracker, &api_socket, id, log)?;
     let result = async {
         wait_for_path(&api_socket, &mut child).await?;
-        attach_cgroup(child.id().context("firecracker exited")?, pool, id).await?;
+        let pid = child.id().context("firecracker exited")?;
+        attach_cgroup(pid, pool, id).await?;
+        // Guest memory: served by our userfaultfd handler, which prefaults the snapshot's
+        // working set before the VM resumes; or mapped straight from the memory file.
+        let prefault = if uffd::enabled() {
+            Some(uffd::serve(
+                &directory,
+                &snapshot.directory,
+                &snapshot.memory,
+                pid,
+            )?)
+        } else {
+            None
+        };
+        let mem_backend = match &prefault {
+            Some((socket, _)) => json!({"backend_path": socket, "backend_type": "Uffd"}),
+            None => json!({"backend_path": snapshot.memory, "backend_type": "File"}),
+        };
         let mut load = json!({
             "snapshot_path": snapshot.state,
-            "mem_backend": {
-                "backend_path": snapshot.memory,
-                "backend_type": "File"
-            },
-            "resume_vm": true,
+            "mem_backend": mem_backend,
+            "resume_vm": prefault.is_none(),
             "vsock_override": {"uds_path": vsock}
         });
         if let Some(lease) = &network_lease {
@@ -1404,54 +1419,49 @@ async fn start_vm(
             }]);
         }
         firecracker_request("PUT", &api_socket, "/snapshot/load", &load).await?;
+        if let Some((_, report)) = prefault {
+            let prefaulted =
+                tokio::task::spawn_blocking(move || report.recv_timeout(Duration::from_secs(20)))
+                    .await?
+                    .context("guest memory prefault timed out")??;
+            tracing::debug!(
+                pages = prefaulted.pages,
+                elapsed_ms = prefaulted.elapsed.as_millis() as u64,
+                recording = prefaulted.recording,
+                "prefaulted guest memory"
+            );
+            firecracker_request("PATCH", &api_socket, "/vm", &json!({"state": "Resumed"})).await?;
+        }
         let unix_time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .context("system time is before the Unix epoch")?
             .as_secs_f64();
-        let ready = tokio::time::timeout(
-            Duration::from_secs(10),
-            guest_request(
-                &vsock,
-                &json!({"encoding": "scraperack-snapshot", "unix_time": unix_time}),
-            ),
-        )
-        .await
-        .context("restored guest did not become ready")??;
-        if let Some(error) = ready.error {
-            bail!("restored guest failed its readiness check: {error}");
-        }
-        if let Some(lease) = &network_lease {
-            let configured = tokio::time::timeout(
-                Duration::from_secs(10),
-                guest_request(
-                    &vsock,
-                    &json!({
-                        "encoding": "scraperack-network",
-                        "address": lease.guest_ip,
-                        "prefix": 30,
-                        "gateway": lease.gateway,
-                        "dns": [GUEST_DNS],
-                    }),
-                ),
-            )
-            .await
-            .context("guest network configuration timed out")??;
-            if let Some(error) = configured.error {
-                bail!("guest network configuration failed: {error}");
-            }
-        }
-        if !pool.preload.is_empty() {
-            let mut preload = json!({"encoding": "scraperack-preload", "modules": &pool.preload});
+        if snapshot.single_restore() {
+            let mut restore = json!({"encoding": "scraperack-restore", "unix_time": unix_time});
             if let Some(lease) = &network_lease {
-                preload["url"] = json!(format!("http://{}:7070/health", lease.gateway));
+                restore["network"] = json!({
+                    "address": lease.guest_ip,
+                    "prefix": 30,
+                    "gateway": lease.gateway,
+                    "dns": [GUEST_DNS],
+                });
             }
-            let preloaded =
-                tokio::time::timeout(Duration::from_secs(30), guest_request(&vsock, &preload))
+            if !pool.preload.is_empty() {
+                restore["preload"] = json!(&pool.preload);
+                if let Some(lease) = &network_lease {
+                    restore["url"] = json!(format!("http://{}:7070/health", lease.gateway));
+                }
+            }
+            let limit = if pool.preload.is_empty() { 10 } else { 40 };
+            let restored =
+                tokio::time::timeout(Duration::from_secs(limit), guest_request(&vsock, &restore))
                     .await
-                    .context("restored guest preload timed out")??;
-            if let Some(error) = preloaded.error {
-                bail!("restored guest preload failed: {error}");
+                    .context("restored guest did not become ready")??;
+            if let Some(error) = restored.error {
+                bail!("restored guest failed to resume: {error}");
             }
+        } else {
+            restore_in_steps(&vsock, pool, network_lease.as_ref(), unix_time).await?;
         }
         connect_vsock(&vsock).await
     }
@@ -1510,6 +1520,68 @@ impl SnapshotPaths {
     fn ready(&self) -> bool {
         self.state.exists() && self.memory.exists() && self.directory.join("ready").exists()
     }
+
+    /// The snapshot's guest agent resumes with one `scraperack-restore` request.
+    fn single_restore(&self) -> bool {
+        self.directory.join(SINGLE_RESTORE).exists()
+    }
+}
+
+const SINGLE_RESTORE: &str = "restore-v1";
+
+/// Resume a guest whose agent predates `scraperack-restore`: three round trips.
+async fn restore_in_steps(
+    vsock: &Path,
+    pool: &Pool,
+    network_lease: Option<&NetworkLease>,
+    unix_time: f64,
+) -> Result<()> {
+    let ready = tokio::time::timeout(
+        Duration::from_secs(10),
+        guest_request(
+            vsock,
+            &json!({"encoding": "scraperack-snapshot", "unix_time": unix_time}),
+        ),
+    )
+    .await
+    .context("restored guest did not become ready")??;
+    if let Some(error) = ready.error {
+        bail!("restored guest failed its readiness check: {error}");
+    }
+    if let Some(lease) = network_lease {
+        let configured = tokio::time::timeout(
+            Duration::from_secs(10),
+            guest_request(
+                vsock,
+                &json!({
+                    "encoding": "scraperack-network",
+                    "address": lease.guest_ip,
+                    "prefix": 30,
+                    "gateway": lease.gateway,
+                    "dns": [GUEST_DNS],
+                }),
+            ),
+        )
+        .await
+        .context("guest network configuration timed out")??;
+        if let Some(error) = configured.error {
+            bail!("guest network configuration failed: {error}");
+        }
+    }
+    if !pool.preload.is_empty() {
+        let mut preload = json!({"encoding": "scraperack-preload", "modules": &pool.preload});
+        if let Some(lease) = network_lease {
+            preload["url"] = json!(format!("http://{}:7070/health", lease.gateway));
+        }
+        let preloaded =
+            tokio::time::timeout(Duration::from_secs(30), guest_request(vsock, &preload))
+                .await
+                .context("restored guest preload timed out")??;
+        if let Some(error) = preloaded.error {
+            bail!("restored guest preload failed: {error}");
+        }
+    }
+    Ok(())
 }
 
 async fn ensure_snapshot(
@@ -1591,6 +1663,15 @@ async fn ensure_snapshot(
         .context("guest did not become snapshot-ready")??;
         if let Some(error) = ready.error {
             bail!("guest snapshot preparation failed: {error}");
+        }
+        let single_restore = ready
+            .result
+            .as_ref()
+            .and_then(|result| result.pointer("/value/data/restore"))
+            .and_then(Value::as_u64)
+            .is_some_and(|version| version >= 1);
+        if single_restore {
+            fs::write(temporary.directory.join(SINGLE_RESTORE), []).await?;
         }
         firecracker_request("PATCH", &api_socket, "/vm", &json!({"state": "Paused"})).await?;
         firecracker_put(

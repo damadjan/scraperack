@@ -17,6 +17,11 @@ import time
 import traceback
 from pathlib import Path
 
+try:
+    import ctypes
+except ImportError:  # minimal Python builds may lack it
+    ctypes = None
+
 EXECUTOR_SOCKET = Path("/tmp/scraperack-executor.sock")
 SERVICE = Path("/etc/scraperack-service.json")
 
@@ -52,12 +57,29 @@ def configure_network(payload):
             raise OSError(-error, os.strerror(-error))
     resolv = Path("/tmp/resolv.conf")
     resolv.write_text("".join(f"nameserver {server}\n" for server in payload["dns"]))
-    subprocess.run(["mount", "--bind", resolv, "/etc/resolv.conf"], check=True)
+    bind_mount(str(resolv), "/etc/resolv.conf")
+    # Resolve the gateway's and DNS server's neighbours now; packets queue until it is done,
+    # so there is no need to wait here.
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
         probe.sendto(b"\0", (payload["gateway"], 9))
         for server in payload["dns"]:
             probe.sendto(b"\0", (server, 53))
-    time.sleep(.05)
+
+
+try:
+    LIBC = ctypes.CDLL(None, use_errno=True) if ctypes else None
+except OSError:
+    LIBC = None
+MS_BIND = 4096
+
+
+def bind_mount(source, target):
+    """mount --bind without starting a process (fork and exec are slow right after a restore)."""
+    if LIBC is None:
+        subprocess.run(["mount", "--bind", source, target], check=True)
+    elif LIBC.mount(source.encode(), target.encode(), None, MS_BIND, None) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, f"bind mount {source} on {target}: {os.strerror(error)}")
 
 
 def ipv4_mask(prefix):
@@ -185,10 +207,28 @@ def handle(connection):
                     "result": {"value": {"encoding": "json", "data": {
                         "compatible": True,
                         "executor": bool(executor_command),
+                        # The node may restore this guest with one scraperack-restore request.
+                        "restore": 1,
                     }}, "stdout": "", "stderr": ""},
                     "error": None,
                     "timed_out": False,
                 }
+            elif payload["encoding"] == "scraperack-restore":
+                # Everything a restored guest needs, in one round trip: each round trip
+                # costs page faults in a freshly restored VM.
+                time.clock_settime(time.CLOCK_REALTIME, payload["unix_time"])
+                if service and service.poll() not in (None, 0):
+                    raise RuntimeError(f"service exited {service.returncode}")
+                if payload.get("network"):
+                    configure_network(payload["network"])
+                if payload.get("preload"):
+                    preload = {"encoding": "scraperack-preload", "modules": payload["preload"]}
+                    if payload.get("url"):
+                        preload["url"] = payload["url"]
+                    preloaded = executor_request(preload)
+                    if preloaded["error"]:
+                        raise RuntimeError(preloaded["error"])
+                response = {"result": None, "error": None, "timed_out": False}
             elif payload["encoding"] == "scraperack-network":
                 configure_network(payload)
                 response = {"result": None, "error": None, "timed_out": False}

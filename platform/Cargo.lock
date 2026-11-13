@@ -1159,6 +1159,7 @@ dependencies = [
  "hex",
  "hyper",
  "hyper-util",
+ "libc",
  "reqwest",
  "ring",
  "rusqlite",
