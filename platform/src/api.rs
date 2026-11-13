@@ -527,7 +527,13 @@ async fn build_docker_image(
     .map_err(|_| {
         "Docker image must contain /usr/bin/python3 for the Scraperack guest agent".to_string()
     })?;
-    let container = command("docker", ["create", reference]).await?;
+    // The container is only exported, never started. Docker refuses to create one for an
+    // image without an entrypoint or command, so give it the interpreter checked above.
+    let container = command(
+        "docker",
+        ["create", "--entrypoint", "/usr/bin/python3", reference],
+    )
+    .await?;
     let container = container.trim();
     let archive = work.join("rootfs.tar");
     let exported = command("docker", ["export", "--output", path(&archive)?, container]).await;
