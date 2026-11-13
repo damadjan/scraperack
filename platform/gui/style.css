@@ -18,6 +18,7 @@ html, body, #app, .q-layout, .q-page-container { background: var(--base); color:
 .nav-link:hover { background: var(--surface-2); }
 .nav-group { padding: 8px 8px 2px; color: #777; font-size: 10px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; }
 .nav-active { background: var(--nav-active); color: var(--accent); }
+.nicegui-content { padding: 0; }
 .content { width: 100%; min-height: 100vh; padding: 6px 8px; }
 .mobile-menu { display: none; align-self: flex-start; }
 .summary-grid { display: grid; grid-template-columns: repeat(4, minmax(190px, 1fr)); gap: 8px; width: 100%; }
@@ -88,8 +89,8 @@ html, body, #app, .q-layout, .q-page-container { background: var(--base); color:
 .error-block { border-color: #7f1d1d; background: #230b0b; }
 .status-starting { color: #67e8f9; border-color: #155e75; background: #083344; }
 .status-stopped { color: #d4d4d4; border-color: #525252; background: #262626; }
-.plugin-frame { width: 100%; height: calc(100vh - 16px); border: 0; border-radius: 8px; background: var(--base); }
-@media (max-width: 800px) { .plugin-frame { height: calc(100vh - 60px); } }
+.plugin-frame { display: block; width: 100%; height: calc(100vh - 16px); border: 0; border-radius: 8px; background: var(--base); }
+@media (max-width: 800px) { .plugin-frame { height: calc(100vh - 64px); } }
 @media (max-width: 1000px) {
   .summary-grid { grid-template-columns: repeat(2, 1fr); }
   .detail-grid { grid-template-columns: repeat(2, 1fr); }
