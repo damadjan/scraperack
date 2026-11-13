@@ -3,7 +3,7 @@
 
 Runs as PID 1 inside every microVM. It is workload-agnostic: the pool tells it,
 in the first ``scraperack-snapshot`` request, which extra disks to mount and
-which executor command handles execution payloads. Executors speak
+which executor command handles task payloads. Executors speak
 length-prefixed JSON over ``/tmp/scraperack-executor.sock``.
 """
 import fcntl

@@ -64,7 +64,7 @@ html, body, #app, .q-layout, .q-page-container { background: var(--base); color:
 .port-map a, .port-map code { color: #d4d4d4; text-decoration: none; }
 .port-map a:hover { color: var(--accent); text-decoration: underline; }
 .port-map b { color: var(--accent); font-weight: 400; }
-.execution-dialog { width: 980px; max-width: 95vw; max-height: 92vh; overflow: auto; padding: 14px; gap: 10px; }
+.detail-dialog { width: 980px; max-width: 95vw; max-height: 92vh; overflow: auto; padding: 14px; gap: 10px; }
 .dialog-eyebrow, .detail-label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .08em; }
 .dialog-title { font-size: 16px; overflow-wrap: anywhere; }
 .status-pill { border: 1px solid #4b4b4b; border-radius: 999px; padding: 5px 10px; font-size: 12px; }
@@ -101,5 +101,5 @@ html, body, #app, .q-layout, .q-page-container { background: var(--base); color:
 @media (max-width: 600px) {
   .summary-grid, .detail-grid, .metric-charts, .timeline, .payload-grid { grid-template-columns: 1fr; }
   .content { padding: 6px; }
-  .execution-dialog { padding: 10px; }
+  .detail-dialog { padding: 10px; }
 }
