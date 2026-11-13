@@ -182,27 +182,21 @@ def summary(icon, label, value, detail):
     return value_label, detail_label
 
 
-def table(columns, rows=None, selection=False, row_key=None, full_height=False):
+def table(columns, rows=None, selection=False, row_key=None):
+    """A data grid that fills the rest of the page and pages as many rows as fit."""
     options = {
         "columnDefs": columns,
         "rowData": rows or [],
         "defaultColDef": {"sortable": True, "filter": True, "resizable": True, "flex": 1, "minWidth": 100},
         "pagination": True,
-        "paginationPageSize": 10,
-        "paginationPageSizeSelector": [10, 25, 50],
+        "paginationAutoPageSize": True,
+        "paginationPageSizeSelector": False,
     }
-    if full_height:
-        options["paginationAutoPageSize"] = True
-        options["paginationPageSizeSelector"] = False
-    else:
-        options["domLayout"] = "autoHeight"
     if selection:
         options["rowSelection"] = {"mode": "singleRow", "checkboxes": False, "enableClickSelection": True}
     if row_key:
         options[":getRowId"] = f"(params) => params.data.{row_key}"
-    grid = ui.aggrid(options, auto_size_columns=False).classes(
-        f'data-grid {"full-height-grid" if full_height else ""}'
-    )
+    grid = ui.aggrid(options, auto_size_columns=False).classes("data-grid")
     return grid.classes("clickable-grid") if selection else grid
 
 
@@ -276,7 +270,7 @@ async def nodes_page():
             {"headerName": "Idle VMs", "field": "idle_count", "maxWidth": 110},
             {"headerName": "Concurrent VM starts", "field": "vm_start_concurrency", "minWidth": 190},
             {"headerName": "Last heartbeat", "field": "last_seen", "minWidth": 190},
-        ], row_key="id", full_height=True)
+        ], row_key="id")
 
     known = {}
     initialized = False
