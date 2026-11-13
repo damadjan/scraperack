@@ -274,6 +274,7 @@ pub async fn serve(
     });
     let router = router(app.clone());
     app.plugins.set_router(router.clone());
+    plugins::backfill_guest_digests(&app).await;
     let plugins = app.plugins.clone();
     tokio::spawn(async move { plugins.start_all(plugin_records).await });
 

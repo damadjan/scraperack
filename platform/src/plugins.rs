@@ -512,6 +512,122 @@ async fn unpack(archive: &Path, target: &Path) -> Result<(PathBuf, Manifest)> {
     bail!("{MANIFEST} must be at the top of the archive")
 }
 
+/// Digest of a guest folder's paths, file types, permissions, and contents.
+///
+/// `mkfs.ext4` writes a random UUID and timestamps, so two builds of the same
+/// files never hash alike; this digest decides whether a rebuild is needed.
+async fn guest_digest(directory: &Path) -> Result<String> {
+    let directory = directory.to_owned();
+    tokio::task::spawn_blocking(move || guest_digest_blocking(&directory)).await?
+}
+
+fn guest_digest_blocking(root: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::PermissionsExt;
+
+    fn walk(root: &Path, directory: &Path, entries: &mut Vec<PathBuf>) -> Result<()> {
+        for entry in std::fs::read_dir(directory)? {
+            let path = entry?.path();
+            entries.push(path.strip_prefix(root)?.to_owned());
+            if std::fs::symlink_metadata(&path)?.is_dir() {
+                walk(root, &path, entries)?;
+            }
+        }
+        Ok(())
+    }
+
+    if !root.is_dir() {
+        bail!("guest directory {} does not exist", root.display());
+    }
+    let mut entries = Vec::new();
+    walk(root, root, &mut entries)?;
+    entries.sort();
+    let mut digest = Sha256::new();
+    digest.update(b"scraperack-guest-disk-v1\0");
+    for relative in entries {
+        let path = root.join(&relative);
+        let metadata = std::fs::symlink_metadata(&path)?;
+        let name = relative.to_str().context("guest paths must be UTF-8")?;
+        let mode = metadata.permissions().mode() & 0o7777;
+        let kind = if metadata.is_dir() {
+            "d"
+        } else if metadata.file_type().is_symlink() {
+            "l"
+        } else {
+            "f"
+        };
+        digest.update(format!("{kind}\0{name}\0{mode:o}\0").as_bytes());
+        if metadata.file_type().is_symlink() {
+            digest.update(std::fs::read_link(&path)?.as_os_str().as_encoded_bytes());
+        } else if metadata.is_file() {
+            let mut file = std::fs::File::open(&path)?;
+            let mut content = Sha256::new();
+            std::io::copy(&mut file, &mut content)?;
+            digest.update(content.finalize());
+        }
+        digest.update(b"\n");
+    }
+    Ok(hex::encode(digest.finalize()))
+}
+
+/// Record guest digests for plugins installed before digests existed, so their
+/// next update can reuse the disk too.
+pub async fn backfill_guest_digests(app: &App) {
+    let records = app.cluster.read().await.plugins.clone();
+    for record in records.values() {
+        if record.guest_disk.is_none() || record.guest_digest.is_some() {
+            continue;
+        }
+        let directory = app.plugins.version_dir(&record.name, &record.version);
+        let digest = async {
+            let manifest = read_manifest(&directory).await?;
+            let guest = manifest.guest.context("manifest has no guest folder")?;
+            guest_digest(&directory.join(guest)).await
+        }
+        .await;
+        match digest {
+            Ok(digest) => {
+                let mut cluster = app.cluster.write().await;
+                if let Some(stored) = cluster.plugins.get_mut(&record.name)
+                    && stored.version == record.version
+                    && stored.guest_digest.is_none()
+                {
+                    stored.guest_digest = Some(digest);
+                    if let Err((_, Json(body))) = save(app, &cluster).await {
+                        tracing::warn!(plugin = %record.name, error = %body["error"], "could not save guest digest");
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(plugin = %record.name, %error, "could not compute guest digest");
+            }
+        }
+    }
+}
+
+/// A disk the previous install built from the same guest files, if it still exists.
+async fn reusable_guest_disk(
+    app: &App,
+    previous: Option<&PluginRecord>,
+    digest: &str,
+) -> Option<String> {
+    let previous = previous?;
+    let cluster = app.cluster.read().await;
+    [
+        (&previous.guest_digest, &previous.guest_disk),
+        (
+            &previous.previous_guest_digest,
+            &previous.previous_guest_disk,
+        ),
+    ]
+    .into_iter()
+    .find_map(|(candidate, key)| {
+        let key = key.as_ref()?;
+        (candidate.as_deref() == Some(digest) && cluster.disks.contains_key(key))
+            .then(|| key.clone())
+    })
+}
+
 /// Build the plugin's guest directory into an ext4 disk and register it.
 async fn build_guest_disk(app: &App, directory: &Path, owner: &str) -> Result<String> {
     let path = |value: &Path| value.to_str().context("invalid path").map(str::to_owned);
@@ -735,23 +851,36 @@ async fn install(app: &App, staged: &Staged) -> Result<InstallResult> {
         log.push_str(&format!("$ {}\n", manifest.install.join(" ")));
         log.push_str(&run_command(&manifest.install, &directory, &env).await?);
     }
-    let guest_disk = match &manifest.guest {
+    let (guest_disk, guest_digest) = match &manifest.guest {
         Some(guest) => {
-            let key = build_guest_disk(app, &directory.join(guest), &name).await?;
-            log.push_str(&format!("Built guest disk {key}\n"));
-            Some(key)
+            let source = directory.join(guest);
+            let digest = guest_digest(&source).await?;
+            match reusable_guest_disk(app, previous.as_ref(), &digest).await {
+                Some(key) => {
+                    log.push_str(&format!("Guest files unchanged; reusing disk {key}\n"));
+                    (Some(key), Some(digest))
+                }
+                None => {
+                    let key = build_guest_disk(app, &source, &name).await?;
+                    log.push_str(&format!("Built guest disk {key}\n"));
+                    (Some(key), Some(digest))
+                }
+            }
         }
-        None => None,
+        None => (None, None),
     };
-    let (previous_version, previous_guest_disk) = match &previous {
-        Some(old) if old.version != manifest.version => {
-            (Some(old.version.clone()), old.guest_disk.clone())
-        }
+    let (previous_version, previous_guest_disk, previous_guest_digest) = match &previous {
+        Some(old) if old.version != manifest.version => (
+            Some(old.version.clone()),
+            old.guest_disk.clone(),
+            old.guest_digest.clone(),
+        ),
         Some(old) => (
             old.previous_version.clone(),
             old.previous_guest_disk.clone(),
+            old.previous_guest_digest.clone(),
         ),
-        None => (None, None),
+        None => (None, None, None),
     };
     let record = PluginRecord {
         name: name.clone(),
@@ -762,6 +891,8 @@ async fn install(app: &App, staged: &Staged) -> Result<InstallResult> {
         gui: manifest.gui,
         guest_disk,
         previous_guest_disk,
+        guest_digest,
+        previous_guest_digest,
         installed_at_ms: now_ms(),
     };
     let save_record = |record: PluginRecord| async move {
@@ -885,6 +1016,7 @@ pub async fn rollback_plugin(
             .ok_or_else(|| error(StatusCode::CONFLICT, "no previous version to roll back to"))?;
         record.previous_version = Some(std::mem::replace(&mut record.version, previous));
         std::mem::swap(&mut record.guest_disk, &mut record.previous_guest_disk);
+        std::mem::swap(&mut record.guest_digest, &mut record.previous_guest_digest);
         record.enabled = true;
         let record = record.clone();
         save(&app, &cluster).await?;
@@ -1045,6 +1177,44 @@ pub async fn proxy(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guest_digest_follows_content_not_timestamps() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!("scraperack-guest-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("lib")).unwrap();
+        std::fs::write(root.join("executor.py"), b"print(1)").unwrap();
+        std::fs::write(root.join("lib/runtime.py"), b"X = 1").unwrap();
+        let first = guest_digest_blocking(&root).unwrap();
+
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(root.join("executor.py"), b"print(1)").unwrap();
+        assert_eq!(
+            guest_digest_blocking(&root).unwrap(),
+            first,
+            "rewrite, same bytes"
+        );
+
+        std::fs::write(root.join("lib/runtime.py"), b"X = 2").unwrap();
+        let changed = guest_digest_blocking(&root).unwrap();
+        assert_ne!(changed, first, "content change");
+
+        std::fs::set_permissions(
+            root.join("executor.py"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        assert_ne!(
+            guest_digest_blocking(&root).unwrap(),
+            changed,
+            "mode change"
+        );
+
+        std::fs::rename(root.join("lib/runtime.py"), root.join("lib/other.py")).unwrap();
+        assert_ne!(guest_digest_blocking(&root).unwrap(), changed, "rename");
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn validates_manifests() {
