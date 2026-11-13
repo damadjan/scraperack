@@ -266,8 +266,6 @@ async def nodes_page():
             ui.label("Cluster nodes").classes("section-title")
             ui.space()
             ui.label("Live · 1 second").classes("text-xs muted")
-            revoke_button = ui.button("Revoke", icon="link_off", color="negative") \
-                .props("outline no-caps")
         nodes = table([
             {"headerName": "Name", "field": "name"},
             {"headerName": "Status", "field": "status", "maxWidth": 120, ":cellRenderer": "statusRenderer"},
@@ -278,7 +276,7 @@ async def nodes_page():
             {"headerName": "Idle VMs", "field": "idle_count", "maxWidth": 110},
             {"headerName": "Concurrent VM starts", "field": "vm_start_concurrency", "minWidth": 190},
             {"headerName": "Last heartbeat", "field": "last_seen", "minWidth": 190},
-        ], selection=True, row_key="id", full_height=True)
+        ], row_key="id", full_height=True)
 
     known = {}
     initialized = False
@@ -348,23 +346,34 @@ async def nodes_page():
                 except Exception as error:
                     notify_error(error)
 
-            with ui.row().classes("w-full justify-end"):
+            with ui.dialog() as confirm, ui.card():
+                ui.label(f'Revoke {selected["name"]}?').classes("section-title")
+                ui.label("This removes the node from the cluster.") \
+                    .classes("text-sm muted")
+                with ui.row().classes("w-full justify-end"):
+                    ui.button("Cancel", on_click=confirm.close).props("flat no-caps")
+                    ui.button("Revoke", color="negative", on_click=lambda: confirm.submit(True)) \
+                        .props("no-caps")
+
+            async def revoke():
+                if not await confirm:
+                    return
+                try:
+                    await request("DELETE", f'/v1/nodes/{selected["id"]}')
+                    dialog.close()
+                    ui.notify(f'Revoked {selected["name"]}', type="positive")
+                    await refresh()
+                except Exception as error:
+                    notify_error(error)
+
+            with ui.row().classes("w-full items-center"):
+                ui.button("Revoke", icon="link_off", color="negative", on_click=revoke) \
+                    .props("outline no-caps")
+                ui.space()
                 ui.button("Cancel", on_click=dialog.close).props("flat no-caps")
                 ui.button("Save", on_click=save_settings).props("no-caps")
         dialog.open()
 
-    async def revoke():
-        selected = await nodes.get_selected_row()
-        if not selected:
-            return ui.notify("Select a node first", type="warning")
-        try:
-            await request("DELETE", f'/v1/nodes/{selected["id"]}')
-            ui.notify(f'Revoked {selected["name"]}', type="positive")
-            await refresh()
-        except Exception as error:
-            notify_error(error)
-
-    revoke_button.on_click(revoke)
     nodes.classes("clickable-grid").on("cellClicked", settings, ["data"])
     await refresh()
     ui.timer(1, refresh)
