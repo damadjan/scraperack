@@ -910,6 +910,37 @@ async fn ensure_working_dir(
     Ok(path)
 }
 
+/// Tell the controller about a VM as soon as it runs a task, instead of at the next
+/// heartbeat, so `/v1/vms` shows its address and ports right away. Best effort.
+async fn report_running_vm(client: &Client, controller: &str, work: &Work, vms: &Mutex<VmState>) {
+    let Some(node) = work.task.node else {
+        return;
+    };
+    let Some(vm) = vms
+        .lock()
+        .await
+        .running
+        .values()
+        .find(|vm| vm.task == Some(work.task.id))
+        .cloned()
+    else {
+        return;
+    };
+    let client = client.clone();
+    let url = format!("{controller}/internal/nodes/{node}/vms");
+    tokio::spawn(async move {
+        if let Err(error) = client
+            .post(url)
+            .json(&vm)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+        {
+            tracing::debug!(%error, "failed to report running VM");
+        }
+    });
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_task(
     client: &Client,
@@ -1035,6 +1066,7 @@ async fn run_task(
             environment: work.pool.environment,
         },
     );
+    report_running_vm(client, controller, work, vms).await;
     let mut payload = work.task.payload.clone();
     if let Some(payload) = payload.as_object_mut() {
         payload.remove("working_dir");

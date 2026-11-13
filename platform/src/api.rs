@@ -373,6 +373,7 @@ fn router(app: App) -> Router {
                 .delete(remove_idle_instance),
         )
         .route("/internal/nodes/{id}/work", get(next_work))
+        .route("/internal/nodes/{id}/vms", post(report_vm))
         .route("/internal/tasks/{id}/complete", post(complete_task))
         .layer(DefaultBodyLimit::disable())
         .with_state(app)
@@ -2351,6 +2352,27 @@ async fn image_ready(
         .save_tasks(&scheduled)
         .map_err(internal_error)?;
     app.work.notify_waiters();
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// A node reports one VM as soon as it starts running a task, ahead of its heartbeat.
+async fn report_vm(
+    State(app): State<App>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<Uuid>,
+    Json(vm): Json<MicroVm>,
+) -> ApiResult<StatusCode> {
+    if authenticated_node(&app, &headers).await? != id {
+        return Err(error(StatusCode::FORBIDDEN, "node identity mismatch"));
+    }
+    let mut cluster = app.cluster.write().await;
+    let node = cluster
+        .nodes
+        .get_mut(&id)
+        .ok_or_else(|| error(StatusCode::NOT_FOUND, "node not found"))?;
+    node.vms.retain(|existing| existing.id != vm.id);
+    node.vms.push(vm);
+    node.vms.sort_by_key(|vm| vm.id);
     Ok(StatusCode::NO_CONTENT)
 }
 
