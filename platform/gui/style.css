@@ -38,8 +38,9 @@ html, body, #app, .q-layout, .q-page-container { background: var(--base); color:
 .status-ready { color: #10b981; }
 .status-busy { color: #f59e0b; }
 .status-error { color: #ef4444; }
-.data-grid { width: 100%; cursor: default; }
-.full-height-grid { height: calc(100vh - 54px); min-height: 360px; }
+.nicegui-content:has(.data-grid) { height: 100dvh; }
+.content:has(> .data-grid) { flex: 1 0 auto; min-height: 0; }
+.data-grid { width: 100%; flex: 1 1 0; min-height: 260px; cursor: default; }
 .data-grid .ag-root-wrapper {
   --ag-background-color: var(--surface);
   --ag-foreground-color: #dedede;
@@ -97,7 +98,6 @@ html, body, #app, .q-layout, .q-page-container { background: var(--base); color:
 }
 @media (max-width: 800px) {
   .mobile-menu { display: inline-flex; }
-  .full-height-grid { height: calc(100vh - 98px); }
 }
 @media (max-width: 600px) {
   .summary-grid, .detail-grid, .metric-charts, .timeline, .payload-grid { grid-template-columns: 1fr; }
