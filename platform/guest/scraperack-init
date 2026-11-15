@@ -5,14 +5,19 @@ Runs as PID 1 inside every microVM. It is workload-agnostic: the pool tells it,
 in the first ``scraperack-snapshot`` request, which extra disks to mount and
 which executor command handles task payloads. Executors speak
 length-prefixed JSON over ``/tmp/scraperack-executor.sock``.
+
+Each host connection is served on its own thread, so the host can flush disks or
+mount a volume while a task runs. Executor requests run one at a time.
 """
 import fcntl
 import json
 import os
+import shutil
 import socket
 import string
 import struct
 import subprocess
+import threading
 import time
 import traceback
 from pathlib import Path
@@ -104,6 +109,42 @@ def mount_disks(mounts):
                        check=True)
 
 
+def mount_volume(payload):
+    """Mount the volume the host swapped in for the snapshot's placeholder drive."""
+    device, target, size = payload["device"], Path(payload["mount"]), int(payload["size"])
+    if not target.is_absolute():
+        raise ValueError(f"volume mount must be absolute: {target}")
+    deadline = time.monotonic() + 30
+    with open(device, "rb") as block:
+        while True:
+            # BLKGETSIZE64: the new size shows once the guest sees the drive change.
+            current = struct.unpack("Q", fcntl.ioctl(block, 0x80081272, b"\0" * 8))[0]
+            if current == size:
+                break
+            if time.monotonic() > deadline:
+                raise TimeoutError(f"{device} has {current} bytes, expected {size}")
+            time.sleep(.02)
+        fcntl.ioctl(block, 0x1261)  # BLKFLSBUF: forget blocks cached from the placeholder
+    target.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["mount", "-t", "ext4", "-o", "rw,noatime", device, str(target)], check=True)
+    if shutil.which("resize2fs"):
+        # Grows the filesystem after the volume grew; a no-op otherwise.
+        subprocess.run(["resize2fs", device], stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, check=False)
+
+
+def reseed(seed):
+    """Mix host randomness into the kernel pool: every restored clone starts the same."""
+    data = bytes.fromhex(seed)
+    try:
+        with open("/dev/urandom", "wb") as device:
+            # RNDADDENTROPY, then RNDRESEEDCRNG so the new entropy is used at once.
+            fcntl.ioctl(device, 0x40085203, struct.pack("ii", len(data) * 8, len(data)) + data)
+            fcntl.ioctl(device, 0x5207)
+    except OSError:
+        pass
+
+
 def start_executor():
     global executor_connection, executor_process
     if not executor_command:
@@ -150,17 +191,37 @@ def connect_executor():
 def executor_request(payload):
     global executor_connection
     data = json.dumps(payload).encode()
-    for attempt in range(2):
-        try:
-            connection = executor_connection or connect_executor()
-            connection.sendall(len(data).to_bytes(4, "big") + data)
-            return json.loads(receive(connection, int.from_bytes(receive(connection, 4), "big")))
-        except (OSError, RuntimeError):
-            if executor_connection:
-                executor_connection.close()
-            executor_connection = None
-            if attempt:
-                raise
+    with executor_lock:
+        generation = executor_generation
+        for attempt in range(2):
+            try:
+                connection = executor_connection or connect_executor()
+                connection.sendall(len(data).to_bytes(4, "big") + data)
+                return json.loads(receive(connection,
+                                          int.from_bytes(receive(connection, 4), "big")))
+            except (OSError, RuntimeError):
+                if executor_connection:
+                    executor_connection.close()
+                executor_connection = None
+                if attempt or generation != executor_generation:
+                    raise
+
+
+def abandon_executor_request():
+    """After a restore, a request from before the snapshot has nobody to answer to.
+
+    That happens when a suspended microVM resumes. Closing the executor connection
+    ends the old request; the executor sees the close, and the next task connects anew.
+    """
+    global executor_generation
+    if executor_lock.locked():
+        executor_generation += 1
+        connection = executor_connection
+        if connection:
+            try:
+                connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
 
 
 def start_service():
@@ -192,7 +253,11 @@ def handle(connection):
             if payload["encoding"] == "scraperack-snapshot":
                 if "unix_time" in payload:
                     time.clock_settime(time.CLOCK_REALTIME, payload["unix_time"])
-                if not initialized:
+                if payload.get("seed"):
+                    reseed(payload["seed"])
+                if initialized:
+                    abandon_executor_request()
+                else:
                     initialize(payload)
                 if service and service.poll() not in (None, 0):
                     raise RuntimeError(f"service exited {service.returncode}")
@@ -217,6 +282,9 @@ def handle(connection):
                 # Everything a restored guest needs, in one round trip: each round trip
                 # costs page faults in a freshly restored VM.
                 time.clock_settime(time.CLOCK_REALTIME, payload["unix_time"])
+                if payload.get("seed"):
+                    reseed(payload["seed"])
+                abandon_executor_request()
                 if service and service.poll() not in (None, 0):
                     raise RuntimeError(f"service exited {service.returncode}")
                 if payload.get("network"):
@@ -232,6 +300,12 @@ def handle(connection):
             elif payload["encoding"] == "scraperack-network":
                 configure_network(payload)
                 response = {"result": None, "error": None, "timed_out": False}
+            elif payload["encoding"] == "scraperack-volume":
+                mount_volume(payload)
+                response = {"result": None, "error": None, "timed_out": False}
+            elif payload["encoding"] == "scraperack-sync":
+                os.sync()
+                response = {"result": None, "error": None, "timed_out": False}
             else:
                 response = executor_request(payload)
         except BaseException:
@@ -241,6 +315,15 @@ def handle(connection):
                 "timed_out": False,
             }
         connection.sendall(json.dumps(response).encode() + b"\n")
+
+
+def serve(connection):
+    try:
+        handle(connection)
+    except OSError:
+        pass  # the host went away, for example when the microVM was snapshotted
+    finally:
+        connection.close()
 
 
 subprocess.run(["mount", "-t", "proc", "-o", "nosuid,nodev,noexec", "proc", "/proc"], check=True)
@@ -256,11 +339,12 @@ initialized = False
 executor_command = []
 executor_process = None
 executor_connection = None
+executor_lock = threading.Lock()
+executor_generation = 0
 service = None
 server = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
 server.bind((socket.VMADDR_CID_ANY, 5000))
-server.listen(1)
+server.listen(16)
 while True:
     connection, _ = server.accept()
-    handle(connection)
-    connection.close()
+    threading.Thread(target=serve, args=(connection,), daemon=True).start()

@@ -17,6 +17,11 @@ Before a pool's snapshot is taken, the guest agent:
 3. starts the image's own entrypoint, if it has one,
 4. sends `{"encoding": "scraperack-preload", "modules": [...]}` if the pool has `preload`.
 
+All of it, preload included, must finish within 3 minutes. Whatever the executor has
+started by then (a browser, a whole desktop) is in the snapshot and already running in
+every microVM restored from it. After each restore the preload is sent again; answer it at
+once.
+
 The executor must listen on the Unix socket `/tmp/scraperack-executor.sock` within
 10 seconds. It is restarted if it exits.
 
@@ -44,6 +49,15 @@ Reply:
 - A non-null `error` marks the task failed. Use it for tracebacks.
 
 The core enforces the timeout itself; an executor never needs to set `timed_out`.
+
+## Volumes and resumed microVMs
+
+In a pool with `volume_mount`, the task's volume is already mounted when its payload
+arrives. When a suspended microVM resumes, the request it was handling when it was
+suspended has nobody left to answer to: the guest agent closes that connection, and the new
+task's payload arrives on a new one. An executor that serves long sessions should therefore
+accept a new connection while an older request is still open, notice that the older
+connection closed, and carry on with what is already running in the VM.
 
 ## Minimal executor
 

@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     net::{IpAddr, Ipv4Addr},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
@@ -83,6 +84,10 @@ pub struct Pool {
     pub aliases: Vec<String>,
     #[serde(default)]
     pub display_name: Option<String>,
+    /// Where a task's volume is mounted in the guest. Pools with a mount get a
+    /// volume drive in their snapshot; a task that names a volume attaches it there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume_mount: Option<String>,
 }
 
 impl Pool {
@@ -108,6 +113,50 @@ pub struct Disk {
     pub size: u64,
     #[serde(default)]
     pub owner: Option<String>,
+}
+
+/// A persistent, writable disk that lives on one node and follows its tasks there.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Volume {
+    pub name: String,
+    pub size_mib: u32,
+    #[serde(default)]
+    pub owner: Option<String>,
+    /// Node that holds the volume's files; set when a task first uses it.
+    #[serde(default)]
+    pub node: Option<Uuid>,
+    /// A suspended microVM's memory and device state is saved with the volume.
+    #[serde(default)]
+    pub suspended: bool,
+    #[serde(default)]
+    pub migration: Option<VolumeMigration>,
+    #[serde(default)]
+    pub migration_failed_at_ms: Option<u64>,
+    #[serde(default)]
+    pub migration_error: Option<String>,
+    pub created_at_ms: u64,
+}
+
+/// The volume's files are being copied from one node to another.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VolumeMigration {
+    pub from: Uuid,
+    pub to: Uuid,
+    pub started_at_ms: u64,
+}
+
+/// A node that has not reported for this long is offline.
+pub const NODE_ONLINE_MS: u64 = 15_000;
+/// A migration that takes longer than this is abandoned.
+pub const MIGRATION_TIMEOUT_MS: u64 = 60 * 60 * 1000;
+/// After a failed migration, tasks start on the volume's node for this long.
+pub const MIGRATION_RETRY_MS: u64 = 5 * 60 * 1000;
+
+pub fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -223,6 +272,8 @@ pub struct MicroVm {
     pub ports: Vec<PublishedPort>,
     #[serde(default)]
     pub environment: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -269,6 +320,16 @@ pub enum TaskStatus {
     TimedOut,
 }
 
+/// How a running task is ended early.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StopMode {
+    /// Flush the guest's disks and destroy the microVM.
+    Stop,
+    /// Save the microVM's state with its volume, so a later task resumes it.
+    Suspend,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TaskMetricPoint {
@@ -305,6 +366,12 @@ pub struct Task {
     pub finished_at_ms: Option<u64>,
     #[serde(default)]
     pub metrics: Option<TaskMetrics>,
+    /// Volume attached to the task's microVM; the task runs where the volume is.
+    #[serde(default)]
+    pub volume: Option<String>,
+    /// Requested early end, delivered to the node with its heartbeat.
+    #[serde(skip)]
+    pub stop: Option<StopMode>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -319,6 +386,8 @@ pub struct TaskView {
     pub started_at_ms: Option<u64>,
     pub finished_at_ms: Option<u64>,
     pub metrics: Option<TaskMetrics>,
+    #[serde(default)]
+    pub volume: Option<String>,
 }
 
 impl From<&Task> for TaskView {
@@ -334,6 +403,7 @@ impl From<&Task> for TaskView {
             started_at_ms: task.started_at_ms,
             finished_at_ms: task.finished_at_ms,
             metrics: task.metrics.clone(),
+            volume: task.volume.clone(),
         }
     }
 }
@@ -344,6 +414,8 @@ pub struct Work {
     pub pool: Pool,
     #[serde(default)]
     pub secrets: HashMap<String, String>,
+    #[serde(default)]
+    pub volume: Option<Volume>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -358,6 +430,8 @@ pub struct Cluster {
     pub environments: HashMap<Uuid, Environment>,
     #[serde(default)]
     pub disks: HashMap<String, Disk>,
+    #[serde(default)]
+    pub volumes: HashMap<String, Volume>,
     #[serde(default)]
     pub plugins: HashMap<String, PluginRecord>,
     #[serde(default)]
@@ -427,6 +501,10 @@ impl Cluster {
         let can_start = pool
             .max_instances
             .is_none_or(|limit| active + idle < limit as usize);
+        if let Some(volume) = task.volume.clone() {
+            let pool = pool.clone();
+            return self.schedule_with_volume(task_id, &pool, &volume, can_start);
+        }
 
         let mut candidates = self
             .nodes
@@ -471,6 +549,155 @@ impl Cluster {
         let task = self.tasks.get_mut(&task_id).unwrap();
         task.node = Some(node_id);
         task.status = TaskStatus::Assigned;
+        true
+    }
+
+    /// Place a task whose microVM attaches a volume.
+    ///
+    /// The task runs on the node that holds the volume. When that node has no free
+    /// memory for the task but another online node does, the volume (with any
+    /// suspended state) is moved there first and the task waits in the queue.
+    /// When no node has room, the task overcommits the volume's node, like any task.
+    fn schedule_with_volume(
+        &mut self,
+        task_id: Uuid,
+        pool: &Pool,
+        name: &str,
+        can_start: bool,
+    ) -> bool {
+        let now = now_ms();
+        let Some(volume) = self.volumes.get_mut(name) else {
+            return false;
+        };
+        if let Some(migration) = &volume.migration {
+            if now.saturating_sub(migration.started_at_ms) < MIGRATION_TIMEOUT_MS {
+                return false;
+            }
+            volume.migration = None;
+            volume.migration_failed_at_ms = Some(now);
+            volume.migration_error = Some("the move timed out".into());
+        }
+        let volume = volume.clone();
+        if self.tasks.values().any(|task| {
+            task.id != task_id
+                && task.volume.as_deref() == Some(name)
+                && matches!(task.status, TaskStatus::Assigned | TaskStatus::Running)
+        }) {
+            return false;
+        }
+        let idle_on = |node: &Node| node.idle_instances.get(&pool.name).copied().unwrap_or(0);
+        let usable = |node: &Node| {
+            node.status == NodeStatus::Ready
+                && now.saturating_sub(node.last_seen_ms) < NODE_ONLINE_MS
+                && node.images.contains(&pool.image)
+                && pool.disks_ready(node)
+                && node.cpu_millis >= pool.cpu_millis
+                && node.memory_mib >= pool.memory_mib
+                && (can_start || idle_on(node) > 0)
+        };
+        let fits = |node: &Node| {
+            idle_on(node) > 0
+                || node.used_memory_mib.saturating_add(pool.memory_mib) <= node.memory_mib
+        };
+        let free = |node: &Node| node.memory_mib.saturating_sub(node.used_memory_mib);
+        // Roomiest usable node first; ties go to the lower ID so placement is stable.
+        let best = |exclude: Option<Uuid>, need_fit: bool| {
+            self.nodes
+                .values()
+                .filter(|node| Some(node.id) != exclude && usable(node))
+                .filter(|node| !need_fit || fits(node))
+                .max_by(|left, right| {
+                    (fits(left), free(left))
+                        .cmp(&(fits(right), free(right)))
+                        .then(right.id.cmp(&left.id))
+                })
+                .map(|node| node.id)
+        };
+        let node_id = match volume.node {
+            None => match best(None, false) {
+                Some(node) => node,
+                None => return false,
+            },
+            Some(home) => {
+                let home_node = self.nodes.get(&home);
+                if home_node.is_some_and(|node| usable(node) && fits(node)) {
+                    home
+                } else {
+                    let home_online = home_node
+                        .is_some_and(|node| now.saturating_sub(node.last_seen_ms) < NODE_ONLINE_MS);
+                    let may_move = volume
+                        .migration_failed_at_ms
+                        .is_none_or(|failed| now.saturating_sub(failed) >= MIGRATION_RETRY_MS);
+                    if home_online
+                        && may_move
+                        && let Some(target) = best(Some(home), true)
+                    {
+                        let volume = self.volumes.get_mut(name).unwrap();
+                        volume.migration = Some(VolumeMigration {
+                            from: home,
+                            to: target,
+                            started_at_ms: now,
+                        });
+                        volume.migration_error = None;
+                        return false;
+                    }
+                    if home_node.is_some_and(usable) {
+                        home
+                    } else {
+                        return false;
+                    }
+                }
+            }
+        };
+        let node = self.nodes.get_mut(&node_id).unwrap();
+        let idle = node.idle_instances.entry(pool.name.clone()).or_default();
+        if *idle > 0 {
+            *idle -= 1;
+        } else {
+            node.used_cpu_millis = node.used_cpu_millis.saturating_add(pool.cpu_millis);
+            node.used_memory_mib = node.used_memory_mib.saturating_add(pool.memory_mib);
+        }
+        self.volumes.get_mut(name).unwrap().node = Some(node_id);
+        let task = self.tasks.get_mut(&task_id).unwrap();
+        task.node = Some(node_id);
+        task.status = TaskStatus::Assigned;
+        true
+    }
+
+    /// The target node holds the volume's files now.
+    pub fn finish_migration(&mut self, name: &str, node: Uuid) -> bool {
+        let Some(volume) = self.volumes.get_mut(name) else {
+            return false;
+        };
+        if volume
+            .migration
+            .as_ref()
+            .is_none_or(|move_| move_.to != node)
+        {
+            return false;
+        }
+        volume.node = Some(node);
+        volume.migration = None;
+        volume.migration_failed_at_ms = None;
+        volume.migration_error = None;
+        true
+    }
+
+    /// The volume stays where it was; its tasks start there for a while.
+    pub fn fail_migration(&mut self, name: &str, node: Uuid, error: String) -> bool {
+        let Some(volume) = self.volumes.get_mut(name) else {
+            return false;
+        };
+        if volume
+            .migration
+            .as_ref()
+            .is_none_or(|move_| move_.from != node && move_.to != node)
+        {
+            return false;
+        }
+        volume.migration = None;
+        volume.migration_failed_at_ms = Some(now_ms());
+        volume.migration_error = Some(error);
         true
     }
 
@@ -798,6 +1025,8 @@ mod tests {
                     started_at_ms: None,
                     finished_at_ms: None,
                     metrics: None,
+                    volume: None,
+                    stop: None,
                 },
             );
             assert!(cluster.schedule(id));
@@ -821,6 +1050,8 @@ mod tests {
                 started_at_ms: None,
                 finished_at_ms: None,
                 metrics: None,
+                volume: None,
+                stop: None,
             },
         );
         assert!(cluster.schedule(id));
@@ -951,6 +1182,8 @@ mod tests {
                 started_at_ms: None,
                 finished_at_ms: None,
                 metrics: None,
+                volume: None,
+                stop: None,
             },
         );
 
@@ -1007,6 +1240,8 @@ mod tests {
                 started_at_ms: None,
                 finished_at_ms: None,
                 metrics: None,
+                volume: None,
+                stop: None,
             },
         );
 
@@ -1016,5 +1251,147 @@ mod tests {
         cluster.release(task_id, true);
         assert_eq!(cluster.nodes[&node_id].idle_instances["p"], 1);
         assert_eq!(cluster.nodes[&node_id].used_memory_mib, 256);
+    }
+
+    fn volume_task(cluster: &mut Cluster, volume: &str) -> Uuid {
+        let id = Uuid::new_v4();
+        cluster.tasks.insert(
+            id,
+            Task {
+                id,
+                pool: "desk".into(),
+                owner: None,
+                node: None,
+                status: TaskStatus::Queued,
+                payload: Value::Null,
+                variables: HashMap::new(),
+                result: None,
+                error: None,
+                created_at_ms: 0,
+                started_at_ms: None,
+                finished_at_ms: None,
+                metrics: None,
+                volume: Some(volume.into()),
+                stop: None,
+            },
+        );
+        id
+    }
+
+    fn volume_cluster() -> (Cluster, Uuid, Uuid) {
+        let image = Uuid::new_v4();
+        let (first, second) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        let mut cluster = Cluster::default();
+        for id in [first, second] {
+            let mut node = node(id, image);
+            node.memory_mib = 8192;
+            node.last_seen_ms = now_ms();
+            cluster.nodes.insert(id, node);
+        }
+        cluster.pools.insert(
+            "desk".into(),
+            Pool {
+                name: "desk".into(),
+                image,
+                cpu_millis: 1000,
+                memory_mib: 2048,
+                disk_mib: 1024,
+                timeout_secs: 60,
+                volume_mount: Some("/home".into()),
+                ..Default::default()
+            },
+        );
+        cluster.volumes.insert(
+            "home".into(),
+            Volume {
+                name: "home".into(),
+                size_mib: 1024,
+                owner: None,
+                node: None,
+                suspended: false,
+                migration: None,
+                migration_failed_at_ms: None,
+                migration_error: None,
+                created_at_ms: 0,
+            },
+        );
+        (cluster, first, second)
+    }
+
+    #[test]
+    fn places_a_new_volume_on_the_roomiest_node_and_follows_it() {
+        let (mut cluster, first, second) = volume_cluster();
+        cluster.nodes.get_mut(&first).unwrap().used_memory_mib = 4096;
+        let task = volume_task(&mut cluster, "home");
+        assert!(cluster.schedule(task));
+        assert_eq!(cluster.tasks[&task].node, Some(second));
+        assert_eq!(cluster.volumes["home"].node, Some(second));
+
+        let again = volume_task(&mut cluster, "home");
+        assert!(!cluster.schedule(again), "one task per volume at a time");
+        cluster.release(task, false);
+        cluster.tasks.remove(&task);
+        cluster.nodes.get_mut(&first).unwrap().used_memory_mib = 0;
+        assert!(cluster.schedule(again));
+        assert_eq!(
+            cluster.tasks[&again].node,
+            Some(second),
+            "tasks follow the volume"
+        );
+    }
+
+    #[test]
+    fn moves_a_volume_to_a_node_with_room() {
+        let (mut cluster, first, second) = volume_cluster();
+        cluster.volumes.get_mut("home").unwrap().node = Some(first);
+        cluster.nodes.get_mut(&first).unwrap().used_memory_mib = 7000;
+        let task = volume_task(&mut cluster, "home");
+        assert!(!cluster.schedule(task));
+        let migration = cluster.volumes["home"].migration.clone().unwrap();
+        assert_eq!((migration.from, migration.to), (first, second));
+        assert!(!cluster.schedule(task), "the task waits for the move");
+        assert!(
+            !cluster.finish_migration("home", first),
+            "only the target finishes"
+        );
+        assert!(cluster.finish_migration("home", second));
+        assert!(cluster.schedule(task));
+        assert_eq!(cluster.tasks[&task].node, Some(second));
+    }
+
+    #[test]
+    fn overcommits_the_volume_node_when_no_node_has_room() {
+        let (mut cluster, first, second) = volume_cluster();
+        cluster.volumes.get_mut("home").unwrap().node = Some(first);
+        cluster.nodes.get_mut(&first).unwrap().used_memory_mib = 7000;
+        cluster.nodes.get_mut(&second).unwrap().used_memory_mib = 7000;
+        let task = volume_task(&mut cluster, "home");
+        assert!(cluster.schedule(task));
+        assert_eq!(cluster.tasks[&task].node, Some(first));
+        assert!(cluster.volumes["home"].migration.is_none());
+    }
+
+    #[test]
+    fn waits_for_an_offline_volume_node_and_retries_failed_moves_later() {
+        let (mut cluster, first, second) = volume_cluster();
+        cluster.volumes.get_mut("home").unwrap().node = Some(first);
+        cluster.nodes.get_mut(&first).unwrap().last_seen_ms = 0;
+        let task = volume_task(&mut cluster, "home");
+        assert!(!cluster.schedule(task), "the files are on the offline node");
+        assert!(cluster.volumes["home"].migration.is_none());
+
+        cluster.nodes.get_mut(&first).unwrap().last_seen_ms = now_ms();
+        cluster.nodes.get_mut(&first).unwrap().used_memory_mib = 7000;
+        assert!(!cluster.schedule(task));
+        assert!(cluster.fail_migration("home", second, "copy failed".into()));
+        assert_eq!(
+            cluster.volumes["home"].migration_error.as_deref(),
+            Some("copy failed")
+        );
+        assert!(
+            cluster.schedule(task),
+            "after a failed move it starts at home"
+        );
+        assert_eq!(cluster.tasks[&task].node, Some(first));
     }
 }

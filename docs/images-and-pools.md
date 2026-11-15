@@ -53,6 +53,7 @@ A pool is a set of identical microVMs from one image.
 | `preload` | `[]` | Passed to the executor before the snapshot is taken |
 | `aliases` | `[]` | Other names that resolve to this pool when submitting tasks |
 | `display_name` | none | Name shown in the GUI |
+| `volume_mount` | none | Where a task's [volume](volumes.md) is mounted |
 
 Read-only fields: `managed_by` (set when a plugin owns the pool), `revision` (bumped when a
 VM-affecting setting changes; idle VMs are replaced), and `ready` in listings.
