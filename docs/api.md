@@ -39,17 +39,29 @@ The Python client [`scraperack`](sdk.md) wraps all of these.
 | `POST /v1/disks` | Raw ext4 bytes | 201, `{key, sha256, size, owner}` |
 | `DELETE /v1/disks/{key}` | | 204; refused while a pool uses it |
 
+## Volumes
+
+| Method and path | Body / query | Result |
+|---|---|---|
+| `GET /v1/volumes` | | Volumes, with their node and any move in progress |
+| `POST /v1/volumes` | `{name, size_mib}` | 201, volume |
+| `GET /v1/volumes/{name}` | | Volume |
+| `DELETE /v1/volumes/{name}` | | 204; 409 while a task uses it |
+
+See [Volumes](volumes.md).
+
 ## Tasks
 
 | Method and path | Body / query | Result |
 |---|---|---|
-| `POST /v1/tasks` | `{pool, payload, queue?, variables?, secrets?}` | 202, task |
+| `POST /v1/tasks` | `{pool, payload, queue?, variables?, secrets?, volume?}` | 202, task |
 | `GET /v1/tasks` | `limit`, `pool` (comma-separated), `owner` | Tasks, newest first |
 | `GET /v1/tasks/{id}` | | Task |
 | `GET /v1/tasks/{id}/wait` | | Task when finished, or after 25 s |
 | `GET /v1/tasks/{id}/result` | | `{status, value, error}` |
 | `GET /v1/tasks/{id}/logs` | | `{stdout, stderr}` |
 | `GET /v1/tasks/{id}/payload` | | Payload |
+| `POST /v1/tasks/{id}/stop` | `{suspend?}` | Ends the task early; 202 while the node stops it |
 | `HEAD /v1/working-dirs/{sha256}` | | 204 if uploaded, else 404 |
 | `PUT /v1/working-dirs/{sha256}` | Zip bytes | 201 |
 

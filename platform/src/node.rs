@@ -23,17 +23,20 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader},
     net::UnixStream,
     process::{Child, Command},
-    sync::{Mutex, Notify},
+    sync::{Mutex, Notify, oneshot},
 };
 use uuid::Uuid;
 
 use crate::cluster::{
-    Disk, Image, MicroVm, Pool, PortProtocol, PublishedPort, TaskMetricPoint, TaskMetrics,
-    VmStatus, Work,
+    Disk, Image, MicroVm, Pool, PortProtocol, PublishedPort, StopMode, TaskMetricPoint,
+    TaskMetrics, VmStatus, Volume, Work,
 };
 use crate::uffd;
 
 const GUEST_PORT: u32 = 5000;
+/// How long a pool's guest may take to prepare its snapshot, preload included: long
+/// enough for a whole desktop session to start in the snapshot.
+const SNAPSHOT_PREPARE_TIMEOUT: Duration = Duration::from_secs(180);
 const NETWORK: &str = "10.240.0.0/16";
 const GUEST_DNS: Ipv4Addr = Ipv4Addr::new(10, 239, 255, 254);
 const PORT_START: u16 = 30000;
@@ -50,6 +53,53 @@ struct RegisteredNode {
     id: Uuid,
     #[serde(default)]
     vm_start_concurrency: Option<usize>,
+    #[serde(default)]
+    stops: Vec<StopCommand>,
+}
+
+#[derive(Deserialize)]
+struct StopCommand {
+    task: Uuid,
+    mode: StopMode,
+}
+
+/// Bookkeeping shared by the heartbeat loop and running tasks.
+#[derive(Default)]
+struct Shared {
+    /// Tasks picked up and not yet reported complete.
+    inflight: std::sync::Mutex<HashSet<Uuid>>,
+    /// Early-end requests waiting for each running task.
+    stops: std::sync::Mutex<HashMap<Uuid, oneshot::Sender<StopMode>>>,
+    /// Volumes attached to a microVM on this node.
+    attached: std::sync::Mutex<HashSet<String>>,
+    /// Volume moves this node is sending or receiving.
+    moving: std::sync::Mutex<HashSet<String>>,
+}
+
+/// Marks a volume attached for as long as it lives.
+struct Attachment<'a> {
+    shared: &'a Shared,
+    name: String,
+}
+
+impl<'a> Attachment<'a> {
+    fn new(shared: &'a Shared, name: &str) -> Option<Self> {
+        let mut attached = shared.attached.lock().expect("attached lock poisoned");
+        attached.insert(name.to_owned()).then(|| Self {
+            shared,
+            name: name.to_owned(),
+        })
+    }
+}
+
+impl Drop for Attachment<'_> {
+    fn drop(&mut self) {
+        self.shared
+            .attached
+            .lock()
+            .expect("attached lock poisoned")
+            .remove(&self.name);
+    }
 }
 
 struct VmStartLimiter {
@@ -134,6 +184,7 @@ struct Registration<'a> {
     address: IpAddr,
     reset_idle: bool,
     vms: Vec<MicroVm>,
+    tasks: Option<Vec<Uuid>>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -214,6 +265,7 @@ impl VmState {
                     .map(|network| network.ports.clone())
                     .unwrap_or_default(),
                 environment: vm.pool.environment,
+                volume: None,
             })
             .chain(self.running.values().cloned())
             .collect::<Vec<_>>();
@@ -235,6 +287,16 @@ impl VmState {
             .max_by_key(|(_, vm)| vm.last_used)
             .map(|(index, _)| index)
             .map(|index| self.idle.swap_remove(index)))
+    }
+
+    /// Account for a microVM that does not come from the idle list.
+    fn reserve(&mut self, pool: &Pool) -> std::result::Result<(), &'static str> {
+        if pool.cpu_millis > self.cpu_millis || pool.memory_mib > self.memory_mib {
+            return Err("instance resources exceed node capacity");
+        }
+        self.active_cpu_millis = self.active_cpu_millis.saturating_add(pool.cpu_millis);
+        self.active_memory_mib = self.active_memory_mib.saturating_add(pool.memory_mib);
+        Ok(())
     }
 
     fn release(&mut self, pool: &Pool, vm: Option<LiveVm>) {
@@ -522,6 +584,8 @@ pub async fn run(
     fs::create_dir_all(data_dir.join("working-dirs")).await?;
     fs::create_dir_all(data_dir.join("logs")).await?;
     fs::create_dir_all(data_dir.join("snapshots")).await?;
+    fs::create_dir_all(data_dir.join("volumes")).await?;
+    ensure_volume_placeholder(&data_dir).await?;
     let instances = data_dir.join("instances");
     if instances.exists() {
         fs::remove_dir_all(&instances).await?;
@@ -577,6 +641,7 @@ pub async fn run(
             address,
             reset_idle: true,
             vms: Vec::new(),
+            tasks: Some(Vec::new()),
         })
         .send()
         .await?
@@ -590,6 +655,7 @@ pub async fn run(
         .unwrap_or(local_vm_start_concurrency);
     tracing::info!(vm_start_concurrency, "configured VM start concurrency");
     let vm_starts = Arc::new(VmStartLimiter::new(vm_start_concurrency));
+    let shared = Arc::new(Shared::default());
     let vms = Arc::new(Mutex::new(VmState {
         idle: Vec::new(),
         running: HashMap::new(),
@@ -628,6 +694,13 @@ pub async fn run(
     loop {
         if heartbeat.elapsed() >= Duration::from_secs(2) {
             let reports = vms.lock().await.reports();
+            let working = shared
+                .inflight
+                .lock()
+                .expect("inflight lock poisoned")
+                .iter()
+                .copied()
+                .collect();
             node = client
                 .post(format!("{controller}/internal/nodes/register"))
                 .json(&Registration {
@@ -639,6 +712,7 @@ pub async fn run(
                     address,
                     reset_idle: false,
                     vms: reports,
+                    tasks: Some(working),
                 })
                 .send()
                 .await?
@@ -650,6 +724,21 @@ pub async fn run(
                 .unwrap_or(local_vm_start_concurrency);
             if vm_starts.set_limit(vm_start_concurrency) {
                 tracing::info!(vm_start_concurrency, "updated VM start concurrency");
+            }
+            for stop in std::mem::take(&mut node.stops) {
+                let sender = shared
+                    .stops
+                    .lock()
+                    .expect("stops lock poisoned")
+                    .remove(&stop.task);
+                if let Some(sender) = sender {
+                    tracing::info!(task = %stop.task, mode = ?stop.mode, "ending task early");
+                    let _ = sender.send(stop.mode);
+                }
+            }
+            if let Err(error) = sync_volumes(&client, controller, node.id, &data_dir, &shared).await
+            {
+                tracing::warn!(%error, "volume sync failed");
             }
             sync_images(&client, controller, node.id, &data_dir).await?;
             sync_disks(&client, controller, node.id, &data_dir).await?;
@@ -689,6 +778,12 @@ pub async fn run(
             .json::<Option<Work>>()
             .await?
         {
+            shared
+                .inflight
+                .lock()
+                .expect("inflight lock poisoned")
+                .insert(work.task.id);
+            let shared = shared.clone();
             let client = client.clone();
             let controller = controller.to_owned();
             let firecracker = firecracker.clone();
@@ -713,6 +808,7 @@ pub async fn run(
                     &vm_starts,
                     &network,
                     &vms,
+                    &shared,
                 )
                 .await;
                 if let Err(error) = client
@@ -724,6 +820,16 @@ pub async fn run(
                 {
                     tracing::error!(id = %task.id, %error, "failed to report completion");
                 }
+                shared
+                    .stops
+                    .lock()
+                    .expect("stops lock poisoned")
+                    .remove(&task.id);
+                shared
+                    .inflight
+                    .lock()
+                    .expect("inflight lock poisoned")
+                    .remove(&task.id);
             });
         }
     }
@@ -954,7 +1060,44 @@ async fn run_task(
     vm_starts: &VmStartLimiter,
     network: &Network,
     vms: &Mutex<VmState>,
+    shared: &Shared,
 ) -> Completion {
+    let failed = |error: String| Completion {
+        result: None,
+        error: Some(error),
+        timed_out: false,
+        metrics: None,
+        keep_idle: false,
+    };
+    let (stop_sender, stop_receiver) = oneshot::channel();
+    shared
+        .stops
+        .lock()
+        .expect("stops lock poisoned")
+        .insert(work.task.id, stop_sender);
+    let _attachment = match &work.volume {
+        Some(volume) => match Attachment::new(shared, &volume.name) {
+            Some(attachment) => Some(attachment),
+            None => {
+                return failed(format!(
+                    "volume {} is attached to another microVM",
+                    volume.name
+                ));
+            }
+        },
+        None => None,
+    };
+    let volume_disk = match &work.volume {
+        Some(volume) => match ensure_volume_disk(data_dir, volume).await {
+            Ok(disk) => Some(disk),
+            Err(error) => return failed(format!("prepare volume: {error:#}")),
+        },
+        None => None,
+    };
+    let saved_state = match &work.volume {
+        Some(volume) => saved_state(data_dir, volume, &work.pool).await,
+        None => None,
+    };
     let working_dir = work
         .task
         .payload
@@ -977,19 +1120,37 @@ async fn run_task(
     } else {
         None
     };
-    let idle = match vms.lock().await.acquire(&work.pool) {
-        Ok(idle) => idle,
-        Err(error) => {
-            return Completion {
-                result: None,
-                error: Some(error.into()),
-                timed_out: false,
-                metrics: None,
-                keep_idle: false,
-            };
+    let mut resumed = false;
+    let idle = if let Some(state) = &saved_state {
+        if let Err(error) = vms.lock().await.reserve(&work.pool) {
+            return failed(error.into());
+        }
+        let permit = vm_starts.acquire().await;
+        let restored = restore_vm(firecracker, data_dir, &work.pool, state, network).await;
+        drop(permit);
+        // The microVM maps the saved memory privately, so the files can go now.
+        let _ = fs::remove_dir_all(&state.directory).await;
+        match restored {
+            Ok(vm) => {
+                resumed = true;
+                Some(vm)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    id = %work.task.id,
+                    error = %format!("{error:#}"),
+                    "could not resume the suspended microVM; starting a fresh one"
+                );
+                None
+            }
+        }
+    } else {
+        match vms.lock().await.acquire(&work.pool) {
+            Ok(idle) => idle,
+            Err(error) => return failed(error.into()),
         }
     };
-    let reused = idle.is_some();
+    let reused = idle.is_some() && !resumed;
     let mut vm = match idle {
         Some(vm) => vm,
         None => {
@@ -1019,6 +1180,14 @@ async fn run_task(
             }
         }
     };
+    if let Some(disk) = &volume_disk
+        && !resumed
+        && let Err(error) = attach_volume(&mut vm, disk).await
+    {
+        destroy_vm(vm, network).await;
+        vms.lock().await.release(&work.pool, None);
+        return failed(format!("attach volume: {error:#}"));
+    }
     let working_dir_archive = if working_dir
         .as_ref()
         .is_some_and(|digest| !vm.working_dirs.contains(digest))
@@ -1064,6 +1233,7 @@ async fn run_task(
                 .map(|network| network.ports.clone())
                 .unwrap_or_default(),
             environment: work.pool.environment,
+            volume: work.volume.as_ref().map(|volume| volume.name.clone()),
         },
     );
     report_running_vm(client, controller, work, vms).await;
@@ -1106,6 +1276,14 @@ async fn run_task(
     let mut memory_total = u128::from(before.memory_bytes);
     let mut memory_count = 1u64;
     let mut samples = vec![metric_point(0, 0.0, before.memory_bytes, &work.pool)];
+    let stop = async move {
+        match stop_receiver.await {
+            Ok(mode) => mode,
+            Err(_) => std::future::pending().await,
+        }
+    };
+    tokio::pin!(stop);
+    let mut stopped = None;
     let response = {
         let request = tokio::time::timeout(
             Duration::from_secs(work.pool.timeout_secs),
@@ -1115,7 +1293,11 @@ async fn run_task(
         let mut sampler = tokio::time::interval(Duration::from_millis(250));
         loop {
             tokio::select! {
-                response = &mut request => break response,
+                response = &mut request => break Some(response),
+                mode = &mut stop => {
+                    stopped = Some(mode);
+                    break None;
+                }
                 _ = sampler.tick() => {
                     if let Some(path) = &cgroup
                         && let Ok(current) = read_vm_counters(path).await
@@ -1153,6 +1335,31 @@ async fn run_task(
     );
     memory_total += u128::from(after.memory_bytes);
     memory_count += 1;
+    let metrics = cgroup.as_ref().map(|_| {
+        task_metrics(
+            &before,
+            &after,
+            wall_time_usec,
+            memory_total,
+            memory_count,
+            samples.clone(),
+            &work.pool,
+        )
+    });
+    let (Some(response), None) = (response, stopped) else {
+        vms.lock().await.running.remove(&vm.id);
+        let mut completion = end_early(
+            vm,
+            stopped.unwrap_or(StopMode::Stop),
+            data_dir,
+            work,
+            network,
+        )
+        .await;
+        vms.lock().await.release(&work.pool, None);
+        completion.metrics = metrics;
+        return completion;
+    };
     let (mut completion, healthy) = match response {
         Ok(Ok(completion)) => (completion, true),
         Ok(Err(error)) => (
@@ -1176,19 +1383,10 @@ async fn run_task(
             false,
         ),
     };
-    completion.metrics = cgroup.map(|_| {
-        task_metrics(
-            &before,
-            &after,
-            wall_time_usec,
-            memory_total,
-            memory_count,
-            samples,
-            &work.pool,
-        )
-    });
+    completion.metrics = metrics;
     redact_completion(&mut completion, &work.secrets);
     let keep_idle = healthy
+        && work.volume.is_none()
         && work.pool.reuse
         && (work.pool.idle_timeout_secs > 0 || work.pool.warm_instances > 0);
     completion.keep_idle = keep_idle;
@@ -1406,6 +1604,17 @@ async fn start_vm(
     network: &Network,
 ) -> Result<LiveVm> {
     let snapshot = ensure_snapshot(firecracker, kernel, data_dir, pool, snapshot_lock).await?;
+    restore_vm(firecracker, data_dir, pool, &snapshot, network).await
+}
+
+/// Start a microVM from a snapshot: the pool's, or one saved when a task was suspended.
+async fn restore_vm(
+    firecracker: &Path,
+    data_dir: &Path,
+    pool: &Pool,
+    snapshot: &SnapshotPaths,
+    network: &Network,
+) -> Result<LiveVm> {
     let id = Uuid::new_v4();
     let mut network_lease = if pool.network {
         Some(network.allocate(id, pool).await?)
@@ -1424,7 +1633,9 @@ async fn start_vm(
         attach_cgroup(pid, pool, id).await?;
         // Guest memory: served by our userfaultfd handler, which prefaults the snapshot's
         // working set before the VM resumes; or mapped straight from the memory file.
-        let prefault = if uffd::enabled() {
+        // MicroVMs with a volume may be suspended, and saving one reads all of its memory:
+        // from a mapped file that is quick, through the handler it is one fault per page.
+        let prefault = if uffd::enabled() && pool.volume_mount.is_none() {
             Some(uffd::serve(
                 &directory,
                 &snapshot.directory,
@@ -1469,7 +1680,11 @@ async fn start_vm(
             .context("system time is before the Unix epoch")?
             .as_secs_f64();
         if snapshot.single_restore() {
-            let mut restore = json!({"encoding": "scraperack-restore", "unix_time": unix_time});
+            let mut restore = json!({
+                "encoding": "scraperack-restore",
+                "unix_time": unix_time,
+                "seed": random_seed(),
+            });
             if let Some(lease) = &network_lease {
                 restore["network"] = json!({
                     "address": lease.guest_ip,
@@ -1669,6 +1884,10 @@ async fn ensure_snapshot(
             kernel,
             &image,
             &disks,
+            pool.volume_mount
+                .as_ref()
+                .map(|_| volume_placeholder(data_dir))
+                .as_deref(),
             pool,
             snapshot_tap.as_deref(),
         )
@@ -1680,7 +1899,7 @@ async fn ensure_snapshot(
         )
         .await?;
         let ready = tokio::time::timeout(
-            Duration::from_secs(30),
+            SNAPSHOT_PREPARE_TIMEOUT,
             guest_request(
                 &vsock,
                 &json!({
@@ -1737,7 +1956,11 @@ async fn ensure_snapshot(
 }
 
 fn snapshot_key(pool: &Pool) -> String {
-    let guest = if pool.preload.is_empty() && pool.disks.is_empty() && pool.executor.is_empty() {
+    let guest = if pool.preload.is_empty()
+        && pool.disks.is_empty()
+        && pool.executor.is_empty()
+        && pool.volume_mount.is_none()
+    {
         String::new()
     } else {
         let mut digest = Sha256::new();
@@ -1760,6 +1983,11 @@ fn snapshot_key(pool: &Pool) -> String {
             }
             digest.update([1]);
         }
+        if let Some(mount) = &pool.volume_mount {
+            digest.update(b"volume\0");
+            digest.update(mount.as_bytes());
+            digest.update([1]);
+        }
         format!("-{}", &hex::encode(digest.finalize())[..16])
     };
     // Pools without guest extras keep their pre-plugin key, so upgrades reuse snapshots.
@@ -1770,6 +1998,604 @@ fn snapshot_key(pool: &Pool) -> String {
         pool.memory_mib,
         if pool.network { "net1" } else { "none" },
     )
+}
+
+// --- Volumes ---------------------------------------------------------------------------
+
+const MIB: u64 = 1024 * 1024;
+/// Files a volume directory may hold; only these travel when a volume moves.
+const VOLUME_FILES: [&str; 6] = [
+    "disk.img",
+    "state/vmstate",
+    "state/memory",
+    "state/key",
+    "state/ready",
+    "state/restore-v1",
+];
+/// Volume directories removed from this node are kept this long before deletion.
+const TRASH_RETENTION: Duration = Duration::from_secs(3600);
+
+fn volume_placeholder(data_dir: &Path) -> PathBuf {
+    data_dir.join("volume-placeholder")
+}
+
+/// Pool snapshots with a volume mount reference this small empty file.
+async fn ensure_volume_placeholder(data_dir: &Path) -> Result<()> {
+    let path = volume_placeholder(data_dir);
+    if !path.exists() {
+        fs::File::create(&path).await?.set_len(MIB).await?;
+    }
+    Ok(())
+}
+
+fn volume_dir(data_dir: &Path, name: &str) -> PathBuf {
+    data_dir.join("volumes").join(name)
+}
+
+/// The volume's disk on this node, created and formatted on first use.
+async fn ensure_volume_disk(data_dir: &Path, volume: &Volume) -> Result<PathBuf> {
+    if !valid_disk_key(&volume.name) {
+        bail!("invalid volume name");
+    }
+    let directory = volume_dir(data_dir, &volume.name);
+    let disk = directory.join("disk.img");
+    if disk.exists() {
+        let size = u64::from(volume.size_mib) * MIB;
+        let file = fs::OpenOptions::new().write(true).open(&disk).await?;
+        if file.metadata().await?.len() < size {
+            // Grown volumes get the space; the guest resizes the filesystem when it mounts it.
+            file.set_len(size).await?;
+        }
+        return Ok(disk);
+    }
+    fs::create_dir_all(&directory).await?;
+    let partial = directory.join("disk.img.partial");
+    fs::File::create(&partial)
+        .await?
+        .set_len(u64::from(volume.size_mib) * MIB)
+        .await?;
+    host_command(
+        "mkfs.ext4",
+        [
+            OsStr::new("-q"),
+            OsStr::new("-F"),
+            OsStr::new("-m"),
+            OsStr::new("0"),
+            OsStr::new("-E"),
+            OsStr::new("lazy_itable_init=1,lazy_journal_init=1"),
+            partial.as_os_str(),
+        ],
+    )
+    .await?;
+    fs::rename(&partial, &disk).await?;
+    tracing::info!(volume = %volume.name, size_mib = volume.size_mib, "created volume");
+    Ok(disk)
+}
+
+/// A suspended microVM saved with the volume, if it fits the pool as it is now.
+async fn saved_state(data_dir: &Path, volume: &Volume, pool: &Pool) -> Option<SnapshotPaths> {
+    let state = SnapshotPaths::new(volume_dir(data_dir, &volume.name).join("state"));
+    if !state.directory.exists() {
+        return None;
+    }
+    let key = fs::read_to_string(state.directory.join("key"))
+        .await
+        .unwrap_or_default();
+    if state.ready() && key == snapshot_key(pool) {
+        return Some(state);
+    }
+    tracing::info!(volume = %volume.name, "discarding a suspended microVM saved for another pool configuration");
+    let _ = fs::remove_dir_all(&state.directory).await;
+    None
+}
+
+/// Swap the volume in for the snapshot's placeholder drive and mount it in the guest.
+async fn attach_volume(vm: &mut LiveVm, disk: &Path) -> Result<()> {
+    let mount = vm
+        .pool
+        .volume_mount
+        .clone()
+        .context("pool has no volume mount")?;
+    firecracker_request(
+        "PATCH",
+        &vm.directory.join("api.sock"),
+        "/drives/volume",
+        &json!({"drive_id": "volume", "path_on_host": disk}),
+    )
+    .await?;
+    let size = fs::metadata(disk).await?.len();
+    let letter = char::from(b'b' + u8::try_from(vm.pool.disks.len()).context("too many disks")?);
+    let mounted = tokio::time::timeout(
+        Duration::from_secs(60),
+        guest_request_stream(
+            &mut vm.guest,
+            &json!({
+                "encoding": "scraperack-volume",
+                "device": format!("/dev/vd{letter}"),
+                "mount": mount,
+                "size": size,
+            }),
+        ),
+    )
+    .await
+    .context("guest did not mount the volume in time")??;
+    if let Some(error) = mounted.error {
+        bail!("guest could not mount the volume: {error}");
+    }
+    Ok(())
+}
+
+/// End a running task on request: save it with its volume, or flush and destroy it.
+async fn end_early(
+    vm: LiveVm,
+    mode: StopMode,
+    data_dir: &Path,
+    work: &Work,
+    network: &Network,
+) -> Completion {
+    let outcome = match (mode, &work.volume) {
+        (StopMode::Suspend, Some(volume)) => suspend_vm(&vm, data_dir, volume)
+            .await
+            .map_err(|error| format!("suspend failed: {error:#}")),
+        _ => {
+            if work.volume.is_some() {
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    guest_request(
+                        &vm.directory.join("vsock.sock"),
+                        &json!({"encoding": "scraperack-sync"}),
+                    ),
+                )
+                .await;
+            }
+            Err("task was stopped".to_owned())
+        }
+    };
+    destroy_vm(vm, network).await;
+    match outcome {
+        Ok(()) => Completion {
+            result: Some(json!({
+                "suspended": true,
+                "value": {"encoding": "json", "data": {"suspended": true}},
+                "stdout": "",
+                "stderr": "",
+            })),
+            error: None,
+            timed_out: false,
+            metrics: None,
+            keep_idle: false,
+        },
+        Err(error) => Completion {
+            result: None,
+            error: Some(error),
+            timed_out: false,
+            metrics: None,
+            keep_idle: false,
+        },
+    }
+}
+
+/// Pause the microVM and save its memory and device state next to its volume.
+async fn suspend_vm(vm: &LiveVm, data_dir: &Path, volume: &Volume) -> Result<()> {
+    let api_socket = vm.directory.join("api.sock");
+    let directory = volume_dir(data_dir, &volume.name);
+    let temporary = SnapshotPaths::new(directory.join(format!(".state-{}", Uuid::new_v4())));
+    fs::create_dir_all(&temporary.directory).await?;
+    let started = Instant::now();
+    let result = async {
+        firecracker_request("PATCH", &api_socket, "/vm", &json!({"state": "Paused"})).await?;
+        firecracker_put(
+            &api_socket,
+            "/snapshot/create",
+            &json!({
+                "snapshot_type": "Full",
+                "snapshot_path": temporary.state,
+                "mem_file_path": temporary.memory,
+            }),
+        )
+        .await?;
+        fs::write(temporary.directory.join("key"), snapshot_key(&vm.pool)).await?;
+        // The guest agent is the pool snapshot's, so it resumes the same way.
+        let pool_snapshot =
+            SnapshotPaths::new(data_dir.join("snapshots").join(snapshot_key(&vm.pool)));
+        if pool_snapshot.single_restore() {
+            fs::write(temporary.directory.join(SINGLE_RESTORE), []).await?;
+        }
+        fs::write(temporary.directory.join("ready"), []).await?;
+        let state = directory.join("state");
+        if state.exists() {
+            fs::remove_dir_all(&state).await?;
+        }
+        fs::rename(&temporary.directory, &state).await?;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&temporary.directory).await;
+    }
+    tracing::info!(
+        volume = %volume.name,
+        ok = result.is_ok(),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "suspended microVM"
+    );
+    result
+}
+
+/// Fresh randomness for a restored guest, so clones of one snapshot differ.
+fn random_seed() -> String {
+    format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
+}
+
+/// Act on volume moves that involve this node and drop volumes it no longer holds.
+async fn sync_volumes(
+    client: &Client,
+    controller: &str,
+    node: Uuid,
+    data_dir: &Path,
+    shared: &Arc<Shared>,
+) -> Result<()> {
+    let volumes = client
+        .get(format!("{controller}/v1/volumes"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Vec<Volume>>()
+        .await?;
+    for volume in &volumes {
+        let Some(migration) = &volume.migration else {
+            continue;
+        };
+        let sending = migration.from == node;
+        if !sending && migration.to != node {
+            continue;
+        }
+        let key = format!("{}:{}", volume.name, migration.started_at_ms);
+        if !shared
+            .moving
+            .lock()
+            .expect("moving lock poisoned")
+            .insert(key.clone())
+        {
+            continue;
+        }
+        let client = client.clone();
+        let controller = controller.to_owned();
+        let data_dir = data_dir.to_owned();
+        let shared = shared.clone();
+        let name = volume.name.clone();
+        tokio::spawn(async move {
+            let started = Instant::now();
+            let result = if sending {
+                send_volume(&client, &controller, &data_dir, &name, &shared).await
+            } else {
+                receive_volume(&client, &controller, &data_dir, &name).await
+            };
+            let report = match &result {
+                Ok(()) if sending => None,
+                Ok(()) => Some(client.post(format!("{controller}/internal/volumes/{name}/moved"))),
+                Err(error) => {
+                    tracing::warn!(volume = %name, sending, error = %format!("{error:#}"), "volume move failed");
+                    Some(
+                        client
+                            .post(format!("{controller}/internal/volumes/{name}/failed"))
+                            .json(&json!({"error": format!("{error:#}")})),
+                    )
+                }
+            };
+            if result.is_ok() {
+                tracing::info!(
+                    volume = %name,
+                    sending,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "volume move finished on this side"
+                );
+            }
+            if let Some(report) = report
+                && let Err(error) = report
+                    .send()
+                    .await
+                    .and_then(reqwest::Response::error_for_status)
+            {
+                tracing::warn!(volume = %name, %error, "could not report the volume move");
+            }
+            shared
+                .moving
+                .lock()
+                .expect("moving lock poisoned")
+                .remove(&key);
+        });
+    }
+
+    let root = data_dir.join("volumes");
+    let trash = root.join(".trash");
+    let mut entries = fs::read_dir(&root).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            if let Some(volume) = name.strip_prefix(".incoming-")
+                && !volumes.iter().any(|candidate| {
+                    candidate.name == volume
+                        && candidate
+                            .migration
+                            .as_ref()
+                            .is_some_and(|migration| migration.to == node)
+                })
+            {
+                let _ = fs::remove_dir_all(entry.path()).await;
+            }
+            continue;
+        }
+        let keep = shared
+            .attached
+            .lock()
+            .expect("attached lock poisoned")
+            .contains(&name)
+            || volumes.iter().any(|volume| {
+                volume.name == name
+                    && (volume.node == Some(node)
+                        || volume.migration.as_ref().is_some_and(|migration| {
+                            migration.from == node || migration.to == node
+                        }))
+            });
+        if !keep {
+            fs::create_dir_all(&trash).await?;
+            let target = trash.join(format!("{name}-{}", crate::cluster::now_ms()));
+            tracing::info!(volume = %name, "moving a volume this node no longer holds to the trash");
+            fs::rename(entry.path(), target).await?;
+        }
+    }
+    if let Ok(mut entries) = fs::read_dir(&trash).await {
+        while let Some(entry) = entries.next_entry().await? {
+            let old = entry
+                .metadata()
+                .await
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age >= TRASH_RETENTION);
+            if old {
+                let _ = fs::remove_dir_all(entry.path()).await;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Stream the volume's files to the controller, which relays them to the new node.
+///
+/// Format (big-endian): per file `F`, name length (u16), name, size (u64), then
+/// `D`, offset (u64), length (u32), bytes for each block that is not all zeros;
+/// finally `E` and the SHA-256 of everything before it. Sparse files stay sparse.
+async fn send_volume(
+    client: &Client,
+    controller: &str,
+    data_dir: &Path,
+    name: &str,
+    shared: &Shared,
+) -> Result<()> {
+    let _attachment = Attachment::new(shared, name).context("volume is attached to a microVM")?;
+    let directory = volume_dir(data_dir, name);
+    if !directory.join("disk.img").exists() {
+        bail!("volume has no disk on this node");
+    }
+    let (sender, receiver) = tokio::sync::mpsc::channel::<std::io::Result<Vec<u8>>>(8);
+    let reader = tokio::task::spawn_blocking(move || write_volume_stream(&directory, &sender));
+    let body = reqwest::Body::wrap_stream(futures_util::stream::unfold(
+        receiver,
+        |mut receiver| async move { receiver.recv().await.map(|chunk| (chunk, receiver)) },
+    ));
+    let sent = client
+        .put(format!("{controller}/internal/volumes/{name}/transfer"))
+        .body(body)
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status);
+    let read = reader.await.context("volume reader panicked")?;
+    sent.context("send volume")?;
+    read.context("read volume")?;
+    Ok(())
+}
+
+fn write_volume_stream(
+    directory: &Path,
+    sender: &tokio::sync::mpsc::Sender<std::io::Result<Vec<u8>>>,
+) -> Result<()> {
+    use std::io::Read;
+    let mut digest = Sha256::new();
+    let emit = |bytes: Vec<u8>, digest: &mut Sha256| -> Result<()> {
+        digest.update(&bytes);
+        sender
+            .blocking_send(Ok(bytes))
+            .map_err(|_| anyhow::anyhow!("the upload stopped"))
+    };
+    let mut block = vec![0u8; MIB as usize];
+    for name in VOLUME_FILES {
+        let path = directory.join(name);
+        let Ok(mut file) = std::fs::File::open(&path) else {
+            continue;
+        };
+        let size = file.metadata()?.len();
+        let mut header = vec![b'F'];
+        header.extend((name.len() as u16).to_be_bytes());
+        header.extend(name.as_bytes());
+        header.extend(size.to_be_bytes());
+        emit(header, &mut digest)?;
+        let mut offset = 0u64;
+        loop {
+            let mut filled = 0;
+            while filled < block.len() {
+                let read = file.read(&mut block[filled..])?;
+                if read == 0 {
+                    break;
+                }
+                filled += read;
+            }
+            if filled == 0 {
+                break;
+            }
+            if block[..filled].iter().any(|byte| *byte != 0) {
+                let mut chunk = Vec::with_capacity(13 + filled);
+                chunk.push(b'D');
+                chunk.extend(offset.to_be_bytes());
+                chunk.extend((filled as u32).to_be_bytes());
+                chunk.extend(&block[..filled]);
+                emit(chunk, &mut digest)?;
+            }
+            offset += filled as u64;
+        }
+    }
+    let mut end = vec![b'E'];
+    digest.update(b"E");
+    end.extend(digest.finalize());
+    sender
+        .blocking_send(Ok(end))
+        .map_err(|_| anyhow::anyhow!("the upload stopped"))?;
+    Ok(())
+}
+
+/// Receive a moving volume into this node's store.
+async fn receive_volume(
+    client: &Client,
+    controller: &str,
+    data_dir: &Path,
+    name: &str,
+) -> Result<()> {
+    if !valid_disk_key(name) {
+        bail!("invalid volume name");
+    }
+    let root = data_dir.join("volumes");
+    let incoming = root.join(format!(".incoming-{name}"));
+    if incoming.exists() {
+        fs::remove_dir_all(&incoming).await?;
+    }
+    fs::create_dir_all(incoming.join("state")).await?;
+    let response = client
+        .get(format!("{controller}/internal/volumes/{name}/transfer"))
+        .send()
+        .await?
+        .error_for_status()?;
+    let stream = response
+        .bytes_stream()
+        .map(|chunk| chunk.map_err(std::io::Error::other));
+    unpack_volume_stream(tokio_util::io::StreamReader::new(stream), &incoming).await?;
+    let target = volume_dir(data_dir, name);
+    if target.exists() {
+        let trash = root.join(".trash");
+        fs::create_dir_all(&trash).await?;
+        fs::rename(
+            &target,
+            trash.join(format!("{name}-{}", crate::cluster::now_ms())),
+        )
+        .await?;
+    }
+    fs::rename(&incoming, &target).await?;
+    Ok(())
+}
+
+/// Write the files of a volume stream into `incoming`, checking its checksum.
+async fn unpack_volume_stream(
+    stream: impl tokio::io::AsyncRead + Unpin,
+    incoming: &Path,
+) -> Result<()> {
+    let mut reader = HashingReader {
+        inner: stream,
+        digest: Sha256::new(),
+    };
+    let stall = Duration::from_secs(300);
+    let mut file: Option<fs::File> = None;
+    loop {
+        let kind = tokio::time::timeout(stall, reader.u8())
+            .await
+            .context("the volume stream stalled")??;
+        match kind {
+            b'F' => {
+                if let Some(mut done) = file.take() {
+                    done.flush().await?;
+                    done.sync_all().await?;
+                }
+                let length = reader.u16().await?;
+                let name = String::from_utf8(reader.bytes(usize::from(length)).await?)?;
+                if !VOLUME_FILES.contains(&name.as_str()) {
+                    bail!("unexpected file {name} in the volume stream");
+                }
+                let size = reader.u64().await?;
+                let opened = fs::File::create(incoming.join(&name)).await?;
+                opened.set_len(size).await?;
+                file = Some(opened);
+            }
+            b'D' => {
+                let offset = reader.u64().await?;
+                let length = reader.u32().await?;
+                if length as u64 > MIB {
+                    bail!("oversized block in the volume stream");
+                }
+                let data = tokio::time::timeout(stall, reader.bytes(length as usize))
+                    .await
+                    .context("the volume stream stalled")??;
+                let target = file.as_mut().context("data before a file header")?;
+                target.seek(std::io::SeekFrom::Start(offset)).await?;
+                target.write_all(&data).await?;
+            }
+            b'E' => {
+                let expected = reader.digest.clone().finalize();
+                let mut actual = [0u8; 32];
+                reader.inner.read_exact(&mut actual).await?;
+                if actual[..] != expected[..] {
+                    bail!("volume stream failed its checksum");
+                }
+                break;
+            }
+            other => bail!("unexpected record {other} in the volume stream"),
+        }
+    }
+    if let Some(mut done) = file.take() {
+        done.flush().await?;
+        done.sync_all().await?;
+    }
+    if !incoming.join("disk.img").exists() {
+        bail!("the volume stream had no disk");
+    }
+    if fs::read_dir(incoming.join("state"))
+        .await?
+        .next_entry()
+        .await?
+        .is_none()
+    {
+        fs::remove_dir(incoming.join("state")).await?;
+    }
+    Ok(())
+}
+
+/// Reads a stream while hashing what it hands out.
+struct HashingReader<R> {
+    inner: R,
+    digest: Sha256,
+}
+
+impl<R: tokio::io::AsyncRead + Unpin> HashingReader<R> {
+    async fn bytes(&mut self, length: usize) -> Result<Vec<u8>> {
+        let mut buffer = vec![0; length];
+        self.inner.read_exact(&mut buffer).await?;
+        self.digest.update(&buffer);
+        Ok(buffer)
+    }
+
+    async fn u8(&mut self) -> Result<u8> {
+        Ok(self.bytes(1).await?[0])
+    }
+
+    async fn u16(&mut self) -> Result<u16> {
+        Ok(u16::from_be_bytes(self.bytes(2).await?.try_into().unwrap()))
+    }
+
+    async fn u32(&mut self) -> Result<u32> {
+        Ok(u32::from_be_bytes(self.bytes(4).await?.try_into().unwrap()))
+    }
+
+    async fn u64(&mut self) -> Result<u64> {
+        Ok(u64::from_be_bytes(self.bytes(8).await?.try_into().unwrap()))
+    }
 }
 
 fn start_firecracker(
@@ -1791,12 +2617,14 @@ fn start_firecracker(
         .context("start firecracker")
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn configure_boot(
     api_socket: &Path,
     vsock: &Path,
     kernel: &Path,
     rootfs: &Path,
     disks: &[PathBuf],
+    volume: Option<&Path>,
     pool: &Pool,
     tap: Option<&str>,
 ) -> Result<()> {
@@ -1842,6 +2670,21 @@ async fn configure_boot(
                 "path_on_host": disk,
                 "is_root_device": false,
                 "is_read_only": true
+            }),
+        )
+        .await?;
+    }
+    // The volume drive comes last. The snapshot holds an empty placeholder; a task
+    // swaps in its volume after the restore (Firecracker cannot add drives then).
+    if let Some(volume) = volume {
+        firecracker_put(
+            api_socket,
+            "/drives/volume",
+            &json!({
+                "drive_id": "volume",
+                "path_on_host": volume,
+                "is_root_device": false,
+                "is_read_only": false
             }),
         )
         .await?;
@@ -2201,7 +3044,10 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{Completion, default_vm_start_concurrency, redact_completion};
+    use super::{
+        Completion, MIB, default_vm_start_concurrency, redact_completion, unpack_volume_stream,
+        write_volume_stream,
+    };
 
     #[test]
     fn vm_start_concurrency_is_half_the_node_vcpus_with_a_minimum_of_one() {
@@ -2235,5 +3081,49 @@ mod tests {
         assert_eq!(result["stderr"], "warned [REDACTED]");
         assert_eq!(result["value"]["data"], "keep secret-value");
         assert_eq!(completion.error.unwrap(), "failed with [REDACTED]");
+    }
+
+    #[tokio::test]
+    async fn volume_streams_keep_files_sparse_and_detect_corruption() {
+        let root = std::env::temp_dir().join(format!("scraperack-volume-{}", uuid::Uuid::new_v4()));
+        let source = root.join("source");
+        std::fs::create_dir_all(source.join("state")).unwrap();
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut disk = std::fs::File::create(source.join("disk.img")).unwrap();
+            disk.set_len(8 * MIB).unwrap();
+            disk.seek(SeekFrom::Start(5 * MIB + 7)).unwrap();
+            disk.write_all(b"workspace data").unwrap();
+        }
+        std::fs::write(source.join("state/key"), b"pool-key").unwrap();
+
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(64);
+        let directory = source.clone();
+        let writer = tokio::task::spawn_blocking(move || write_volume_stream(&directory, &sender));
+        let mut stream = Vec::new();
+        while let Some(chunk) = receiver.recv().await {
+            stream.extend(chunk.unwrap());
+        }
+        writer.await.unwrap().unwrap();
+        assert!(stream.len() < 2 * MIB as usize, "zero blocks are skipped");
+
+        let target = root.join("target");
+        std::fs::create_dir_all(target.join("state")).unwrap();
+        unpack_volume_stream(&stream[..], &target).await.unwrap();
+        let disk = std::fs::read(target.join("disk.img")).unwrap();
+        assert_eq!(disk.len() as u64, 8 * MIB);
+        assert_eq!(&disk[(5 * MIB + 7) as usize..][..14], b"workspace data");
+        assert_eq!(
+            std::fs::read(target.join("state/key")).unwrap(),
+            b"pool-key"
+        );
+
+        let mut corrupted = stream.clone();
+        let middle = corrupted.len() / 2;
+        corrupted[middle] ^= 1;
+        let again = root.join("again");
+        std::fs::create_dir_all(again.join("state")).unwrap();
+        assert!(unpack_volume_stream(&corrupted[..], &again).await.is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -189,6 +189,9 @@ impl Database {
             "CREATE INDEX IF NOT EXISTS tasks_owner ON tasks(owner, created_at_ms DESC)",
             [],
         )?;
+        if !column_exists(&connection, "tasks", "volume")? {
+            connection.execute("ALTER TABLE tasks ADD COLUMN volume TEXT", [])?;
+        }
         let database = Self(Arc::new(Mutex::new(connection)));
         database.set_default("retention_ms", DEFAULT_RETENTION_MS)?;
         database.set_default("max_storage_bytes", DEFAULT_STORAGE_BYTES)?;
@@ -250,17 +253,22 @@ impl Database {
         Ok(())
     }
 
+    /// Tasks to resume after a restart. Unfinished tasks queue again, except
+    /// those with a volume that already reached a node: their microVM may still
+    /// run, so they stay put until the node reports whether it has them.
     pub fn load_active_tasks(&self) -> Result<Vec<Task>> {
         let connection = self.connection()?;
         connection.execute(
             "UPDATE tasks SET status = 'queued', node = NULL, started_at_ms = NULL
-             WHERE status IN ('queued', 'assigned', 'running')",
+             WHERE status IN ('queued', 'assigned', 'running')
+               AND (volume IS NULL OR node IS NULL)",
             [],
         )?;
         let mut statement = connection.prepare(
             "SELECT id, pool, node, status, payload, result, error, created_at_ms,
-                    started_at_ms, finished_at_ms, metrics, variables, owner
-             FROM tasks WHERE status = 'queued' ORDER BY created_at_ms",
+                    started_at_ms, finished_at_ms, metrics, variables, owner, volume
+             FROM tasks WHERE status IN ('queued', 'assigned', 'running')
+             ORDER BY created_at_ms",
         )?;
         let rows = statement.query_map([], task_from_row)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -345,7 +353,7 @@ impl Database {
         let connection = self.connection()?;
         let mut sql = String::from(
             "SELECT id, pool, node, status, error, created_at_ms, started_at_ms,
-                    finished_at_ms, metrics, owner
+                    finished_at_ms, metrics, owner, volume
              FROM tasks WHERE 1 = 1",
         );
         let mut values: Vec<rusqlite::types::Value> = Vec::new();
@@ -387,7 +395,7 @@ impl Database {
         self.connection()?
             .query_row(
                 "SELECT id, pool, node, status, payload, result, error, created_at_ms,
-                        started_at_ms, finished_at_ms, metrics, variables, owner
+                        started_at_ms, finished_at_ms, metrics, variables, owner, volume
                  FROM tasks WHERE id = ?1",
                 [id.to_string()],
                 task_from_row,
@@ -459,10 +467,11 @@ fn upsert_task(connection: &Connection, task: &Task) -> Result<()> {
     connection.execute(
         "INSERT INTO tasks(
             id, pool, node, status, payload, result, error, created_at_ms,
-            started_at_ms, finished_at_ms, metrics, variables, size_bytes, owner
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+            started_at_ms, finished_at_ms, metrics, variables, size_bytes, owner, volume
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
          ON CONFLICT(id) DO UPDATE SET
             pool = excluded.pool, owner = excluded.owner, node = excluded.node,
+            volume = excluded.volume,
             status = excluded.status,
             payload = excluded.payload, result = excluded.result, error = excluded.error,
             started_at_ms = excluded.started_at_ms, finished_at_ms = excluded.finished_at_ms,
@@ -484,6 +493,7 @@ fn upsert_task(connection: &Connection, task: &Task) -> Result<()> {
             variables,
             size as u64,
             task.owner,
+            task.volume,
         ],
     )?;
     Ok(())
@@ -504,6 +514,8 @@ fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         metrics: optional_json(row.get(10)?)?,
         variables: json(row.get::<_, Vec<u8>>(11)?)?,
         owner: row.get(12)?,
+        volume: row.get(13)?,
+        stop: None,
     })
 }
 
@@ -538,6 +550,7 @@ fn task_view_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskView> {
         finished_at_ms: row.get(7)?,
         metrics: optional_json(row.get(8)?)?,
         owner: row.get(9)?,
+        volume: row.get(10)?,
     })
 }
 
@@ -662,7 +675,33 @@ mod tests {
             started_at_ms: None,
             finished_at_ms: None,
             metrics: None,
+            volume: None,
+            stop: None,
         }
+    }
+
+    #[test]
+    fn keeps_running_volume_tasks_across_restarts() {
+        let (database, path) = database();
+        let node = Uuid::new_v4();
+        let mut plain = task(1);
+        plain.status = TaskStatus::Running;
+        plain.node = Some(node);
+        let mut attached = task(2);
+        attached.status = TaskStatus::Running;
+        attached.node = Some(node);
+        attached.volume = Some("home".into());
+        database.insert_task(&plain, &[]).unwrap();
+        database.insert_task(&attached, &[]).unwrap();
+        let active = database.load_active_tasks().unwrap();
+        let find = |id| active.iter().find(|task| task.id == id).unwrap();
+        assert_eq!(find(plain.id).status, TaskStatus::Queued);
+        assert_eq!(find(plain.id).node, None);
+        assert_eq!(find(attached.id).status, TaskStatus::Running);
+        assert_eq!(find(attached.id).node, Some(node));
+        assert_eq!(find(attached.id).volume.as_deref(), Some("home"));
+        drop(database);
+        std::fs::remove_file(path).ok();
     }
 
     #[test]

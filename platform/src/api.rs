@@ -32,8 +32,8 @@ use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
 use crate::cluster::{
-    Cluster, Disk, Image, ImageKind, JoinToken, MicroVm, Node, NodeStatus, Pool, PoolDisk, Task,
-    TaskMetrics, TaskStatus, TaskView, Work,
+    Cluster, Disk, Image, ImageKind, JoinToken, MicroVm, Node, NodeStatus, Pool, PoolDisk,
+    StopMode, Task, TaskMetrics, TaskStatus, TaskView, Volume, Work,
 };
 use crate::plugins::{self, Plugins};
 use crate::storage::{Database, SecretCipher, StorageSettings, StorageView};
@@ -53,6 +53,7 @@ pub struct App {
     work: Arc<Notify>,
     pub plugins: Arc<Plugins>,
     imports: Arc<Imports>,
+    transfers: Arc<Transfers>,
 }
 
 /// Identifies requests that arrive on a plugin's private core socket.
@@ -262,6 +263,7 @@ pub async fn serve(
         tasks: Arc::new(Notify::new()),
         work: Arc::new(Notify::new()),
         imports: Arc::default(),
+        transfers: Arc::default(),
     };
     app.database.prune(now_ms())?;
     let garbage_collector = app.clone();
@@ -320,6 +322,14 @@ fn router(app: App) -> Router {
         .route("/v1/pools/{name}/restart", post(restart_pool))
         .route("/v1/disks", get(list_disks).post(upload_disk))
         .route("/v1/disks/{key}", axum::routing::delete(delete_disk))
+        .route("/v1/volumes", get(list_volumes).post(create_volume))
+        .route("/v1/volumes/{name}", get(get_volume).delete(delete_volume))
+        .route(
+            "/internal/volumes/{name}/transfer",
+            get(receive_volume).put(send_volume),
+        )
+        .route("/internal/volumes/{name}/moved", post(volume_moved))
+        .route("/internal/volumes/{name}/failed", post(volume_move_failed))
         .route("/internal/disks/{key}", get(download_disk))
         .route("/v1/plugins", get(plugins::list_plugins))
         .route("/v1/plugins/uploads", post(plugins::upload_plugin))
@@ -357,6 +367,7 @@ fn router(app: App) -> Router {
         .route("/v1/tasks/{id}/payload", get(get_task_payload))
         .route("/v1/tasks/{id}/result", get(get_task_result))
         .route("/v1/tasks/{id}/logs", get(get_task_logs))
+        .route("/v1/tasks/{id}/stop", post(stop_task))
         .route("/internal/nodes/register", post(register_node))
         .route("/internal/identity", get(controller_identity))
         .route("/internal/join", post(join_cluster))
@@ -1424,6 +1435,14 @@ fn validate_pool(cluster: &Cluster, pool: &Pool, previous: Option<&Pool>) -> Api
             ));
         }
     }
+    if let Some(mount) = &pool.volume_mount
+        && (!mount.starts_with('/') || mount == "/" || mounts.contains(mount))
+    {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "the volume mount must be an absolute path other than / and the disk mounts",
+        ));
+    }
     if pool.disks.len() > 16 {
         return Err(error(
             StatusCode::BAD_REQUEST,
@@ -1537,6 +1556,7 @@ fn recycles_vms(old: &Pool, new: &Pool) -> bool {
         || old.preload != new.preload
         || old.disks != new.disks
         || old.executor != new.executor
+        || old.volume_mount != new.volume_mount
         || old.ports.len() != new.ports.len()
         || old.ports.iter().zip(&new.ports).any(|(left, right)| {
             left.name != right.name
@@ -1973,6 +1993,20 @@ async fn delete_node(
         return Err(error(StatusCode::NOT_FOUND, "node not found"));
     }
     cluster.node_credentials.remove(&id);
+    // The volumes' files went with the node; their next task starts them empty.
+    for volume in cluster.volumes.values_mut() {
+        if volume.node == Some(id) {
+            volume.node = None;
+            volume.suspended = false;
+        }
+        if volume
+            .migration
+            .as_ref()
+            .is_some_and(|migration| migration.from == id || migration.to == id)
+        {
+            volume.migration = None;
+        }
+    }
     let scheduled = cluster.schedule_queued();
     save(&app, &cluster).await?;
     app.database
@@ -2044,6 +2078,9 @@ struct CreateTask {
     secrets: HashMap<String, String>,
     #[serde(default = "default_queue")]
     queue: bool,
+    /// Volume to attach; the pool must have a volume mount.
+    #[serde(default)]
+    volume: Option<String>,
 }
 
 fn default_queue() -> bool {
@@ -2052,6 +2089,7 @@ fn default_queue() -> bool {
 
 async fn create_task(
     State(app): State<App>,
+    caller: Option<Extension<Caller>>,
     Json(request): Json<CreateTask>,
 ) -> ApiResult<(StatusCode, Json<TaskView>)> {
     if let Some(working_dir) = request.payload.get("working_dir") {
@@ -2081,6 +2119,33 @@ async fn create_task(
     }
     let pool_name = pool.name.clone();
     let owner = pool.managed_by.clone();
+    if let Some(name) = &request.volume {
+        if pool.volume_mount.is_none() {
+            return Err(error(StatusCode::BAD_REQUEST, "pool has no volume mount"));
+        }
+        let volume = cluster
+            .volumes
+            .get(name)
+            .ok_or_else(|| error(StatusCode::BAD_REQUEST, format!("unknown volume {name}")))?;
+        if volume.owner.is_some() && volume.owner != owner_of(&caller) {
+            return Err(error(
+                StatusCode::FORBIDDEN,
+                "volume belongs to another owner",
+            ));
+        }
+        if cluster.tasks.values().any(|task| {
+            task.volume.as_deref() == Some(name.as_str())
+                && matches!(
+                    task.status,
+                    TaskStatus::Queued | TaskStatus::Assigned | TaskStatus::Running
+                )
+        }) {
+            return Err(error(
+                StatusCode::CONFLICT,
+                "volume is attached to another active task",
+            ));
+        }
+    }
     let id = Uuid::new_v4();
     let task = Task {
         id,
@@ -2096,6 +2161,8 @@ async fn create_task(
         started_at_ms: None,
         finished_at_ms: None,
         metrics: None,
+        volume: request.volume,
+        stop: None,
     };
     let secrets = app
         .secrets
@@ -2262,6 +2329,72 @@ async fn get_task_logs(
     }))
 }
 
+#[derive(Deserialize, Default)]
+struct StopTask {
+    /// Save the microVM's state with the task's volume instead of discarding it.
+    #[serde(default)]
+    suspend: bool,
+}
+
+/// End a task early. Queued tasks end at once; running ones end on their node
+/// within a heartbeat, either destroyed or, with `suspend`, saved with their volume.
+async fn stop_task(
+    State(app): State<App>,
+    caller: Option<Extension<Caller>>,
+    AxumPath(id): AxumPath<Uuid>,
+    body: Option<Json<StopTask>>,
+) -> ApiResult<(StatusCode, Json<TaskView>)> {
+    let request = body.map(|Json(body)| body).unwrap_or_default();
+    let mut cluster = app.cluster.write().await;
+    let Some(task) = cluster.tasks.get_mut(&id) else {
+        drop(cluster);
+        return match app.database.task(id).map_err(internal_error)? {
+            Some(task) => Ok((StatusCode::OK, Json(TaskView::from(&task)))),
+            None => Err(error(StatusCode::NOT_FOUND, "task not found")),
+        };
+    };
+    if caller.is_some() && task.owner != owner_of(&caller) {
+        return Err(error(
+            StatusCode::FORBIDDEN,
+            "task belongs to another owner",
+        ));
+    }
+    if request.suspend && task.volume.is_none() {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "only tasks with a volume can be suspended",
+        ));
+    }
+    if task.status == TaskStatus::Running {
+        task.stop = Some(if request.suspend {
+            StopMode::Suspend
+        } else {
+            StopMode::Stop
+        });
+        let view = TaskView::from(&*task);
+        return Ok((StatusCode::ACCEPTED, Json(view)));
+    }
+    // Not on a node yet: end it here.
+    task.status = TaskStatus::Failed;
+    task.error = Some("stopped before it started".into());
+    task.finished_at_ms = Some(now_ms());
+    let assigned = task.node.is_some();
+    if assigned {
+        cluster.release(id, false);
+    }
+    let task = cluster.tasks.remove(&id).unwrap();
+    let scheduled = cluster.schedule_queued();
+    save(&app, &cluster).await?;
+    drop(cluster);
+    app.database
+        .save_tasks(&scheduled)
+        .map_err(internal_error)?;
+    let task = app.database.complete_task(&task).map_err(internal_error)?;
+    app.tasks.notify_waiters();
+    app.work.notify_waiters();
+    Ok((StatusCode::OK, Json(TaskView::from(&task))))
+}
+
 #[derive(Deserialize)]
 struct RegisterNode {
     id: Option<Uuid>,
@@ -2275,13 +2408,33 @@ struct RegisterNode {
     reset_idle: bool,
     #[serde(default)]
     vms: Vec<MicroVm>,
+    /// Tasks the node is working on; older nodes leave it out.
+    #[serde(default)]
+    tasks: Option<Vec<Uuid>>,
 }
+
+#[derive(Serialize)]
+struct Registered {
+    #[serde(flatten)]
+    node: Node,
+    /// Running tasks on this node that should end early.
+    stops: Vec<StopCommand>,
+}
+
+#[derive(Serialize)]
+struct StopCommand {
+    task: Uuid,
+    mode: StopMode,
+}
+
+/// Grace period for a picked-up task to show up in its node's reports.
+const TASK_REPORT_GRACE_MS: u64 = 15_000;
 
 async fn register_node(
     State(app): State<App>,
     headers: HeaderMap,
     Json(request): Json<RegisterNode>,
-) -> ApiResult<Json<Node>> {
+) -> ApiResult<Json<Registered>> {
     let authenticated = authenticated_node(&app, &headers).await?;
     if request.id != Some(authenticated) {
         return Err(error(StatusCode::FORBIDDEN, "node identity mismatch"));
@@ -2317,15 +2470,75 @@ async fn register_node(
     if request.reset_idle {
         cluster.reset_idle_instances(id);
     }
+    // Volume tasks survive controller restarts; one the node no longer works on
+    // (it restarted, say) starts again, or ends if it was being stopped.
+    let mut changed = Vec::new();
+    let mut ended = Vec::new();
+    if let Some(working) = &request.tasks {
+        let now = now_ms();
+        let lost = cluster
+            .tasks
+            .values()
+            .filter(|task| {
+                task.node == Some(id)
+                    && task.volume.is_some()
+                    && task.status == TaskStatus::Running
+                    && !working.contains(&task.id)
+                    && task
+                        .started_at_ms
+                        .is_none_or(|started| now.saturating_sub(started) > TASK_REPORT_GRACE_MS)
+            })
+            .map(|task| task.id)
+            .collect::<Vec<_>>();
+        for task_id in lost {
+            cluster.release(task_id, false);
+            let task = cluster.tasks.get_mut(&task_id).unwrap();
+            if task.stop.is_some() {
+                task.status = TaskStatus::Failed;
+                task.error = Some("the node lost the task while stopping it".into());
+                task.finished_at_ms = Some(now);
+                ended.push(cluster.tasks.remove(&task_id).unwrap());
+            } else {
+                tracing::info!(task = %task_id, node = %id, "restarting a volume task its node lost");
+                task.status = TaskStatus::Queued;
+                task.node = None;
+                task.started_at_ms = None;
+                changed.push(task.clone());
+            }
+        }
+    }
     cluster.refresh_node(id);
-    let scheduled = cluster.schedule_queued();
+    let mut scheduled = cluster.schedule_queued();
+    for task in changed {
+        if !scheduled.iter().any(|other| other.id == task.id) {
+            scheduled.push(task);
+        }
+    }
+    let stops = cluster
+        .tasks
+        .values()
+        .filter(|task| task.node == Some(id) && task.status == TaskStatus::Running)
+        .filter_map(|task| {
+            task.stop.map(|mode| StopCommand {
+                task: task.id,
+                mode,
+            })
+        })
+        .collect();
     let node = cluster.nodes[&id].clone();
     save(&app, &cluster).await?;
+    drop(cluster);
     app.database
         .save_tasks(&scheduled)
         .map_err(internal_error)?;
+    for task in &ended {
+        app.database.complete_task(task).map_err(internal_error)?;
+    }
+    if !ended.is_empty() {
+        app.tasks.notify_waiters();
+    }
     app.work.notify_waiters();
-    Ok(Json(node))
+    Ok(Json(Registered { node, stops }))
 }
 
 async fn image_ready(
@@ -2484,7 +2697,8 @@ async fn next_work(
     loop {
         let notified = app.work.notified();
         let work = {
-            let mut cluster = app.cluster.write().await;
+            let mut guard = app.cluster.write().await;
+            let cluster = &mut *guard;
             if !cluster.nodes.contains_key(&id) {
                 return Err(error(StatusCode::NOT_FOUND, "node not found"));
             }
@@ -2497,13 +2711,29 @@ async fn next_work(
                     task.started_at_ms = Some(now_ms());
                     task.clone()
                 });
-            task.map(|task| Work {
-                pool: cluster.pools[&task.pool].clone(),
-                task,
-                secrets: HashMap::new(),
+            task.map(|task| {
+                // The node resumes a suspended microVM once; its saved state goes then.
+                let volume = task
+                    .volume
+                    .as_ref()
+                    .and_then(|name| cluster.volumes.get_mut(name))
+                    .map(|volume| {
+                        let view = volume.clone();
+                        volume.suspended = false;
+                        view
+                    });
+                Work {
+                    pool: cluster.pools[&task.pool].clone(),
+                    task,
+                    secrets: HashMap::new(),
+                    volume,
+                }
             })
         };
         if let Some(mut work) = work {
+            if work.volume.is_some() {
+                save(&app, &*app.cluster.read().await).await?;
+            }
             save_task(&app, &work.task).await?;
             let encrypted = app
                 .database
@@ -2561,10 +2791,23 @@ async fn complete_task(
     } else {
         TaskStatus::Succeeded
     };
+    let suspended = request.error.is_none()
+        && request
+            .result
+            .as_ref()
+            .and_then(|result| result.get("suspended"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
     task.result = request.result;
     task.error = request.error;
     task.metrics = request.metrics;
     task.finished_at_ms = Some(now_ms());
+    if suspended
+        && let Some(volume) = task.volume.clone()
+        && let Some(volume) = cluster.volumes.get_mut(&volume)
+    {
+        volume.suspended = true;
+    }
     cluster.release(id, request.keep_idle);
     let scheduled = cluster.schedule_queued();
     let task = cluster.tasks[&id].clone();
@@ -2576,6 +2819,294 @@ async fn complete_task(
         .map_err(internal_error)?;
     app.database.complete_task(&task).map_err(internal_error)?;
     app.tasks.notify_waiters();
+    app.work.notify_waiters();
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// --- Volumes ---------------------------------------------------------------------------
+
+const MIN_VOLUME_MIB: u32 = 64;
+const MAX_VOLUME_MIB: u32 = 4 * 1024 * 1024;
+
+#[derive(Deserialize)]
+struct CreateVolume {
+    name: String,
+    size_mib: u32,
+}
+
+async fn list_volumes(State(app): State<App>) -> Json<Vec<Volume>> {
+    let mut volumes = app
+        .cluster
+        .read()
+        .await
+        .volumes
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    volumes.sort_by(|left, right| left.name.cmp(&right.name));
+    Json(volumes)
+}
+
+async fn get_volume(
+    State(app): State<App>,
+    AxumPath(name): AxumPath<String>,
+) -> ApiResult<Json<Volume>> {
+    app.cluster
+        .read()
+        .await
+        .volumes
+        .get(&name)
+        .cloned()
+        .map(Json)
+        .ok_or_else(|| error(StatusCode::NOT_FOUND, "volume not found"))
+}
+
+/// Volumes are created empty; the first node that runs a task with one formats it.
+async fn create_volume(
+    State(app): State<App>,
+    caller: Option<Extension<Caller>>,
+    Json(request): Json<CreateVolume>,
+) -> ApiResult<(StatusCode, Json<Volume>)> {
+    if !valid_disk_key(&request.name) {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "volume names may only contain letters, digits, '-' and '_'",
+        ));
+    }
+    if !(MIN_VOLUME_MIB..=MAX_VOLUME_MIB).contains(&request.size_mib) {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            format!("volume size must be {MIN_VOLUME_MIB}-{MAX_VOLUME_MIB} MiB"),
+        ));
+    }
+    let mut cluster = app.cluster.write().await;
+    if cluster.volumes.contains_key(&request.name) {
+        return Err(error(StatusCode::CONFLICT, "volume already exists"));
+    }
+    let volume = Volume {
+        name: request.name,
+        size_mib: request.size_mib,
+        owner: owner_of(&caller),
+        node: None,
+        suspended: false,
+        migration: None,
+        migration_failed_at_ms: None,
+        migration_error: None,
+        created_at_ms: now_ms(),
+    };
+    cluster.volumes.insert(volume.name.clone(), volume.clone());
+    save(&app, &cluster).await?;
+    Ok((StatusCode::CREATED, Json(volume)))
+}
+
+/// Forget a volume; its node deletes the files on its next heartbeat.
+async fn delete_volume(
+    State(app): State<App>,
+    caller: Option<Extension<Caller>>,
+    AxumPath(name): AxumPath<String>,
+) -> ApiResult<StatusCode> {
+    let mut cluster = app.cluster.write().await;
+    let volume = cluster
+        .volumes
+        .get(&name)
+        .ok_or_else(|| error(StatusCode::NOT_FOUND, "volume not found"))?;
+    if volume.owner != owner_of(&caller) {
+        return Err(error(
+            StatusCode::FORBIDDEN,
+            "volume belongs to another owner",
+        ));
+    }
+    if cluster.tasks.values().any(|task| {
+        task.volume.as_deref() == Some(name.as_str())
+            && matches!(
+                task.status,
+                TaskStatus::Queued | TaskStatus::Assigned | TaskStatus::Running
+            )
+    }) {
+        return Err(error(StatusCode::CONFLICT, "volume has active tasks"));
+    }
+    cluster.volumes.remove(&name);
+    save(&app, &cluster).await?;
+    drop(cluster);
+    app.transfers.remove(&name);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Volume copies stream from the old node to the new one through the controller,
+/// without touching the controller's disk.
+#[derive(Default)]
+struct Transfers(std::sync::Mutex<HashMap<String, Transfer>>);
+
+struct Transfer {
+    started_at_ms: u64,
+    sender: Option<tokio::sync::mpsc::Sender<std::io::Result<Bytes>>>,
+    receiver: Option<tokio::sync::mpsc::Receiver<std::io::Result<Bytes>>>,
+}
+
+impl Transfers {
+    fn with<T>(&self, name: &str, started_at_ms: u64, take: impl FnOnce(&mut Transfer) -> T) -> T {
+        let mut transfers = self.0.lock().expect("transfers lock poisoned");
+        let transfer = transfers
+            .entry(name.to_owned())
+            .or_insert_with(|| Transfer::new(started_at_ms));
+        if transfer.started_at_ms != started_at_ms {
+            *transfer = Transfer::new(started_at_ms);
+        }
+        take(transfer)
+    }
+
+    fn remove(&self, name: &str) {
+        self.0.lock().expect("transfers lock poisoned").remove(name);
+    }
+}
+
+impl Transfer {
+    fn new(started_at_ms: u64) -> Self {
+        let (sender, receiver) = tokio::sync::mpsc::channel(16);
+        Self {
+            started_at_ms,
+            sender: Some(sender),
+            receiver: Some(receiver),
+        }
+    }
+}
+
+/// How long one side of a volume copy waits for the other.
+const TRANSFER_STALL_SECS: u64 = 300;
+
+/// Which side of the volume's current move this node is.
+async fn migration_side(
+    app: &App,
+    headers: &HeaderMap,
+    name: &str,
+) -> ApiResult<(Uuid, crate::cluster::VolumeMigration)> {
+    let node = authenticated_node(app, headers).await?;
+    let cluster = app.cluster.read().await;
+    let migration = cluster
+        .volumes
+        .get(name)
+        .and_then(|volume| volume.migration.clone())
+        .ok_or_else(|| error(StatusCode::CONFLICT, "volume is not moving"))?;
+    if migration.from != node && migration.to != node {
+        return Err(error(
+            StatusCode::FORBIDDEN,
+            "node is not part of this volume's move",
+        ));
+    }
+    Ok((node, migration))
+}
+
+async fn send_volume(
+    State(app): State<App>,
+    headers: HeaderMap,
+    AxumPath(name): AxumPath<String>,
+    body: Body,
+) -> ApiResult<StatusCode> {
+    let (node, migration) = migration_side(&app, &headers, &name).await?;
+    if node != migration.from {
+        return Err(error(StatusCode::FORBIDDEN, "only the old node sends"));
+    }
+    let sender = app
+        .transfers
+        .with(&name, migration.started_at_ms, |transfer| {
+            transfer.sender.take()
+        })
+        .ok_or_else(|| error(StatusCode::CONFLICT, "volume is already being sent"))?;
+    let mut stream = body.into_data_stream();
+    let stall = std::time::Duration::from_secs(TRANSFER_STALL_SECS);
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(std::io::Error::other);
+        let failed = chunk.is_err();
+        match tokio::time::timeout(stall, sender.send(chunk)).await {
+            Ok(Ok(())) if !failed => {}
+            Ok(Ok(())) => return Err(error(StatusCode::BAD_REQUEST, "upload failed")),
+            Ok(Err(_)) => {
+                return Err(error(
+                    StatusCode::BAD_GATEWAY,
+                    "the new node stopped receiving",
+                ));
+            }
+            Err(_) => {
+                return Err(error(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "the new node did not receive",
+                ));
+            }
+        }
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn receive_volume(
+    State(app): State<App>,
+    headers: HeaderMap,
+    AxumPath(name): AxumPath<String>,
+) -> ApiResult<Response> {
+    let (node, migration) = migration_side(&app, &headers, &name).await?;
+    if node != migration.to {
+        return Err(error(StatusCode::FORBIDDEN, "only the new node receives"));
+    }
+    let receiver = app
+        .transfers
+        .with(&name, migration.started_at_ms, |transfer| {
+            transfer.receiver.take()
+        })
+        .ok_or_else(|| error(StatusCode::CONFLICT, "volume is already being received"))?;
+    let stream = futures_util::stream::unfold(receiver, |mut receiver| async move {
+        receiver.recv().await.map(|chunk| (chunk, receiver))
+    });
+    Ok(Body::from_stream(stream).into_response())
+}
+
+async fn volume_moved(
+    State(app): State<App>,
+    headers: HeaderMap,
+    AxumPath(name): AxumPath<String>,
+) -> ApiResult<StatusCode> {
+    let node = authenticated_node(&app, &headers).await?;
+    let mut cluster = app.cluster.write().await;
+    if !cluster.finish_migration(&name, node) {
+        return Err(error(
+            StatusCode::CONFLICT,
+            "volume is not moving to this node",
+        ));
+    }
+    tracing::info!(volume = %name, %node, "volume moved");
+    let scheduled = cluster.schedule_queued();
+    save(&app, &cluster).await?;
+    drop(cluster);
+    app.transfers.remove(&name);
+    app.database
+        .save_tasks(&scheduled)
+        .map_err(internal_error)?;
+    app.work.notify_waiters();
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct MoveFailed {
+    error: String,
+}
+
+async fn volume_move_failed(
+    State(app): State<App>,
+    headers: HeaderMap,
+    AxumPath(name): AxumPath<String>,
+    Json(request): Json<MoveFailed>,
+) -> ApiResult<StatusCode> {
+    let node = authenticated_node(&app, &headers).await?;
+    let mut cluster = app.cluster.write().await;
+    if !cluster.fail_migration(&name, node, request.error.clone()) {
+        return Ok(StatusCode::NO_CONTENT);
+    }
+    tracing::warn!(volume = %name, %node, error = %request.error, "volume move failed");
+    let scheduled = cluster.schedule_queued();
+    save(&app, &cluster).await?;
+    drop(cluster);
+    app.transfers.remove(&name);
+    app.database
+        .save_tasks(&scheduled)
+        .map_err(internal_error)?;
     app.work.notify_waiters();
     Ok(StatusCode::NO_CONTENT)
 }
@@ -2600,6 +3131,7 @@ mod tests {
             tasks: Arc::new(Notify::new()),
             work: Arc::new(Notify::new()),
             imports: Arc::default(),
+            transfers: Arc::default(),
         }
     }
 
@@ -2704,8 +3236,9 @@ mod tests {
             variables: HashMap::new(),
             secrets: HashMap::new(),
             queue: true,
+            volume: None,
         };
-        let (_, Json(task)) = create_task(State(app.clone()), Json(request("jobs")))
+        let (_, Json(task)) = create_task(State(app.clone()), None, Json(request("jobs")))
             .await
             .unwrap();
         assert_eq!(task.pool, "runner");
@@ -2721,11 +3254,11 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(owned.len(), 1);
-        let rejected = create_task(State(app.clone()), Json(request("chrome")))
+        let rejected = create_task(State(app.clone()), None, Json(request("chrome")))
             .await
             .unwrap_err();
         assert_eq!(rejected.0, StatusCode::BAD_REQUEST);
-        let unknown = create_task(State(app.clone()), Json(request("missing")))
+        let unknown = create_task(State(app.clone()), None, Json(request("missing")))
             .await
             .unwrap_err();
         assert_eq!(unknown.0, StatusCode::BAD_REQUEST);

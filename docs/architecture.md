@@ -64,12 +64,16 @@ Each node advertises CPU (millicores) and memory (MiB). A pool's VM must fit on 
 the sum of VMs is not capped: overcommit is managed by the pool owner through
 `max_instances`. Idle VMs count against their node until they expire.
 
+Tasks with a [volume](volumes.md) are the exception: they run where their volume is, and
+when that node's reserved memory would exceed its total, the volume first moves to a node
+with room.
+
 ## Snapshots and pool revisions
 
 A node boots each pool's VM once, lets the guest agent mount disks, start the executor and
 preload modules, then snapshots it. Every later VM of that pool is restored from the
 snapshot. Changing a VM-affecting pool setting (image, CPU, memory, disk size, disks,
-executor, network, ports, preload, reuse) bumps the pool's `revision`: idle VMs are replaced and running ones finish
+executor, network, ports, preload, reuse, volume mount) bumps the pool's `revision`: idle VMs are replaced and running ones finish
 first.
 
 Restores are fast because the guest does not fault its memory in page by page. Firecracker

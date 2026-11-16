@@ -17,6 +17,8 @@ POST /v1/tasks
 - `queue`: when the pool is at `max_instances` or no node fits, wait (`true`) or fail with
   503 (`false`).
 - `variables` and `secrets`: handed to the executor with the payload (see below).
+- `volume`: a [volume](volumes.md) to mount at the pool's `volume_mount`. The task runs on
+  the volume's node.
 
 The reply is the task with status `queued` or `assigned`.
 
@@ -26,7 +28,17 @@ The reply is the task with status `queued` or `assigned`.
 
 - `failed`: the executor returned an error, or the VM broke.
 - `timed_out`: the pool's `timeout_secs` passed; the VM is destroyed.
-- Tasks that were queued, assigned, or running when the controller restarts are queued again.
+- Tasks that were queued, assigned, or running when the controller restarts are queued
+  again, except running tasks with a volume, which keep running (see
+  [Volumes](volumes.md#restarts)).
+
+## Stop
+
+`POST /v1/tasks/{id}/stop` ends a task early. A queued task fails at once. A running task
+ends on its node within a heartbeat: its disks are flushed, the VM is destroyed, and the
+task fails with `task was stopped`. With `{"suspend": true}`, a task with a volume is
+saved instead and succeeds with `{"suspended": true}`; see
+[Suspend and resume](volumes.md#suspend-and-resume). A plugin can stop only its own tasks.
 
 ## Read
 

@@ -6,6 +6,7 @@
 | [Installation](installation.md) | Installing, updating, joining nodes, configuration files, services, ports |
 | [Images and pools](images-and-pools.md) | Importing images, pool settings, warm and idle microVMs, disks, networking |
 | [Tasks](tasks.md) | Sending payloads to executors, results, logs, secrets, working directories, storage |
+| [Volumes](volumes.md) | Persistent disks, suspend and resume, moving work to a node with room |
 | [Executors](executors.md) | Writing the program inside a microVM that handles task payloads |
 | [API reference](api.md) | Every core HTTP endpoint |
 | [Python client](sdk.md) | `scraperack`, the Python client for the core API |
