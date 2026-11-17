@@ -68,6 +68,24 @@ struct Region {
     base_host_virt_addr: u64,
     size: u64,
     offset: u64,
+    /// Bytes per guest memory page: 2 MiB when the VM uses huge pages. Older Firecracker
+    /// versions send `page_size_kib` instead.
+    #[serde(default)]
+    page_size: u64,
+    #[serde(default)]
+    page_size_kib: u64,
+}
+
+impl Region {
+    fn page(&self) -> u64 {
+        if self.page_size > 0 {
+            self.page_size
+        } else if self.page_size_kib > 0 {
+            self.page_size_kib * 1024
+        } else {
+            PAGE
+        }
+    }
 }
 
 #[repr(C)]
@@ -100,6 +118,8 @@ struct Source {
     uffd: RawFd,
     base: usize,
     len: usize,
+    /// Guest page size: every copy covers whole pages of this size.
+    page: u64,
 }
 
 // The fd and the read-only mapping outlive every thread using them: `Handler::run` joins
@@ -136,6 +156,7 @@ pub fn serve(
 struct Handler {
     uffd: OwnedFd,
     regions: Vec<Region>,
+    page: u64,
     source: *const u8,
     source_len: usize,
     working_set: PathBuf,
@@ -163,6 +184,10 @@ impl Handler {
         let (body, uffd) = receive_fd(&stream)?;
         let regions: Vec<Region> =
             serde_json::from_slice(&body).context("invalid guest memory regions")?;
+        let page = regions.iter().map(Region::page).max().unwrap_or(PAGE);
+        if !page.is_power_of_two() || page > FILL_CHUNK {
+            bail!("unsupported guest page size {page}");
+        }
         let source_len = memory.metadata()?.len() as usize;
         // SAFETY: a fresh read-only private mapping of the whole snapshot memory file.
         let source = unsafe {
@@ -181,6 +206,7 @@ impl Handler {
         Ok(Self {
             uffd,
             regions,
+            page,
             source: source.cast(),
             source_len,
             working_set,
@@ -256,9 +282,9 @@ impl Handler {
                 continue;
             }
             let address =
-                u64::from_ne_bytes(message[16..24].try_into().expect("8 bytes")) & !(PAGE - 1);
+                u64::from_ne_bytes(message[16..24].try_into().expect("8 bytes")) & !(self.page - 1);
             if let Some(offset) = self.file_offset(address) {
-                if self.copy(address, offset, PAGE).is_err() {
+                if self.copy(address, offset, self.page).is_err() {
                     break;
                 }
                 if !saved {
@@ -279,35 +305,37 @@ impl Handler {
             uffd: self.uffd.as_raw_fd(),
             base: self.source as usize,
             len: self.source_len,
+            page: self.page,
         }
     }
 
     /// Copy the recorded pages in, merged into contiguous runs.
     fn prefault(&self, offsets: &[u64]) -> usize {
+        let page = self.page;
         let mut copied = 0;
         let mut index = 0;
         while index < offsets.len() {
             let start = offsets[index];
-            let mut end = start + PAGE;
+            let mut end = start + page;
             index += 1;
             while index < offsets.len() && offsets[index] == end {
-                end += PAGE;
+                end += page;
                 index += 1;
             }
             let Some(address) = self.guest_address(start) else {
                 continue;
             };
-            if self.guest_address(end - PAGE) != Some(address + (end - start - PAGE)) {
+            if self.guest_address(end - page) != Some(address + (end - start - page)) {
                 // The run crosses a region boundary: copy it page by page.
-                for offset in (start..end).step_by(PAGE as usize) {
+                for offset in (start..end).step_by(page as usize) {
                     if let Some(address) = self.guest_address(offset) {
-                        copied += usize::from(self.copy(address, offset, PAGE).is_ok());
+                        copied += usize::from(self.copy(address, offset, page).is_ok());
                     }
                 }
                 continue;
             }
             if self.copy(address, start, end - start).is_ok() {
-                copied += ((end - start) / PAGE) as usize;
+                copied += ((end - start) / page) as usize;
             }
         }
         copied
@@ -372,9 +400,9 @@ fn copy(source: Source, address: u64, offset: u64, len: u64) -> Result<()> {
         let error = std::io::Error::last_os_error();
         match error.raw_os_error() {
             // Some pages were already in: copy the rest one by one.
-            Some(libc::EEXIST) if len > PAGE => {
-                for step in (0..len).step_by(PAGE as usize) {
-                    copy(source, address + step, offset + step, PAGE)?;
+            Some(libc::EEXIST) if len > source.page => {
+                for step in (0..len).step_by(source.page as usize) {
+                    copy(source, address + step, offset + step, source.page)?;
                 }
                 return Ok(());
             }
@@ -390,8 +418,16 @@ fn copy(source: Source, address: u64, offset: u64, len: u64) -> Result<()> {
 }
 
 /// Map `len` bytes of guest memory at `address` to the zero page. Pages already in are
-/// skipped.
+/// skipped. Huge pages have no zero page: they get zeroed pages copied from a buffer.
 fn zero(source: Source, address: u64, len: u64) -> Result<()> {
+    if source.page > PAGE {
+        static ZEROS: [u8; FILL_CHUNK as usize] = [0; FILL_CHUNK as usize];
+        for step in (0..len).step_by(FILL_CHUNK as usize) {
+            let chunk = FILL_CHUNK.min(len - step);
+            copy_from(source, address + step, ZEROS.as_ptr() as u64, chunk)?;
+        }
+        return Ok(());
+    }
     let mut request = UffdioZeropage {
         start: address,
         len,
@@ -422,6 +458,40 @@ fn zero(source: Source, address: u64, len: u64) -> Result<()> {
     }
 }
 
+/// UFFDIO_COPY `len` bytes from our buffer at `src` into the guest at `address`, whole pages
+/// at a time; pages already in are skipped.
+fn copy_from(source: Source, address: u64, src: u64, len: u64) -> Result<()> {
+    let mut request = UffdioCopy {
+        dst: address,
+        src,
+        len,
+        mode: 0,
+        copy: 0,
+    };
+    loop {
+        // SAFETY: UFFDIO_COPY with a valid argument; `src` is readable memory of ours.
+        let result = unsafe { libc::ioctl(source.uffd, UFFDIO_COPY, &mut request) };
+        if result == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::EEXIST) if len > source.page => {
+                for step in (0..len).step_by(source.page as usize) {
+                    copy_from(source, address + step, src + step, source.page)?;
+                }
+                return Ok(());
+            }
+            Some(libc::EEXIST) => return Ok(()),
+            Some(libc::EAGAIN) => {
+                request.copy = 0;
+                continue;
+            }
+            _ => return Err(error.into()),
+        }
+    }
+}
+
 /// Whether the snapshot memory at `offset` is all zeros for `len` bytes.
 fn is_zero(source: Source, offset: u64, len: u64) -> bool {
     if offset + len > source.len as u64 {
@@ -436,7 +506,7 @@ fn is_zero(source: Source, offset: u64, len: u64) -> bool {
 }
 
 /// Fill in every page of guest memory not already there: all-zero chunks are mapped to the
-/// zero page, the others copied. Stops when the VM is gone.
+/// zero page (zeroed copies with huge pages), the others copied. Stops when the VM is gone.
 fn fill(source: Source, regions: &[Region]) {
     let started = Instant::now();
     let (mut copied, mut zeroed) = (0, 0);
@@ -506,4 +576,24 @@ fn receive_fd(stream: &UnixStream) -> Result<(Vec<u8>, OwnedFd)> {
     body.truncate(received as usize);
     // SAFETY: the kernel just gave us this descriptor.
     Ok((body, unsafe { OwnedFd::from_raw_fd(fd) }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn region_page_size() {
+        let parse = |json: &str| serde_json::from_str::<Region>(json).unwrap().page();
+        let base = r#""base_host_virt_addr": 0, "size": 4096, "offset": 0"#;
+        assert_eq!(parse(&format!("{{{base}}}")), PAGE);
+        assert_eq!(
+            parse(&format!(r#"{{{base}, "page_size": 2097152}}"#)),
+            2 << 20
+        );
+        assert_eq!(
+            parse(&format!(r#"{{{base}, "page_size_kib": 2048}}"#)),
+            2 << 20
+        );
+    }
 }

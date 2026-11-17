@@ -1992,12 +1992,20 @@ fn snapshot_key(pool: &Pool) -> String {
     };
     // Pools without guest extras keep their pre-plugin key, so upgrades reuse snapshots.
     format!(
-        "{}-{}-{}-{}-base{guest}",
+        "{}-{}-{}-{}-base{guest}{}",
         pool.image,
         pool.cpu_millis.div_ceil(1000).max(1),
         pool.memory_mib,
         if pool.network { "net1" } else { "none" },
+        if huge_pages(pool) { "-huge" } else { "" },
     )
+}
+
+/// Whether a pool's VMs get 2 MiB huge pages. Firecracker restores huge-page snapshots only
+/// through userfaultfd, so without it (and for volume pools, restored from the memory file)
+/// the pool falls back to normal pages.
+fn huge_pages(pool: &Pool) -> bool {
+    pool.huge_pages && uffd::enabled() && pool.volume_mount.is_none()
 }
 
 // --- Volumes ---------------------------------------------------------------------------
@@ -2635,7 +2643,8 @@ async fn configure_boot(
             "vcpu_count": pool.cpu_millis.div_ceil(1000).max(1),
             "mem_size_mib": pool.memory_mib,
             "smt": false,
-            "track_dirty_pages": false
+            "track_dirty_pages": false,
+            "huge_pages": if huge_pages(pool) { "2M" } else { "None" }
         }),
     )
     .await?;

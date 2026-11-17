@@ -1443,6 +1443,12 @@ fn validate_pool(cluster: &Cluster, pool: &Pool, previous: Option<&Pool>) -> Api
             "the volume mount must be an absolute path other than / and the disk mounts",
         ));
     }
+    if pool.huge_pages && !pool.memory_mib.is_multiple_of(2) {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "with huge_pages, memory_mib must be a multiple of 2",
+        ));
+    }
     if pool.disks.len() > 16 {
         return Err(error(
             StatusCode::BAD_REQUEST,
@@ -1557,6 +1563,7 @@ fn recycles_vms(old: &Pool, new: &Pool) -> bool {
         || old.disks != new.disks
         || old.executor != new.executor
         || old.volume_mount != new.volume_mount
+        || old.huge_pages != new.huge_pages
         || old.ports.len() != new.ports.len()
         || old.ports.iter().zip(&new.ports).any(|(left, right)| {
             left.name != right.name

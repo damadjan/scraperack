@@ -54,6 +54,15 @@ A pool is a set of identical microVMs from one image.
 | `aliases` | `[]` | Other names that resolve to this pool when submitting tasks |
 | `display_name` | none | Name shown in the GUI |
 | `volume_mount` | none | Where a task's [volume](volumes.md) is mounted |
+| `huge_pages` | false | Back guest memory with 2 MiB huge pages (see below) |
+
+`huge_pages` makes memory-hungry guests much faster under nested virtualization (a node that
+is itself a VM): each new 4 KiB guest page costs a slow fault there, and a browser writes
+fresh memory all the time. Touching 512 MiB of new memory took ~14 s with normal pages and
+1-3 s with huge pages. Nodes take the pages on demand (`vm.nr_overcommit_hugepages`, set by
+the node service) and give them back when the VM exits; a VM holds its whole memory while it
+runs. Ignored for volume pools and with `SCRAPERACK_NODE_PREFAULT=0`. `memory_mib` must be
+even.
 
 Read-only fields: `managed_by` (set when a plugin owns the pool), `revision` (bumped when a
 VM-affecting setting changes; idle VMs are replaced), and `ready` in listings.

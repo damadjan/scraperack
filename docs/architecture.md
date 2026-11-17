@@ -84,5 +84,7 @@ snapshot), and later restores copy exactly those pages in before the VM resumes.
 VM runs, the node fills in the rest of its memory in 2 MiB chunks, so the guest stops
 paying a handler round trip for every new page within seconds (each one is slow with nested
 virtualization). Chunks that are all zeros, most of a snapshot's memory, are mapped to the
-zero page instead of copied. The restored guest then gets its clock, network and preload in one request. Set
+zero page instead of copied. Pools with `huge_pages` use 2 MiB guest pages: faults, the
+working set and the fill then work in whole 2 MiB pages, and zero chunks are copied from a
+zeroed buffer since huge pages have no shared zero page. The restored guest then gets its clock, network and preload in one request. Set
 `SCRAPERACK_NODE_PREFAULT=0` in `/etc/scraperack/node.env` to map the memory file instead.

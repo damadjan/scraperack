@@ -14,6 +14,9 @@ Environment=XTABLES_LOCKFILE=/var/lib/scraperack-node/xtables.lock
 ExecStartPre=+/usr/sbin/sysctl -w net.ipv4.ip_forward=1
 # Firecracker serves restored guest memory through userfaultfd (memory prefault).
 ExecStartPre=+/bin/sh -c 'if [ -e /dev/userfaultfd ]; then chgrp kvm /dev/userfaultfd && chmod 0660 /dev/userfaultfd; fi'
+# Pools with huge_pages take 2 MiB pages on demand (a cap, 128 GiB); none are reserved, and
+# they go back to the system when the VM exits.
+ExecStartPre=+/usr/sbin/sysctl -w vm.nr_overcommit_hugepages=65536
 ExecStart=/usr/local/bin/scraperack node --controller ${SCRAPERACK_CONTROLLER} --name ${SCRAPERACK_NODE_NAME} --cpu-millis ${SCRAPERACK_NODE_CPU_MILLIS} --memory-mib ${SCRAPERACK_NODE_MEMORY_MIB} --vm-start-concurrency ${SCRAPERACK_NODE_VM_START_CONCURRENCY} --data-dir /var/lib/scraperack-node --firecracker /usr/local/bin/firecracker --kernel /var/lib/scraperack-node/vmlinux
 AmbientCapabilities=CAP_NET_ADMIN
 CapabilityBoundingSet=CAP_NET_ADMIN

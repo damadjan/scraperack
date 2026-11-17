@@ -88,6 +88,10 @@ pub struct Pool {
     /// volume drive in their snapshot; a task that names a volume attaches it there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub volume_mount: Option<String>,
+    /// Back guest memory with 2 MiB huge pages. Faster for memory-hungry guests (browsers)
+    /// under nested virtualization, where every new 4 KiB page costs a slow fault.
+    #[serde(default)]
+    pub huge_pages: bool,
 }
 
 impl Pool {
