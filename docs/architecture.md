@@ -81,7 +81,8 @@ Restores are fast because the guest does not fault its memory in page by page. F
 hands the guest memory to the node over userfaultfd; the first restore of each snapshot
 records which pages it touches in its first 15 seconds (`working-set.json` next to the
 snapshot), and later restores copy exactly those pages in before the VM resumes. While the
-VM runs, the node copies in the rest of its memory in 2 MiB chunks, so the guest stops
+VM runs, the node fills in the rest of its memory in 2 MiB chunks, so the guest stops
 paying a handler round trip for every new page within seconds (each one is slow with nested
-virtualization). The restored guest then gets its clock, network and preload in one request. Set
+virtualization). Chunks that are all zeros, most of a snapshot's memory, are mapped to the
+zero page instead of copied. The restored guest then gets its clock, network and preload in one request. Set
 `SCRAPERACK_NODE_PREFAULT=0` in `/etc/scraperack/node.env` to map the memory file instead.
