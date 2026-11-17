@@ -9,11 +9,12 @@
 //! during [`RECORD_FOR`] is saved next to the snapshot, so it covers the guest agent, the
 //! executor and the workload's first steps after a restore.
 //!
-//! Once the VM runs, a second thread copies in the rest of the memory in large chunks. A page
+//! Once the VM runs, a second thread fills in the rest of the memory in 2 MiB chunks. A page
 //! served on demand costs the guest a round trip through this handler (about 0.3 ms with nested
 //! virtualization), so a restored VM touching new memory, a browser loading a page for example,
-//! ran several times slower for its first minute. Filled in the background, the whole memory
-//! is in within seconds.
+//! ran several times slower for its first minute. Most of a snapshot's memory was never used and
+//! is all zeros (85% of a 2 GiB browser VM): those chunks are mapped to the zero page, which
+//! allocates nothing, and only chunks with data are copied.
 
 use std::{
     collections::BTreeSet,
@@ -40,6 +41,7 @@ const PAGE: u64 = 4096;
 /// Size of each copy while filling in the rest of the memory.
 const FILL_CHUNK: u64 = 2 << 20;
 const UFFDIO_COPY: libc::c_ulong = 0xC028_AA03;
+const UFFDIO_ZEROPAGE: libc::c_ulong = 0xC020_AA04;
 const UFFD_EVENT_PAGEFAULT: u8 = 0x12;
 
 /// Whether restores use this handler. Firecracker (running as this user) needs
@@ -75,6 +77,14 @@ struct UffdioCopy {
     len: u64,
     mode: u64,
     copy: i64,
+}
+
+#[repr(C)]
+struct UffdioZeropage {
+    start: u64,
+    len: u64,
+    mode: u64,
+    zeropage: i64,
 }
 
 /// Outcome of the prefault, reported once the VM may be resumed.
@@ -379,27 +389,81 @@ fn copy(source: Source, address: u64, offset: u64, len: u64) -> Result<()> {
     }
 }
 
-/// Copy in every page of guest memory not already there, in large chunks. Stops when the VM
-/// is gone.
+/// Map `len` bytes of guest memory at `address` to the zero page. Pages already in are
+/// skipped.
+fn zero(source: Source, address: u64, len: u64) -> Result<()> {
+    let mut request = UffdioZeropage {
+        start: address,
+        len,
+        mode: 0,
+        zeropage: 0,
+    };
+    loop {
+        // SAFETY: UFFDIO_ZEROPAGE with a valid argument.
+        let result = unsafe { libc::ioctl(source.uffd, UFFDIO_ZEROPAGE, &mut request) };
+        if result == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::EEXIST) if len > PAGE => {
+                for step in (0..len).step_by(PAGE as usize) {
+                    zero(source, address + step, PAGE)?;
+                }
+                return Ok(());
+            }
+            Some(libc::EEXIST) => return Ok(()),
+            Some(libc::EAGAIN) => {
+                request.zeropage = 0;
+                continue;
+            }
+            _ => return Err(error.into()),
+        }
+    }
+}
+
+/// Whether the snapshot memory at `offset` is all zeros for `len` bytes.
+fn is_zero(source: Source, offset: u64, len: u64) -> bool {
+    if offset + len > source.len as u64 {
+        return false;
+    }
+    // SAFETY: the range was just checked against our read-only mapping of the file.
+    let bytes = unsafe {
+        std::slice::from_raw_parts((source.base + offset as usize) as *const u8, len as usize)
+    };
+    let (head, words, tail) = unsafe { bytes.align_to::<u64>() };
+    head.iter().all(|&b| b == 0) && words.iter().all(|&w| w == 0) && tail.iter().all(|&b| b == 0)
+}
+
+/// Fill in every page of guest memory not already there: all-zero chunks are mapped to the
+/// zero page, the others copied. Stops when the VM is gone.
 fn fill(source: Source, regions: &[Region]) {
     let started = Instant::now();
-    let mut bytes = 0;
+    let (mut copied, mut zeroed) = (0, 0);
     for region in regions {
         let end = region.offset + region.size;
         let mut offset = region.offset;
         while offset < end {
             let len = FILL_CHUNK.min(end - offset);
             let address = region.base_host_virt_addr + (offset - region.offset);
-            if let Err(error) = copy(source, address, offset, len) {
+            let result = if is_zero(source, offset, len) {
+                zeroed += len;
+                // Falls back to a copy where the zero page cannot be mapped.
+                zero(source, address, len).or_else(|_| copy(source, address, offset, len))
+            } else {
+                copied += len;
+                copy(source, address, offset, len)
+            };
+            if let Err(error) = result {
                 tracing::debug!(%error, "stopped filling guest memory");
                 return;
             }
-            bytes += len;
             offset += len;
         }
     }
     tracing::debug!(
-        mib = bytes >> 20,
+        copied_mib = copied >> 20,
+        zero_mib = zeroed >> 20,
         elapsed_ms = started.elapsed().as_millis() as u64,
         "filled guest memory"
     );
