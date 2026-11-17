@@ -9,14 +9,15 @@ what runs inside them.
 
 ## Install
 
-On a fresh Ubuntu 24.04 x86_64 machine with KVM:
+On a fresh Ubuntu 24.04 x86_64 machine:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/damadjan/scraperack/main/install.sh | sudo sh
 ```
 
-That installs the controller (API on port 7070), the GUI (port 8080), and a node. Run the
-same command to update. Add machines from **Settings → Join nodes**.
+Choose a single-machine install (controller, GUI, and worker), a control plane without a
+worker, or a worker to join to an existing control plane. KVM is required only for roles
+that run a worker. Run the same command to update or change the installation type.
 
 ## Documentation
 
