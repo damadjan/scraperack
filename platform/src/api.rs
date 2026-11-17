@@ -2470,8 +2470,9 @@ async fn register_node(
     if request.reset_idle {
         cluster.reset_idle_instances(id);
     }
-    // Volume tasks survive controller restarts; one the node no longer works on
-    // (it restarted, say) starts again, or ends if it was being stopped.
+    // A running task the node no longer works on (its microVM ended without a result, or the
+    // node restarted) would otherwise stay running forever. Volume tasks start again, unless
+    // they were being stopped; other tasks fail.
     let mut changed = Vec::new();
     let mut ended = Vec::new();
     if let Some(working) = &request.tasks {
@@ -2481,7 +2482,6 @@ async fn register_node(
             .values()
             .filter(|task| {
                 task.node == Some(id)
-                    && task.volume.is_some()
                     && task.status == TaskStatus::Running
                     && !working.contains(&task.id)
                     && task
@@ -2493,10 +2493,15 @@ async fn register_node(
         for task_id in lost {
             cluster.release(task_id, false);
             let task = cluster.tasks.get_mut(&task_id).unwrap();
-            if task.stop.is_some() {
+            if task.volume.is_none() || task.stop.is_some() {
                 task.status = TaskStatus::Failed;
-                task.error = Some("the node lost the task while stopping it".into());
+                task.error = Some(if task.stop.is_some() {
+                    "the node lost the task while stopping it".into()
+                } else {
+                    "the node lost the task: its microVM ended without a result".into()
+                });
                 task.finished_at_ms = Some(now);
+                tracing::warn!(task = %task_id, node = %id, "failing a task its node lost");
                 ended.push(cluster.tasks.remove(&task_id).unwrap());
             } else {
                 tracing::info!(task = %task_id, node = %id, "restarting a volume task its node lost");
@@ -3405,6 +3410,90 @@ mod tests {
                 .0,
             StatusCode::UNAUTHORIZED
         );
+        fs::remove_dir_all(app.data_dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tasks_a_node_no_longer_reports_fail() {
+        let app = app().await;
+        let image = with_image(&app).await;
+        let token = create_join_token(State(app.clone())).await.unwrap().0;
+        let credentials = join_cluster(
+            State(app.clone()),
+            Json(JoinRequest {
+                token: token.token.unwrap(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        let node = credentials.node_id;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {}", credentials.credential)).unwrap(),
+        );
+        let report = |tasks: Vec<Uuid>| RegisterNode {
+            id: Some(node),
+            name: "node".into(),
+            cpu_millis: 4000,
+            memory_mib: 4096,
+            vm_start_concurrency: None,
+            address: None,
+            reset_idle: false,
+            vms: Vec::new(),
+            tasks: Some(tasks),
+        };
+        let _ = register_node(
+            State(app.clone()),
+            headers.clone(),
+            Json(report(Vec::new())),
+        )
+        .await
+        .unwrap();
+        let mut runner = pool("runner", image);
+        runner.executor = vec!["/bin/executor".into()];
+        let task = |started_ms_ago: u64| Task {
+            id: Uuid::new_v4(),
+            pool: "runner".into(),
+            owner: None,
+            node: Some(node),
+            status: TaskStatus::Running,
+            payload: json!({"encoding": "json", "data": 1}),
+            variables: HashMap::new(),
+            result: None,
+            error: None,
+            created_at_ms: now_ms() - started_ms_ago,
+            started_at_ms: Some(now_ms() - started_ms_ago),
+            finished_at_ms: None,
+            metrics: None,
+            volume: None,
+            stop: None,
+        };
+        let (lost, fresh, working) = (task(60_000), task(1_000), task(60_000));
+        {
+            let mut cluster = app.cluster.write().await;
+            cluster.pools.insert(runner.name.clone(), runner);
+            for task in [&lost, &fresh, &working] {
+                cluster.tasks.insert(task.id, task.clone());
+            }
+        }
+        app.database
+            .save_tasks(&[lost.clone(), fresh.clone(), working.clone()])
+            .unwrap();
+        let _ = register_node(State(app.clone()), headers, Json(report(vec![working.id])))
+            .await
+            .unwrap();
+        let cluster = app.cluster.read().await;
+        assert!(!cluster.tasks.contains_key(&lost.id));
+        assert_eq!(cluster.tasks[&fresh.id].status, TaskStatus::Running);
+        assert_eq!(cluster.tasks[&working.id].status, TaskStatus::Running);
+        drop(cluster);
+        let Json(result) = get_task_result(State(app.clone()), AxumPath(lost.id))
+            .await
+            .unwrap();
+        assert_eq!(result.status, TaskStatus::Failed);
+        assert!(result.error.unwrap().contains("lost the task"));
         fs::remove_dir_all(app.data_dir).await.unwrap();
     }
 
