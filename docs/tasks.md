@@ -26,7 +26,8 @@ The reply is the task with status `queued` or `assigned`.
 
 `queued` → `assigned` → `running` → `succeeded` | `failed` | `timed_out`
 
-- `failed`: the executor returned an error, or the VM broke.
+- `failed`: the executor returned an error, or the VM broke (also when its node stops
+  reporting a running task, for example after the microVM died without a result).
 - `timed_out`: the pool's `timeout_secs` passed; the VM is destroyed.
 - Tasks that were queued, assigned, or running when the controller restarts are queued
   again, except running tasks with a volume, which keep running (see
