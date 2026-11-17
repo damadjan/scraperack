@@ -3,44 +3,69 @@
 ## Requirements
 
 - Ubuntu 24.04, x86_64
-- KVM (`/dev/kvm`), so bare metal or a VM with nested virtualization
 - Root access for the installer
+- KVM (`/dev/kvm`) for single-machine and worker installs; a control-plane-only install
+  can run on a regular VPS
 
-## Install a controller
+## Install
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/damadjan/scraperack/main/install.sh | sudo sh
 ```
 
-The installer:
+The installer asks which type to install:
 
-- installs host packages (Docker, Skopeo, e2fsprogs, iptables, Python 3)
-- downloads the rolling build of `main` and verifies its checksum
-- installs Firecracker and its CI kernel, and dnsproxy for guest DNS
-- creates the `scraperack` user and the systemd services below
-- prints the controller and GUI URLs
+- **Single machine** (`all`): controller, GUI, and worker. This is the default and forms a
+  one-machine cluster.
+- **Control plane only** (`control-plane`): controller and GUI. It runs no microVMs and
+  does not require KVM, Firecracker, dnsproxy, or worker networking packages.
+- **Worker only** (`worker`): Firecracker worker and guest DNS. Join it to an existing
+  control plane after installation.
 
-The machine runs the controller, the GUI, and a node, so it is a one-machine cluster.
+The installer downloads the rolling build of `main`, verifies its checksum, installs only
+the packages required by the selected role, creates the `scraperack` user and systemd
+services, and starts the selected components.
 
-## Update
+For an unattended installation, pass the role explicitly:
 
-Run the same command again. It keeps `/var/lib/scraperack-controller`,
-`/var/lib/scraperack-node`, and `/etc/scraperack/node.env`, skips anything unchanged, and
-restarts the services. Update the controller machine first, then the other nodes. See
-[Operations](operations.md#upgrades).
+```sh
+curl -fsSL https://raw.githubusercontent.com/damadjan/scraperack/main/install.sh |
+    sudo sh -s -- --role control-plane --yes
+```
 
-Pin a release instead of the rolling build with `SCRAPERACK_RELEASE=<tag>`.
+Valid roles are `all`, `control-plane`, and `worker`. Pin a release instead of the rolling
+build with `SCRAPERACK_RELEASE=<tag>`.
 
-## Add nodes
+## Update or change type
 
-1. Install Scraperack on the new machine with the same command.
+Run the same install command again. The installer offers to update the current type or
+change it. For unattended changes, pass `--role` and `--yes`.
+
+Changing type keeps `/var/lib/scraperack-controller`, `/var/lib/scraperack-node`, and the
+configuration files. Removing the local worker stops its workloads and disables its
+services; changing to `worker` stops the local controller and GUI. Changing to `all` or
+`worker` checks for KVM before making changes.
+
+Updates preserve the role in `/etc/scraperack/role`. Existing installations whose role is
+`node` are treated as `worker`.
+
+## Add workers
+
+1. Run the installer on the new machine and choose **Worker only**, or install it
+   unattended:
+
+   ```sh
+   curl -fsSL https://raw.githubusercontent.com/damadjan/scraperack/main/install.sh |
+       sudo sh -s -- --role worker --yes
+   ```
+
 2. In the GUI open **Settings → Join nodes**, check the controller URL, optionally name the
-   node, and generate the command. It is single-use and valid for ten minutes.
-3. Run the command on the new machine.
+   worker, and generate the command. It is single-use and valid for ten minutes.
+3. Run the command on the worker.
 
-Joining switches the machine to node-only: its controller and GUI are disabled, their data
-kept, and the node authenticates with a persistent per-node credential. Re-running the
-installer keeps the node-only role (`/etc/scraperack/role`).
+Until it is joined, a fresh worker installation leaves the worker and DNS services
+disabled. Joining stores a persistent per-worker credential and starts them. Re-running
+the installer updates the worker without requiring another join.
 
 ## Configuration
 
@@ -64,6 +89,9 @@ The installer writes these files (mode 0600). Edit them and restart the matching
 | `SCRAPERACK_NODE_VM_START_CONCURRENCY` | cores ÷ 2, at least 1 | MicroVMs started at once |
 | `SCRAPERACK_NODE_CREDENTIAL` | set by joining | Node credential |
 
+Installer options: `--role all|control-plane|worker`, `--yes`, and `--help`. The
+`SCRAPERACK_ROLE` environment variable is equivalent to `--role`.
+
 Installer-time overrides: `SCRAPERACK_NODE_CPU_MILLIS`, `SCRAPERACK_NODE_MEMORY_MIB`,
 `SCRAPERACK_NODE_VM_START_CONCURRENCY`, `SCRAPERACK_NODE_NAME`, `SCRAPERACK_LISTEN`,
 `SCRAPERACK_GUI_PORT`, `SCRAPERACK_PUBLIC_URL`, `SCRAPERACK_USER`, `SCRAPERACK_REPOSITORY`.
@@ -77,8 +105,8 @@ in join commands), `SCRAPERACK_GUI_PORT` (`8080`).
 |---|---|---|
 | `scraperack-controller` | controller | API, scheduler, plugin supervisor |
 | `scraperack-gui` | controller | Web console |
-| `scraperack-node` | every machine | Runs microVMs |
-| `scraperack-dns` | every machine | DNS for microVMs at `10.239.255.254`, DNS-over-HTTPS upstream |
+| `scraperack-node` | workers | Runs microVMs |
+| `scraperack-dns` | workers | DNS for microVMs at `10.239.255.254`, DNS-over-HTTPS upstream |
 
 ## Ports and addresses
 

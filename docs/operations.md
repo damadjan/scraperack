@@ -2,15 +2,17 @@
 
 ## Upgrades
 
-Re-run the installer on each machine, controller first, then the other nodes right after:
+Re-run the installer on each machine, control plane first, then the workers right after:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/damadjan/scraperack/main/install.sh | sudo sh
 ```
 
-Services stop for a few seconds. Tasks that were queued or running are queued again when
-the controller comes back, and nodes reconnect on their own. Pools whose VM settings did
-not change keep their snapshots.
+Choose **Update the current installation** when prompted. The saved installation type is
+also used automatically when no terminal is attached. Services stop for a few seconds.
+Tasks that were queued or running are queued again when the controller comes back, and
+workers reconnect on their own. Pools whose VM settings did not change keep their
+snapshots.
 
 Check what is installed:
 
@@ -44,10 +46,11 @@ sudo systemctl stop scraperack-gui scraperack-node scraperack-controller
 sudo cp /var/backups/scraperack/scraperack /usr/local/bin/scraperack
 sudo cp /var/backups/scraperack/scraperack.db /var/lib/scraperack-controller/scraperack.db
 sudo rm -f /var/lib/scraperack-controller/scraperack.db-wal /var/lib/scraperack-controller/scraperack.db-shm
-sudo systemctl start scraperack-controller scraperack-node scraperack-gui
+sudo systemctl start scraperack-controller scraperack-gui
 ```
 
-Roll back nodes by restoring the same binary on them.
+On a single-machine install, also start `scraperack-dns` and `scraperack-node`. Roll back
+workers by restoring the same binary on them.
 
 ## Logs
 

@@ -108,7 +108,7 @@ pub async fn run(
     systemctl(&["stop", "scraperack-node"]).await?;
     fs::write(&config_path, config).await?;
     fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600)).await?;
-    fs::write("/etc/scraperack/role", "node").await?;
+    fs::write("/etc/scraperack/role", "worker").await?;
     fs::create_dir_all(&data_dir).await?;
     fs::write(data_dir.join("node-id"), response.node_id.to_string()).await?;
     systemctl(&[

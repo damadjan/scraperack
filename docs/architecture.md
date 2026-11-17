@@ -27,10 +27,11 @@ plugins, and tasks. It schedules tasks onto nodes, serves the API on port 7070, 
 images and disks, and supervises plugins. State lives in
 `/var/lib/scraperack-controller/scraperack.db`.
 
-**Node** (`scraperack node`) runs on every machine that hosts microVMs, including the
-controller machine. It downloads images and disks, keeps one snapshot per pool, keeps warm
-microVMs ready, long-polls the controller for work, runs it, and reports the result with
-CPU and memory metrics. Each VM runs in its own cgroup v2 with CPU, memory, and PID limits.
+**Node** (`scraperack node`) runs on every worker machine. A single-machine install also
+runs it on the controller; a control-plane-only install does not. It downloads images and
+disks, keeps one snapshot per pool, keeps warm microVMs ready, long-polls the controller
+for work, runs it, and reports the result with CPU and memory metrics. Each VM runs in its
+own cgroup v2 with CPU, memory, and PID limits.
 
 **Guest agent** (`/sbin/scraperack-init`) is injected into every imported image and runs as
 PID 1. It mounts the pool's extra disks, starts the pool's executor or the image's own
