@@ -8,6 +8,12 @@
 //! The working set is recorded by the first restore of each snapshot: every page it faults in
 //! during [`RECORD_FOR`] is saved next to the snapshot, so it covers the guest agent, the
 //! executor and the workload's first steps after a restore.
+//!
+//! Once the VM runs, a second thread copies in the rest of the memory in large chunks. A page
+//! served on demand costs the guest a round trip through this handler (about 0.3 ms with nested
+//! virtualization), so a restored VM touching new memory, a browser loading a page for example,
+//! ran several times slower for its first minute. Filled in the background, the whole memory
+//! is in within seconds.
 
 use std::{
     collections::BTreeSet,
@@ -31,6 +37,8 @@ pub const WORKING_SET: &str = "working-set.json";
 /// How long the recording restore keeps collecting touched pages.
 const RECORD_FOR: Duration = Duration::from_secs(15);
 const PAGE: u64 = 4096;
+/// Size of each copy while filling in the rest of the memory.
+const FILL_CHUNK: u64 = 2 << 20;
 const UFFDIO_COPY: libc::c_ulong = 0xC028_AA03;
 const UFFD_EVENT_PAGEFAULT: u8 = 0x12;
 
@@ -53,7 +61,7 @@ pub fn enabled() -> bool {
     })
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct Region {
     base_host_virt_addr: u64,
     size: u64,
@@ -75,6 +83,18 @@ pub struct Prefaulted {
     pub elapsed: Duration,
     pub recording: bool,
 }
+
+/// Where memory is copied from and to; shared by the fault loop and the fill thread.
+#[derive(Clone, Copy)]
+struct Source {
+    uffd: RawFd,
+    base: usize,
+    len: usize,
+}
+
+// The fd and the read-only mapping outlive every thread using them: `Handler::run` joins
+// the fill thread before the handler (and with it the fd and the mapping) is dropped.
+unsafe impl Send for Source {}
 
 /// Start serving a VM's memory. Returns the socket path to give Firecracker as
 /// `backend_path`, and a channel that reports when the working set is in.
@@ -171,6 +191,14 @@ impl Handler {
             elapsed: started.elapsed(),
             recording,
         }));
+        // Not while recording: the recording restore must fault its working set in itself.
+        let fill = (!recording).then(|| {
+            let (source, regions) = (self.source(), self.regions.clone());
+            thread::Builder::new()
+                .name("uffd-fill".into())
+                .spawn(move || fill(source, &regions))
+                .ok()
+        });
         let mut touched = BTreeSet::new();
         let record_until = Instant::now() + RECORD_FOR;
         let mut saved = !recording;
@@ -231,6 +259,17 @@ impl Handler {
         if !saved {
             self.save(&touched);
         }
+        if let Some(Some(fill)) = fill {
+            let _ = fill.join();
+        }
+    }
+
+    fn source(&self) -> Source {
+        Source {
+            uffd: self.uffd.as_raw_fd(),
+            base: self.source as usize,
+            len: self.source_len,
+        }
     }
 
     /// Copy the recorded pages in, merged into contiguous runs.
@@ -265,40 +304,7 @@ impl Handler {
     }
 
     fn copy(&self, address: u64, offset: u64, len: u64) -> Result<()> {
-        if offset + len > self.source_len as u64 {
-            bail!("page outside the snapshot memory");
-        }
-        let mut request = UffdioCopy {
-            dst: address,
-            src: self.source as u64 + offset,
-            len,
-            mode: 0,
-            copy: 0,
-        };
-        loop {
-            // SAFETY: UFFDIO_COPY with a valid argument; the source is our read-only mapping.
-            let result = unsafe { libc::ioctl(self.uffd.as_raw_fd(), UFFDIO_COPY, &mut request) };
-            if result == 0 {
-                return Ok(());
-            }
-            let error = std::io::Error::last_os_error();
-            match error.raw_os_error() {
-                // Some pages were already in: copy the rest one by one.
-                Some(libc::EEXIST) if len > PAGE => {
-                    for step in (0..len).step_by(PAGE as usize) {
-                        let _ = self.copy(address + step, offset + step, PAGE);
-                    }
-                    return Ok(());
-                }
-                Some(libc::EEXIST) => return Ok(()),
-                // The address space changed under us; try again.
-                Some(libc::EAGAIN) => {
-                    request.copy = 0;
-                    continue;
-                }
-                _ => return Err(error.into()),
-            }
-        }
+        copy(self.source(), address, offset, len)
     }
 
     fn file_offset(&self, address: u64) -> Option<u64> {
@@ -332,6 +338,71 @@ impl Handler {
             tracing::info!(pages = offsets.len(), "recorded snapshot working set");
         }
     }
+}
+
+/// Copy `len` bytes of the snapshot memory at `offset` into the guest at `address`. Pages
+/// already in are skipped.
+fn copy(source: Source, address: u64, offset: u64, len: u64) -> Result<()> {
+    if offset + len > source.len as u64 {
+        bail!("page outside the snapshot memory");
+    }
+    let mut request = UffdioCopy {
+        dst: address,
+        src: source.base as u64 + offset,
+        len,
+        mode: 0,
+        copy: 0,
+    };
+    loop {
+        // SAFETY: UFFDIO_COPY with a valid argument; the source is our read-only mapping.
+        let result = unsafe { libc::ioctl(source.uffd, UFFDIO_COPY, &mut request) };
+        if result == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        match error.raw_os_error() {
+            // Some pages were already in: copy the rest one by one.
+            Some(libc::EEXIST) if len > PAGE => {
+                for step in (0..len).step_by(PAGE as usize) {
+                    copy(source, address + step, offset + step, PAGE)?;
+                }
+                return Ok(());
+            }
+            Some(libc::EEXIST) => return Ok(()),
+            // The address space changed under us; try again.
+            Some(libc::EAGAIN) => {
+                request.copy = 0;
+                continue;
+            }
+            _ => return Err(error.into()),
+        }
+    }
+}
+
+/// Copy in every page of guest memory not already there, in large chunks. Stops when the VM
+/// is gone.
+fn fill(source: Source, regions: &[Region]) {
+    let started = Instant::now();
+    let mut bytes = 0;
+    for region in regions {
+        let end = region.offset + region.size;
+        let mut offset = region.offset;
+        while offset < end {
+            let len = FILL_CHUNK.min(end - offset);
+            let address = region.base_host_virt_addr + (offset - region.offset);
+            if let Err(error) = copy(source, address, offset, len) {
+                tracing::debug!(%error, "stopped filling guest memory");
+                return;
+            }
+            bytes += len;
+            offset += len;
+        }
+    }
+    tracing::debug!(
+        mib = bytes >> 20,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "filled guest memory"
+    );
 }
 
 impl Drop for Handler {
