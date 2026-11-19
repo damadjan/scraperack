@@ -73,6 +73,7 @@ See [Tasks](tasks.md).
 |---|---|---|
 | `GET /v1/vms` | | Live microVMs with node, IP, published ports, current task |
 | `GET /v1/nodes` | | Nodes with capacity, usage, images, disks, VMs |
+| `GET /v1/capacity` | | Worker, VM pool, and plugin capacity for the homepage |
 | `PUT /v1/nodes/{id}` | `{vm_start_concurrency}` | Node |
 | `DELETE /v1/nodes/{id}` | | 204; 409 while it runs tasks |
 | `POST /v1/join-tokens` | | `{id, token, expires_at_ms, status}`; single-use, 10 minutes |
@@ -95,5 +96,31 @@ See [Tasks](tasks.md).
 | `DELETE /v1/plugins/{name}` | | 204; removes its pools and disks; 409 while its tasks are active |
 | `ANY /plugins/{name}/api/...` | | Proxied to the plugin |
 | `ANY /plugins/{name}/gui/...` | | Proxied to the plugin |
+
+### Capacity reports
+
+Plugins can send a complete snapshot with `PUT /v1/capacity` over
+`SCRAPERACK_CORE_SOCKET`. The core identifies the sender from its socket and
+returns 204. Send on startup and refresh periodically (for example, every 10
+seconds). Reports expire after 30 seconds and are cleared when a plugin stops.
+
+```json
+{
+  "dependencies": ["storage"],
+  "resources": [{"label": "Worker slots", "used": 12, "total": 16, "unit": "slots"}],
+  "queued": 3
+}
+```
+
+All top-level fields are optional. Dependencies name other plugins and link to
+them on the Capacity page when installed. Each resource requires a label and a
+nonnegative integer `used`. Omit `total` for a count without a capacity limit.
+Reports can contain up to 12 dependencies and 12 resources and are limited to
+16 KiB. The core shows plugin status and managed VM pools even when a plugin
+doesn't send reports.
+
+Worker RAM comes from the worker's `MemTotal` and `MemAvailable` readings.
+VM reservations are shown separately. Older workers keep reporting their
+reservations and show host memory telemetry as unavailable.
 
 `/internal/...` routes are used by nodes and are not part of the public API.
