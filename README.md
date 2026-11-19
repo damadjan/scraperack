@@ -33,7 +33,6 @@ that run a worker. Run the same command to update or change the installation typ
 
 ```text
 platform/   Rust controller and node, guest agent, GUI, deployment files
-images/     Docker build contexts for VM images
 sdk/        scraperack, the Python client for the core API
 docs/       Documentation
 ```

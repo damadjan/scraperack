@@ -27,8 +27,7 @@ Nodes download images in the background. A pool can use an image once `ready` is
 meaning every ready node has it. Images can be renamed (`PATCH`) or deleted when no pool
 uses them.
 
-Build contexts for the images used so far are in [`images/`](../images): `python-runtime`,
-`python-requests-runtime`, `chromium`, `headless-chromium`, and `chrome`.
+Image build contexts live with the plugins that use them, not in this repository.
 
 ## Pools
 
