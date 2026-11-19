@@ -259,6 +259,7 @@ def set_rows(element, rows):
 
 @ui.page("/")
 async def dashboard():
+    await ui.context.client.connected()
     with await layout("dashboard"):
         with ui.column().classes("capacity-page"):
             with ui.row().classes("cap-header"):
