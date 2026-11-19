@@ -3,6 +3,9 @@ Description=Scraperack worker node
 After=network-online.target scraperack-controller.service scraperack-dns.service
 Wants=network-online.target
 Requires=scraperack-dns.service
+# The node exits when the controller is not up yet (after a reboot, or a worker whose controller
+# is another host): keep retrying instead of giving up after systemd's default 5 starts in 10 s.
+StartLimitIntervalSec=0
 
 [Service]
 User=scraperack
@@ -21,7 +24,7 @@ ExecStart=/usr/local/bin/scraperack node --controller ${SCRAPERACK_CONTROLLER} -
 AmbientCapabilities=CAP_NET_ADMIN
 CapabilityBoundingSet=CAP_NET_ADMIN
 Restart=on-failure
-RestartSec=1
+RestartSec=5
 LimitNOFILE=1048576
 StateDirectory=scraperack-node
 Delegate=yes
