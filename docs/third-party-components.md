@@ -6,8 +6,6 @@ The SDK wheel contains only Scraperack code. Its declared dependencies, currentl
 
 The GUI is distributed as source. Its Python dependencies are resolved and installed separately by pip.
 
-The files under `images/` are build recipes. Scraperack does not distribute their resulting filesystems, browsers, operating-system packages, or container images.
-
 The deployment scripts install or download the following components directly from their publishers:
 
 | Component | Publisher |

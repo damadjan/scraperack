@@ -5,7 +5,6 @@ platform/src/       Rust: controller (api.rs, cluster.rs, storage.rs, plugins.rs
 platform/guest/     scraperack-init, the guest agent injected into images
 platform/gui/       NiceGUI console
 platform/deploy/    systemd units, Firecracker installer, rootfs builder
-images/             Docker build contexts for VM images
 sdk/                scraperack, the Python client
 ```
 
