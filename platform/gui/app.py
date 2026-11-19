@@ -13,6 +13,8 @@ from fastapi import Request
 from fastapi.responses import Response
 from nicegui import app, ui
 
+from capacity import capacity_html
+
 CONTROLLER = os.getenv("SCRAPERACK_URL", "http://127.0.0.1:7070").rstrip("/")
 PUBLIC_CONTROLLER = os.getenv("SCRAPERACK_PUBLIC_URL", "")
 client = httpx.AsyncClient(base_url=CONTROLLER, timeout=10)
@@ -172,7 +174,7 @@ def shell(active, plugins=()):
     """Page layout; ``plugins`` lists installed plugins for their sidebar entries."""
     ui.colors(primary="#d946ef")
     ui.dark_mode().enable()
-    drawer = ui.left_drawer(value=True).props("width=220 breakpoint=800").classes("compact-drawer")
+    drawer = ui.left_drawer(value=None).props("width=220 breakpoint=800").classes("compact-drawer")
     with drawer:
         with ui.row().classes("items-center gap-2 px-2 py-2"):
             ui.icon("developer_board", size="28px").classes("text-primary")
@@ -185,7 +187,7 @@ def shell(active, plugins=()):
                          plugin["name"].replace("-", " ").title())
                         for plugin in plugins if plugin.get("gui") and plugin.get("enabled")]
         groups = [
-            (None, [("dashboard", "/", NAV_ICONS["home"], "Home")]),
+            (None, [("dashboard", "/", NAV_ICONS["home"], "Capacity")]),
             ("Plugins", [*plugin_links, ("plugins", "/plugins", NAV_ICONS["plugins"], "Manage plugins")]),
             ("Virtualization", [
                 ("vms", "/vms", NAV_ICONS["vms"], "MicroVMs"),
@@ -231,17 +233,6 @@ def owner_label(managed_by):
     return managed_by.removeprefix("plugin:").replace("-", " ").title() + " plugin"
 
 
-def summary(icon, label, value, detail):
-    with ui.card().classes("summary-card"):
-        with ui.row().classes("items-start justify-between w-full"):
-            with ui.column().classes("gap-2"):
-                ui.label(label).classes("text-sm muted")
-                value_label = ui.label(value).classes("metric")
-                detail_label = ui.label(detail).classes("text-xs muted")
-            ui.icon(icon, size="30px").classes("text-primary")
-    return value_label, detail_label
-
-
 def table(columns, rows=None, selection=False, row_key=None):
     """A data grid that fills the rest of the page and pages as many rows as fit."""
     options = {
@@ -269,48 +260,31 @@ def set_rows(element, rows):
 @ui.page("/")
 async def dashboard():
     with await layout("dashboard"):
-        with ui.element("div").classes("summary-grid"):
-            node_value, node_detail = summary("dns", "Nodes", "—", "Loading")
-            image_value, image_detail = summary("layers", "Images", "—", "Loading")
-            pool_value, pool_detail = summary("hub", "Pools", "—", "Loading")
-            vm_value, vm_detail = summary("memory", "MicroVMs", "—", "Loading")
-        with ui.card().classes("panel"):
-            with ui.row().classes("items-center w-full"):
-                ui.label("Cluster allocation").classes("section-title")
-                ui.space()
-                capacity = ui.label().classes("text-sm muted")
-            cpu_text = ui.label().classes("text-sm")
-            memory_text = ui.label().classes("text-sm")
+        with ui.column().classes("capacity-page"):
+            with ui.row().classes("cap-header"):
+                ui.label("Capacity").classes("cap-title")
+                status = ui.label("Connecting").classes("cap-feed").props('role="status"')
+            warning = ui.label().classes("cap-warning")
+            warning.set_visibility(False)
+            sections = [ui.html("", sanitize=False).classes("w-full") for _ in range(3)]
+
     async def refresh():
         try:
-            nodes, images, pools, vms = await asyncio.gather(
-                request("GET", "/v1/nodes"), request("GET", "/v1/images"),
-                request("GET", "/v1/pools"), request("GET", "/v1/vms"),
-            )
-            ready_nodes = sum(node["status"] == "ready" for node in nodes)
-            ready_images = sum(image["ready"] for image in images)
-            running = sum(vm["status"] == "running" for vm in vms)
-            for label, value in ((node_value, len(nodes)), (image_value, len(images)),
-                                 (pool_value, len(pools)), (vm_value, len(vms))):
-                label.text = str(value)
-            node_detail.text = f"{ready_nodes} ready"
-            image_detail.text = f"{ready_images} distributed"
-            pool_detail.text = f'{sum(bool(pool.get("managed_by")) for pool in pools)} managed by plugins'
-            vm_detail.text = f"{running} running"
-            total_cpu = sum(node["cpu_millis"] for node in nodes)
-            used_cpu = sum(node["used_cpu_millis"] for node in nodes)
-            total_mem = sum(node["memory_mib"] for node in nodes)
-            used_mem = sum(node["used_memory_mib"] for node in nodes)
-            cpu_percent = used_cpu / total_cpu * 100 if total_cpu else 0
-            memory_percent = used_mem / total_mem * 100 if total_mem else 0
-            cpu_text.text = f"CPU  {used_cpu / 1000:g} / {total_cpu / 1000:g} cores · {cpu_percent:.0f}%"
-            memory_text.text = f"RAM  {used_mem} / {total_mem} MiB · {memory_percent:.0f}%"
-            capacity.text = f"{len(nodes)} node{'s' if len(nodes) != 1 else ''}"
+            dashboard = capacity_html(await request("GET", "/v1/capacity"))
+            for section, rendered in zip(sections, dashboard):
+                if rendered != section.content:
+                    section.set_content(rendered)
+            warning.set_visibility(False)
+            status.text = "Live"
+            status.classes(add="connected")
         except Exception as error:
-            node_detail.text = f"Unavailable: {error}"
+            status.text = "Stale" if sections[0].content else "Offline"
+            status.classes(remove="connected")
+            warning.text = f"Capacity feed unavailable. {error}"
+            warning.set_visibility(True)
 
     await refresh()
-    ui.timer(.5, refresh)
+    ui.timer(2, refresh)
 
 
 @ui.page("/nodes")

@@ -28,7 +28,7 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::cluster::{
-    Disk, Image, MicroVm, Pool, PortProtocol, PublishedPort, StopMode, TaskMetricPoint,
+    Disk, HostMemory, Image, MicroVm, Pool, PortProtocol, PublishedPort, StopMode, TaskMetricPoint,
     TaskMetrics, VmStatus, Volume, Work,
 };
 use crate::uffd;
@@ -180,11 +180,31 @@ struct Registration<'a> {
     name: &'a str,
     cpu_millis: u32,
     memory_mib: u32,
+    host_memory: Option<HostMemory>,
     vm_start_concurrency: usize,
     address: IpAddr,
     reset_idle: bool,
     vms: Vec<MicroVm>,
     tasks: Option<Vec<Uuid>>,
+}
+
+async fn host_memory() -> Option<HostMemory> {
+    let meminfo = fs::read_to_string("/proc/meminfo").await.ok()?;
+    let kib = |key: &str| -> Option<u64> {
+        meminfo
+            .lines()
+            .find_map(|line| line.strip_prefix(key))?
+            .split_whitespace()
+            .next()?
+            .parse()
+            .ok()
+    };
+    let total_kib = kib("MemTotal:")?;
+    let available_kib = kib("MemAvailable:")?.min(total_kib);
+    Some(HostMemory {
+        total_kib,
+        available_kib,
+    })
 }
 
 #[derive(Deserialize, Serialize)]
@@ -637,6 +657,7 @@ pub async fn run(
             name: &name,
             cpu_millis,
             memory_mib,
+            host_memory: host_memory().await,
             vm_start_concurrency: local_vm_start_concurrency,
             address,
             reset_idle: true,
@@ -708,6 +729,7 @@ pub async fn run(
                     name: &name,
                     cpu_millis,
                     memory_mib,
+                    host_memory: host_memory().await,
                     vm_start_concurrency: local_vm_start_concurrency,
                     address,
                     reset_idle: false,

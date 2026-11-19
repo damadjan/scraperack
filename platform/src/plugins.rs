@@ -11,19 +11,20 @@ use std::{
     path::{Path, PathBuf},
     process::Stdio,
     sync::{Arc, Mutex as StdMutex, OnceLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
 use axum::{
     Extension, Json, Router,
-    body::{Body, Bytes},
+    body::{Body, Bytes, to_bytes},
     extract::{Path as AxumPath, Query, Request, State},
     http::{HeaderValue, StatusCode, header::HOST},
     response::{IntoResponse, Response},
 };
 use hyper_util::rt::TokioIo;
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use tokio::{
     fs,
     io::AsyncWriteExt,
@@ -112,6 +113,24 @@ struct Runtime {
     status: PluginStatus,
     message: Option<String>,
     stop: Option<watch::Sender<bool>>,
+    capacity: Option<(Instant, CapacityReport)>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct CapacityReport {
+    #[serde(default)]
+    dependencies: Vec<String>,
+    #[serde(default)]
+    resources: Vec<CapacityResource>,
+    queued: Option<u64>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct CapacityResource {
+    label: String,
+    used: u64,
+    total: Option<u64>,
+    unit: Option<String>,
 }
 
 struct Staged {
@@ -174,7 +193,11 @@ impl Plugins {
             status: PluginStatus::Stopped,
             message: None,
             stop: None,
+            capacity: None,
         });
+        if matches!(status, PluginStatus::Stopped | PluginStatus::Failed) {
+            runtime.capacity = None;
+        }
         runtime.status = status;
         runtime.message = message;
     }
@@ -186,6 +209,27 @@ impl Plugins {
             .get(name)
             .map(|runtime| (runtime.status.clone(), runtime.message.clone()))
             .unwrap_or((PluginStatus::Stopped, None))
+    }
+
+    pub fn capacity(&self, records: &HashMap<String, PluginRecord>) -> Vec<Value> {
+        let runtimes = self.runtimes.lock().expect("plugin state poisoned");
+        let mut names = records.keys().collect::<Vec<_>>();
+        names.sort();
+        names
+            .into_iter()
+            .map(|name| {
+                let runtime = runtimes.get(name);
+                let report = runtime
+                    .and_then(|runtime| runtime.capacity.as_ref())
+                    .filter(|(at, _)| at.elapsed() < Duration::from_secs(30))
+                    .map(|(_, report)| report);
+                json!({
+                    "name": name, "enabled": records[name].enabled,
+                    "status": runtime.map_or(&PluginStatus::Stopped, |runtime| &runtime.status),
+                    "report": report,
+                })
+            })
+            .collect()
     }
 
     /// Start every enabled plugin; called once when the controller starts.
@@ -223,6 +267,7 @@ impl Plugins {
                 status: PluginStatus::Starting,
                 message: None,
                 stop: Some(stop),
+                capacity: None,
             },
         );
         let core = router.layer(Extension(Caller(record.name.clone())));
@@ -673,6 +718,64 @@ pub struct PluginView {
     record: PluginRecord,
     status: PluginStatus,
     message: Option<String>,
+}
+
+pub async fn report_capacity(
+    State(app): State<App>,
+    caller: Option<Extension<Caller>>,
+    request: Request,
+) -> ApiResult<StatusCode> {
+    let Some(Extension(Caller(name))) = caller else {
+        return Err(error(StatusCode::FORBIDDEN, "use the plugin core socket"));
+    };
+    let bytes = to_bytes(request.into_body(), 16 * 1024)
+        .await
+        .map_err(|_| {
+            error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "capacity reports are limited to 16 KiB",
+            )
+        })?;
+    let report: CapacityReport = serde_json::from_slice(&bytes)
+        .map_err(|cause| error(StatusCode::BAD_REQUEST, cause.to_string()))?;
+    if report.resources.len() > 12
+        || report.dependencies.len() > 12
+        || report.resources.iter().any(|resource| {
+            resource.label.trim().is_empty()
+                || resource.label.len() > 80
+                || resource.unit.as_ref().is_some_and(|unit| unit.len() > 24)
+        })
+        || report
+            .dependencies
+            .iter()
+            .enumerate()
+            .any(|(index, dependency)| {
+                dependency == &name
+                    || dependency.is_empty()
+                    || dependency.len() > 32
+                    || !dependency.bytes().all(|byte| {
+                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
+                    })
+                    || report.dependencies[..index].contains(dependency)
+            })
+    {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "invalid capacity resources or dependencies",
+        ));
+    }
+    let mut runtimes = app.plugins.runtimes.lock().expect("plugin state poisoned");
+    let runtime = runtimes
+        .get_mut(&name)
+        .filter(|runtime| {
+            matches!(
+                runtime.status,
+                PluginStatus::Starting | PluginStatus::Running
+            )
+        })
+        .ok_or_else(|| error(StatusCode::CONFLICT, "plugin is inactive"))?;
+    runtime.capacity = Some((Instant::now(), report));
+    Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn list_plugins(State(app): State<App>) -> Json<Vec<PluginView>> {

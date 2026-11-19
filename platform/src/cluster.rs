@@ -281,11 +281,19 @@ pub struct MicroVm {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostMemory {
+    pub total_kib: u64,
+    pub available_kib: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Node {
     pub id: Uuid,
     pub name: String,
     pub cpu_millis: u32,
     pub memory_mib: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_memory: Option<HostMemory>,
     #[serde(default)]
     pub vm_start_concurrency: Option<usize>,
     #[serde(default)]
@@ -966,6 +974,7 @@ mod tests {
             name: id.to_string(),
             cpu_millis: 1000,
             memory_mib: 512,
+            host_memory: None,
             vm_start_concurrency: None,
             address: None,
             used_cpu_millis: 0,

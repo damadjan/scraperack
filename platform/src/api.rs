@@ -32,8 +32,9 @@ use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
 use crate::cluster::{
-    Cluster, Disk, Image, ImageKind, JoinToken, MicroVm, Node, NodeStatus, Pool, PoolDisk,
-    StopMode, Task, TaskMetrics, TaskStatus, TaskView, Volume, Work,
+    Cluster, Disk, HostMemory, Image, ImageKind, JoinToken, MicroVm, NODE_ONLINE_MS, Node,
+    NodeStatus, Pool, PoolDisk, StopMode, Task, TaskMetrics, TaskStatus, TaskView, VmStatus,
+    Volume, Work,
 };
 use crate::plugins::{self, Plugins};
 use crate::storage::{Database, SecretCipher, StorageSettings, StorageView};
@@ -294,6 +295,7 @@ pub async fn serve(
 fn router(app: App) -> Router {
     Router::new()
         .route("/health", get(|| async { Json(json!({ "ok": true })) }))
+        .route("/v1/capacity", get(capacity).put(plugins::report_capacity))
         .route("/v1/images", get(list_images))
         .route("/v1/images/import", post(import_image))
         .route("/v1/images/imports", get(list_imports).post(create_import))
@@ -1959,6 +1961,74 @@ async fn list_nodes(State(app): State<App>) -> Json<Vec<Node>> {
     Json(app.cluster.read().await.nodes.values().cloned().collect())
 }
 
+async fn capacity(State(app): State<App>) -> Json<Value> {
+    let cluster = app.cluster.read().await;
+    let now = now_ms();
+    let mut workers = cluster.nodes.values().collect::<Vec<_>>();
+    workers.sort_by_key(|node| (&node.name, node.id));
+    let online = |node: &Node| now.saturating_sub(node.last_seen_ms) < NODE_ONLINE_MS;
+    let ready = workers
+        .iter()
+        .copied()
+        .filter(|node| online(node) && node.status == NodeStatus::Ready)
+        .collect::<Vec<_>>();
+    let nodes = workers.iter().map(|node| {
+        let online = online(node);
+        json!({
+            "name": node.name, "online": online, "status": node.status,
+            "cpu_millis": node.cpu_millis, "used_cpu_millis": node.used_cpu_millis,
+            "memory_mib": node.memory_mib, "used_memory_mib": node.used_memory_mib,
+            "host_memory": node.host_memory,
+            "running": node.vms.iter().filter(|vm| matches!(vm.status, VmStatus::Running)).count(),
+            "idle": node.vms.iter().filter(|vm| matches!(vm.status, VmStatus::Idle)).count(),
+        })
+    }).collect::<Vec<_>>();
+
+    let mut demand = HashMap::<&str, (usize, usize)>::new();
+    for task in cluster.tasks.values() {
+        let (active, queued) = demand.entry(&task.pool).or_default();
+        match task.status {
+            TaskStatus::Assigned | TaskStatus::Running => *active += 1,
+            TaskStatus::Queued => *queued += 1,
+            _ => {}
+        }
+    }
+    let mut pools = cluster.pools.values().collect::<Vec<_>>();
+    pools.sort_by_key(|pool| &pool.name);
+    let pools = pools
+        .into_iter()
+        .map(|pool| {
+            let (active, queued) = demand.get(pool.name.as_str()).copied().unwrap_or_default();
+            let idle: u64 = ready
+                .iter()
+                .map(|node| u64::from(node.idle_instances.get(&pool.name).copied().unwrap_or(0)))
+                .sum();
+            let has_artifacts =
+                |node: &&Node| node.images.contains(&pool.image) && pool.disks_ready(node);
+            let placement = if ready.is_empty() {
+                Some("No ready workers")
+            } else if !ready.iter().any(has_artifacts) {
+                Some("Image or disks unavailable")
+            } else if !ready.iter().filter(|node| has_artifacts(node)).any(|node| {
+                node.cpu_millis >= pool.cpu_millis && node.memory_mib >= pool.memory_mib
+            }) {
+                Some("VM exceeds worker CPU or RAM")
+            } else {
+                None
+            };
+            json!({
+                "name": pool.name, "label": pool.display_name.as_deref().unwrap_or(&pool.name),
+                "owner": pool.managed_by.as_deref().and_then(|owner| owner.strip_prefix("plugin:")),
+                "limit": pool.max_instances,
+                "active": active, "idle": idle, "queued": queued, "placement": placement,
+            })
+        })
+        .collect::<Vec<_>>();
+    Json(
+        json!({ "nodes": nodes, "pools": pools, "plugins": app.plugins.capacity(&cluster.plugins) }),
+    )
+}
+
 #[derive(Deserialize)]
 struct UpdateNode {
     vm_start_concurrency: usize,
@@ -2408,6 +2478,7 @@ struct RegisterNode {
     name: String,
     cpu_millis: u32,
     memory_mib: u32,
+    host_memory: Option<HostMemory>,
     #[serde(default)]
     vm_start_concurrency: Option<usize>,
     address: Option<IpAddr>,
@@ -2453,6 +2524,7 @@ async fn register_node(
         name: request.name.clone(),
         cpu_millis: request.cpu_millis,
         memory_mib: request.memory_mib,
+        host_memory: None,
         vm_start_concurrency: None,
         address: request.address,
         used_cpu_millis: 0,
@@ -2468,6 +2540,9 @@ async fn register_node(
     node.name = request.name;
     node.cpu_millis = request.cpu_millis;
     node.memory_mib = request.memory_mib;
+    node.host_memory = request
+        .host_memory
+        .filter(|memory| memory.total_kib > 0 && memory.available_kib <= memory.total_kib);
     if node.vm_start_concurrency.is_none() {
         node.vm_start_concurrency = request.vm_start_concurrency.map(|value| value.max(1));
     }
@@ -3445,6 +3520,7 @@ mod tests {
             name: "node".into(),
             cpu_millis: 4000,
             memory_mib: 4096,
+            host_memory: None,
             vm_start_concurrency: None,
             address: None,
             reset_idle: false,
