@@ -15,7 +15,11 @@ Before a pool's snapshot is taken, the guest agent:
 1. mounts the pool's `disks` in order,
 2. starts the `executor` command (stdin, stdout, and stderr go to `/dev/null`),
 3. starts the image's own entrypoint, if it has one,
-4. sends `{"encoding": "scraperack-preload", "modules": [...]}` if the pool has `preload`.
+4. sends `{"encoding": "scraperack-preload", "preload": [...]}` if the pool has `preload`.
+
+`preload` is a list of strings the core passes through untouched; what they mean is up to
+the executor (the Python plugin imports them as modules, the browsers plugin starts a
+browser). The same list is also sent as `modules`, the name older executors read.
 
 All of it, preload included, must finish within 3 minutes. Whatever the executor has
 started by then (a browser, a whole desktop) is in the snapshot and already running in

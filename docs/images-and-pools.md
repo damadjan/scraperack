@@ -49,7 +49,7 @@ A pool is a set of identical microVMs from one image.
 | `ports` | `[]` | Ports to publish on the node (needs `network`) |
 | `disks` | `[]` | Read-only disks to mount, in order (up to 16) |
 | `executor` | `[]` | Command that handles task payloads; empty means VMs only |
-| `preload` | `[]` | Passed to the executor before the snapshot is taken |
+| `preload` | `[]` | Strings passed to the executor before the snapshot is taken and after each restore |
 | `aliases` | `[]` | Other names that resolve to this pool when submitting tasks |
 | `display_name` | none | Name shown in the GUI |
 | `volume_mount` | none | Where a task's [volume](volumes.md) is mounted |

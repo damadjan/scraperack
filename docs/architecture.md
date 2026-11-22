@@ -72,7 +72,7 @@ with room.
 ## Snapshots and pool revisions
 
 A node boots each pool's VM once, lets the guest agent mount disks, start the executor and
-preload modules, then snapshots it. Every later VM of that pool is restored from the
+hand it the pool's preload, then snapshots it. Every later VM of that pool is restored from the
 snapshot. Changing a VM-affecting pool setting (image, CPU, memory, disk size, disks,
 executor, network, ports, preload, reuse, volume mount) bumps the pool's `revision`: idle VMs are replaced and running ones finish
 first.
