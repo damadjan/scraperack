@@ -1717,9 +1717,6 @@ async fn restore_vm(
             }
             if !pool.preload.is_empty() {
                 restore["preload"] = json!(&pool.preload);
-                if let Some(lease) = &network_lease {
-                    restore["url"] = json!(format!("http://{}:7070/health", lease.gateway));
-                }
             }
             let limit = if pool.preload.is_empty() { 10 } else { 40 };
             let restored =
@@ -1838,10 +1835,12 @@ async fn restore_in_steps(
         }
     }
     if !pool.preload.is_empty() {
-        let mut preload = json!({"encoding": "scraperack-preload", "modules": &pool.preload});
-        if let Some(lease) = network_lease {
-            preload["url"] = json!(format!("http://{}:7070/health", lease.gateway));
-        }
+        // "modules" is the name executors written before "preload" read.
+        let preload = json!({
+            "encoding": "scraperack-preload",
+            "preload": &pool.preload,
+            "modules": &pool.preload,
+        });
         let preloaded =
             tokio::time::timeout(Duration::from_secs(30), guest_request(vsock, &preload))
                 .await

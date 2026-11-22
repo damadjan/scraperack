@@ -207,6 +207,12 @@ def executor_request(payload):
                     raise
 
 
+def preload_request(preload):
+    """The pool's preload list, handed to the executor as is; its meaning is the executor's.
+    "modules" is the name executors written before "preload" read."""
+    return {"encoding": "scraperack-preload", "preload": preload, "modules": preload}
+
+
 def abandon_executor_request():
     """After a restore, a request from before the snapshot has nobody to answer to.
 
@@ -262,10 +268,7 @@ def handle(connection):
                 if service and service.poll() not in (None, 0):
                     raise RuntimeError(f"service exited {service.returncode}")
                 if payload.get("preload"):
-                    preloaded = executor_request({
-                        "encoding": "scraperack-preload",
-                        "modules": payload["preload"],
-                    })
+                    preloaded = executor_request(preload_request(payload["preload"]))
                     if preloaded["error"]:
                         raise RuntimeError(preloaded["error"])
                 response = {
@@ -290,10 +293,7 @@ def handle(connection):
                 if payload.get("network"):
                     configure_network(payload["network"])
                 if payload.get("preload"):
-                    preload = {"encoding": "scraperack-preload", "modules": payload["preload"]}
-                    if payload.get("url"):
-                        preload["url"] = payload["url"]
-                    preloaded = executor_request(preload)
+                    preloaded = executor_request(preload_request(payload["preload"]))
                     if preloaded["error"]:
                         raise RuntimeError(preloaded["error"])
                 response = {"result": None, "error": None, "timed_out": False}
