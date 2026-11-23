@@ -2275,7 +2275,11 @@ struct ListTasks {
     pool: Option<String>,
     /// Pool owner, such as `plugin:python`.
     owner: Option<String>,
+    /// Comma-separated task ids, at most 500; unknown ids are left out.
+    ids: Option<String>,
 }
+
+const MAX_LISTED_IDS: usize = 500;
 
 async fn list_tasks(
     State(app): State<App>,
@@ -2289,8 +2293,36 @@ async fn list_tasks(
             .map(str::to_owned)
             .collect::<Vec<_>>()
     });
+    let ids = query
+        .ids
+        .as_deref()
+        .map(|ids| {
+            let ids = ids
+                .split(',')
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(|id| {
+                    Uuid::parse_str(id).map_err(|_| {
+                        error(StatusCode::BAD_REQUEST, format!("invalid task id {id}"))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if ids.len() > MAX_LISTED_IDS {
+                return Err(error(
+                    StatusCode::BAD_REQUEST,
+                    format!("at most {MAX_LISTED_IDS} ids at a time"),
+                ));
+            }
+            Ok(ids)
+        })
+        .transpose()?;
     app.database
-        .list_tasks(query.limit, pools.as_deref(), query.owner.as_deref())
+        .list_tasks(
+            query.limit,
+            pools.as_deref(),
+            query.owner.as_deref(),
+            ids.as_deref(),
+        )
         .map(Json)
         .map_err(internal_error)
 }
@@ -3336,6 +3368,7 @@ mod tests {
                 limit: None,
                 pool: None,
                 owner: Some("plugin:python".into()),
+                ids: None,
             }),
         )
         .await

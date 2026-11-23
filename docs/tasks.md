@@ -51,6 +51,7 @@ saved instead and succeeds with `{"suspended": true}`; see
 | `GET /v1/tasks/{id}/logs` | `{stdout, stderr}` |
 | `GET /v1/tasks/{id}/payload` | The submitted payload |
 | `GET /v1/tasks?owner=&pool=a,b&limit=` | Newest first, filtered |
+| `GET /v1/tasks?ids=a,b` | Those tasks (at most 500; unknown ids are left out), combinable with the filters above |
 
 Each task records `owner`, the `managed_by` of its pool when it was created (for example
 `plugin:python`). Plugins list their own tasks with `?owner=plugin:<name>`.

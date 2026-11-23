@@ -55,7 +55,7 @@ See [Volumes](volumes.md).
 | Method and path | Body / query | Result |
 |---|---|---|
 | `POST /v1/tasks` | `{pool, payload, queue?, variables?, secrets?, volume?}` | 202, task |
-| `GET /v1/tasks` | `limit`, `pool` (comma-separated), `owner` | Tasks, newest first |
+| `GET /v1/tasks` | `limit`, `pool` (comma-separated), `owner`, `ids` (comma-separated, at most 500) | Tasks, newest first |
 | `GET /v1/tasks/{id}` | | Task |
 | `GET /v1/tasks/{id}/wait` | | Task when finished, or after 25 s |
 | `GET /v1/tasks/{id}/result` | | `{status, value, error}` |

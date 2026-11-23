@@ -351,12 +351,13 @@ impl Database {
         Ok(())
     }
 
-    /// Newest tasks first, optionally only those on the given pools or owner.
+    /// Newest tasks first, optionally only those on the given pools, owner or ids.
     pub fn list_tasks(
         &self,
         limit: Option<usize>,
         pools: Option<&[String]>,
         owner: Option<&str>,
+        ids: Option<&[Uuid]>,
     ) -> Result<Vec<TaskView>> {
         let connection = self.connection()?;
         let mut sql = String::from(
@@ -377,6 +378,15 @@ impl Database {
         if let Some(owner) = owner {
             sql.push_str(" AND owner = ?");
             values.push(owner.to_owned().into());
+        }
+        if let Some(ids) = ids {
+            if ids.is_empty() {
+                return Ok(Vec::new());
+            }
+            sql.push_str(" AND id IN (");
+            sql.push_str(&vec!["?"; ids.len()].join(", "));
+            sql.push(')');
+            values.extend(ids.iter().map(|id| id.to_string().into()));
         }
         sql.push_str(" ORDER BY created_at_ms DESC");
         if let Some(limit) = limit {
@@ -720,24 +730,42 @@ mod tests {
         database.insert_task(&task(1), &[]).unwrap();
         database.insert_task(&other, &[]).unwrap();
         let pools = ["chrome".to_owned()];
-        let listed = database.list_tasks(None, Some(&pools), None).unwrap();
+        let listed = database.list_tasks(None, Some(&pools), None, None).unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].pool, "chrome");
         assert!(
             database
-                .list_tasks(None, Some(&[]), None)
+                .list_tasks(None, Some(&[]), None, None)
                 .unwrap()
                 .is_empty()
         );
-        assert_eq!(database.list_tasks(Some(1), None, None).unwrap().len(), 1);
+        assert_eq!(
+            database
+                .list_tasks(Some(1), None, None, None)
+                .unwrap()
+                .len(),
+            1
+        );
         database
             .backfill_task_owner("python", "plugin:python")
             .unwrap();
         let owned = database
-            .list_tasks(None, None, Some("plugin:python"))
+            .list_tasks(None, None, Some("plugin:python"), None)
             .unwrap();
         assert_eq!(owned.len(), 1);
         assert_eq!(owned[0].owner.as_deref(), Some("plugin:python"));
+        let id = listed[0].id;
+        let by_id = database
+            .list_tasks(None, None, None, Some(&[id, Uuid::new_v4()]))
+            .unwrap();
+        assert_eq!(by_id.len(), 1);
+        assert_eq!(by_id[0].id, id);
+        assert!(
+            database
+                .list_tasks(None, None, None, Some(&[]))
+                .unwrap()
+                .is_empty()
+        );
         drop(database);
         std::fs::remove_file(path).unwrap();
     }
@@ -788,7 +816,7 @@ mod tests {
         database.complete_task(&task).unwrap();
 
         let view =
-            serde_json::to_value(&database.list_tasks(None, None, None).unwrap()[0]).unwrap();
+            serde_json::to_value(&database.list_tasks(None, None, None, None).unwrap()[0]).unwrap();
         assert!(view.get("payload").is_none());
         assert!(view.get("result").is_none());
         assert_eq!(database.task(task.id).unwrap().unwrap().result, task.result);
