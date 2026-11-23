@@ -192,6 +192,14 @@ impl Database {
         if !column_exists(&connection, "tasks", "volume")? {
             connection.execute("ALTER TABLE tasks ADD COLUMN volume TEXT", [])?;
         }
+        // Every task insert and completion sums size_bytes. Without a covering
+        // index that reads every row, including the large payload and result
+        // blobs stored before size_bytes, and holds the database lock meanwhile.
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS tasks_storage
+             ON tasks(status, finished_at_ms, created_at_ms, size_bytes)",
+            [],
+        )?;
         let database = Self(Arc::new(Mutex::new(connection)));
         database.set_default("retention_ms", DEFAULT_RETENTION_MS)?;
         database.set_default("max_storage_bytes", DEFAULT_STORAGE_BYTES)?;
@@ -860,6 +868,27 @@ mod tests {
         task.finished_at_ms = Some(2);
         database.complete_task(&task).unwrap();
         assert!(database.task_secrets(task.id).unwrap().unwrap().is_empty());
+        drop(database);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn storage_used_reads_only_the_covering_index() {
+        let (database, path) = database();
+        let connection = database.connection().unwrap();
+        let plan: Vec<String> = connection
+            .prepare("EXPLAIN QUERY PLAN SELECT COALESCE(SUM(size_bytes), 0) FROM tasks")
+            .unwrap()
+            .query_map([], |row| row.get(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|step| step.contains("COVERING INDEX tasks_storage")),
+            "{plan:?}"
+        );
+        drop(connection);
         drop(database);
         std::fs::remove_file(path).unwrap();
     }
