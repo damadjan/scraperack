@@ -150,7 +150,6 @@ Reports can contain up to 12 dependencies and 12 resources and are limited to
 doesn't send reports.
 
 Worker RAM comes from the worker's `MemTotal` and `MemAvailable` readings.
-VM reservations are shown separately. Older workers keep reporting their
-reservations and show host memory telemetry as unavailable.
+VM reservations are shown separately.
 
 `/internal/...` routes are used by nodes and are not part of the public API.

@@ -618,41 +618,6 @@ fn guest_digest_blocking(root: &Path) -> Result<String> {
     Ok(hex::encode(digest.finalize()))
 }
 
-/// Record guest digests for plugins installed before digests existed, so their
-/// next update can reuse the disk too.
-pub async fn backfill_guest_digests(app: &App) {
-    let records = app.cluster.read().await.plugins.clone();
-    for record in records.values() {
-        if record.guest_disk.is_none() || record.guest_digest.is_some() {
-            continue;
-        }
-        let directory = app.plugins.version_dir(&record.name, &record.version);
-        let digest = async {
-            let manifest = read_manifest(&directory).await?;
-            let guest = manifest.guest.context("manifest has no guest folder")?;
-            guest_digest(&directory.join(guest)).await
-        }
-        .await;
-        match digest {
-            Ok(digest) => {
-                let mut cluster = app.cluster.write().await;
-                if let Some(stored) = cluster.plugins.get_mut(&record.name)
-                    && stored.version == record.version
-                    && stored.guest_digest.is_none()
-                {
-                    stored.guest_digest = Some(digest);
-                    if let Err((_, Json(body))) = save(app, &cluster).await {
-                        tracing::warn!(plugin = %record.name, error = %body["error"], "could not save guest digest");
-                    }
-                }
-            }
-            Err(error) => {
-                tracing::warn!(plugin = %record.name, %error, "could not compute guest digest");
-            }
-        }
-    }
-}
-
 /// A disk the previous install built from the same guest files, if it still exists.
 async fn reusable_guest_disk(
     app: &App,

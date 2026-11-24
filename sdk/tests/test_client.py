@@ -2,7 +2,6 @@ import hashlib
 import json
 import tempfile
 import unittest
-import unittest.mock
 from pathlib import Path
 
 import httpx
@@ -11,7 +10,7 @@ from scraperack import APIError, AsyncCluster, Cluster
 
 
 def cluster_with(handler):
-    return Cluster("http://controller",
+    return Cluster("http://controller", "sr_test",
                    client=httpx.Client(base_url="http://controller",
                                        transport=httpx.MockTransport(handler)))
 
@@ -50,15 +49,9 @@ class ClusterTests(unittest.TestCase):
             seen.append(request.headers.get("Authorization"))
             return httpx.Response(200, json=[])
 
-        transport = httpx.MockTransport(handler)
-        with Cluster("http://controller", api_key="sr_test",
-                     client=httpx.Client(base_url="http://controller", transport=transport)) as cluster:
+        with cluster_with(handler) as cluster:
             cluster.pools()
-        with unittest.mock.patch.dict("os.environ", {"SCRAPERACK_API_KEY": "sr_env"}):
-            with Cluster("http://controller",
-                         client=httpx.Client(base_url="http://controller", transport=transport)) as cluster:
-                cluster.pools()
-        self.assertEqual(seen, ["Bearer sr_test", "Bearer sr_env"])
+        self.assertEqual(seen, ["Bearer sr_test"])
 
     def test_errors_carry_the_controller_message(self):
         with cluster_with(lambda request: httpx.Response(
@@ -111,7 +104,7 @@ class AsyncClusterTests(unittest.IsolatedAsyncioTestCase):
 
         client = httpx.AsyncClient(base_url="http://controller",
                                    transport=httpx.MockTransport(handler))
-        async with AsyncCluster("http://controller", client=client) as cluster:
+        async with AsyncCluster("http://controller", "sr_test", client=client) as cluster:
             task = await cluster.submit("jobs", {"encoding": "json", "data": 1})
             self.assertEqual((await cluster.wait(task["id"]))["status"], "failed")
 

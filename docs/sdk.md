@@ -12,7 +12,7 @@ pip install scraperack
 ```python
 from scraperack import APIError, Cluster
 
-with Cluster("http://controller:7070", api_key="sr_...") as cluster:
+with Cluster("http://controller:7070", "sr_...") as cluster:
     image = next(i for i in cluster.images() if i["name"] == "headless-chromium")
     cluster.create_pool("browsers", image["id"], cpu=1, memory_mib=1024, warm=4,
                         network=True,
@@ -38,8 +38,9 @@ with Cluster("http://controller:7070", api_key="sr_...") as cluster:
 `aliases`, and `preload`. `update_pool` reads the pool, applies the changes, and writes it
 back.
 
-The API key comes from `api_key=` or the `SCRAPERACK_API_KEY` environment variable and is
-sent as `Authorization: Bearer <key>`. See [API keys](installation.md#api-keys).
+`Cluster(url, api_key)` and `AsyncCluster(url, api_key)` both need the controller URL and an
+API key with the `core` scope; the key is sent as `Authorization: Bearer <key>`. See
+[API keys](installation.md#api-keys).
 
 Errors raise `APIError` with `status` and the controller's `message`; a missing or wrong key
 is 401, a key without the core scope 403.
@@ -49,7 +50,7 @@ is 401, a key without the core scope 403.
 ```python
 from scraperack import AsyncCluster
 
-async with AsyncCluster("http://controller:7070") as cluster:
+async with AsyncCluster("http://controller:7070", "sr_...") as cluster:
     task = await cluster.submit("my-pool", {"encoding": "json", "data": 1})
     print(await cluster.result(task["id"]))
 ```

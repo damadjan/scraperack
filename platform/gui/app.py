@@ -701,16 +701,6 @@ async def images_page():
     ui.timer(1, refresh)
 
 
-@ui.page("/vm-images")
-async def vm_images_redirect():
-    ui.navigate.to("/images")
-
-
-@ui.page("/runtime-images")
-async def runtime_images_redirect():
-    ui.navigate.to("/images")
-
-
 @ui.page("/pools")
 async def pools_page():
     with await layout("pools"):

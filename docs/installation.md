@@ -106,8 +106,8 @@ Installer-time overrides: `SCRAPERACK_NODE_CPU_MILLIS`, `SCRAPERACK_NODE_MEMORY_
 
 The API on port 7070 refuses every request until you create a key. Open **API keys** in the
 GUI, choose what the key opens (the core API, single plugins, or everything), and copy the
-key; it is shown once. Programs send it as `Authorization: Bearer <key>`, and the SDKs read
-it from `SCRAPERACK_API_KEY`. See [API](api.md#authentication).
+key; it is shown once. Programs send it as `Authorization: Bearer <key>`; the SDKs take it
+as their `api_key` argument. See [API](api.md#authentication).
 
 ## Services
 
