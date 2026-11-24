@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import shlex
 import time
@@ -37,6 +38,19 @@ async def plugin_proxy(name: str, path: str, request: Request):
                              if key.lower() not in HOP_HEADERS})
 ui.add_css(Path(__file__).with_name("style.css").read_text(), shared=True)
 ui.add_head_html('''<script>
+function copyText(text) {
+  if (window.isSecureContext && navigator.clipboard) return navigator.clipboard.writeText(text)
+  // Plain-HTTP pages have no Clipboard API; copy through a selected textarea instead.
+  // It goes inside the open dialog, whose focus trap would otherwise steal the selection.
+  const host = document.activeElement?.closest('.q-dialog') || document.body
+  const area = document.createElement('textarea')
+  area.value = text
+  area.setAttribute('readonly', '')
+  area.style.cssText = 'position:fixed;top:0;left:0;opacity:0'
+  host.appendChild(area)
+  area.select()
+  try { document.execCommand('copy') } finally { area.remove() }
+}
 function statusRenderer(params) {
   const status = params.value || 'unknown'
   return `<span class="status-pill status-${status}">${status.replaceAll('_', ' ')}</span>`
@@ -454,6 +468,11 @@ def detail_card(label, value, classes=""):
         ui.label(value or "—").classes(f"detail-value {classes}")
 
 
+def copy_text(text):
+    """Copy to the browser clipboard; works on plain HTTP, unlike ui.clipboard."""
+    ui.run_javascript(f"copyText({json.dumps(text)})")
+
+
 def log_block(title="Log"):
     with ui.row().classes("items-center w-full"):
         ui.label(title).classes("section-title")
@@ -462,7 +481,7 @@ def log_block(title="Log"):
     log = ui.code("Loading…", language="plaintext").classes("json-code w-full import-log")
 
     def copy_log():
-        ui.clipboard.write(log.content)
+        copy_text(log.content)
         ui.notify("Log copied")
 
     copy.on_click(copy_log)
@@ -1100,7 +1119,8 @@ def show_new_key(key, title):
         ui.code(example, language="bash").classes("json-code w-full")
         with ui.row().classes("w-full justify-end"):
             ui.button("Copy key", icon="content_copy",
-                      on_click=lambda: ui.clipboard.write(key["key"])).props("outline no-caps")
+                      on_click=lambda: (copy_text(key["key"]), ui.notify("Key copied"))) \
+                .props("outline no-caps")
             ui.button("Done", on_click=dialog.close).props("unelevated no-caps color=primary")
     dialog.open()
 
@@ -1341,7 +1361,7 @@ async def settings_page():
                     join_status.text = f"Unavailable: {error}"
 
             generate.on_click(create_token)
-            copy.on_click(lambda: ui.clipboard.write(command.value))
+            copy.on_click(lambda: copy_text(command.value))
             ui.timer(1, token_status)
         with ui.card().classes("panel"):
             ui.label("Display timezone").classes("section-title")
