@@ -32,8 +32,9 @@ use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
 use crate::cluster::{
-    Cluster, Disk, HostMemory, Image, ImageKind, JoinToken, MicroVm, NODE_ONLINE_MS, Node,
-    NodeStatus, Pool, StopMode, Task, TaskMetrics, TaskStatus, TaskView, VmStatus, Volume, Work,
+    Cluster, Disk, HostMemory, HostUsage, Image, ImageKind, JoinToken, MicroVm, NODE_ONLINE_MS,
+    Node, NodeStatus, Pool, StopMode, Task, TaskMetrics, TaskStatus, TaskView, VmStatus, Volume,
+    Work,
 };
 use crate::keys;
 use crate::plugins::{self, Plugins};
@@ -1930,6 +1931,7 @@ async fn capacity(State(app): State<App>) -> Json<Value> {
             "cpu_millis": node.cpu_millis, "used_cpu_millis": node.used_cpu_millis,
             "memory_mib": node.memory_mib, "used_memory_mib": node.used_memory_mib,
             "host_memory": node.host_memory,
+            "host_usage": node.host_usage,
             "running": node.vms.iter().filter(|vm| matches!(vm.status, VmStatus::Running)).count(),
             "idle": node.vms.iter().filter(|vm| matches!(vm.status, VmStatus::Idle)).count(),
         })
@@ -2463,6 +2465,8 @@ struct RegisterNode {
     memory_mib: u32,
     host_memory: Option<HostMemory>,
     #[serde(default)]
+    host_usage: Option<HostUsage>,
+    #[serde(default)]
     vm_start_concurrency: Option<usize>,
     address: Option<IpAddr>,
     #[serde(default)]
@@ -2508,6 +2512,7 @@ async fn register_node(
         cpu_millis: request.cpu_millis,
         memory_mib: request.memory_mib,
         host_memory: None,
+        host_usage: None,
         vm_start_concurrency: None,
         address: request.address,
         used_cpu_millis: 0,
@@ -2525,6 +2530,16 @@ async fn register_node(
     node.host_memory = request
         .host_memory
         .filter(|memory| memory.total_kib > 0 && memory.available_kib <= memory.total_kib);
+    node.host_usage = request.host_usage.map(|mut usage| {
+        usage.cpu_busy_permille = usage.cpu_busy_permille.filter(|busy| *busy <= 1000);
+        if usage.disk_total_bytes.unwrap_or(0) == 0
+            || usage.disk_available_bytes > usage.disk_total_bytes
+        {
+            usage.disk_total_bytes = None;
+            usage.disk_available_bytes = None;
+        }
+        usage
+    });
     if node.vm_start_concurrency.is_none() {
         node.vm_start_concurrency = request.vm_start_concurrency.map(|value| value.max(1));
     }
@@ -3553,6 +3568,7 @@ mod tests {
             cpu_millis: 4000,
             memory_mib: 4096,
             host_memory: None,
+            host_usage: None,
             vm_start_concurrency: None,
             address: None,
             reset_idle: false,
