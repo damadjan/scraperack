@@ -137,14 +137,6 @@ impl Database {
         if new {
             connection.execute_batch("PRAGMA auto_vacuum=INCREMENTAL; VACUUM;")?;
         }
-        if table_exists(&connection, "executions")? && !table_exists(&connection, "tasks")? {
-            connection.execute_batch(
-                "ALTER TABLE executions RENAME TO tasks;
-                 DROP INDEX IF EXISTS executions_created;
-                 DROP INDEX IF EXISTS executions_finished;
-                 DROP INDEX IF EXISTS executions_status;",
-            )?;
-        }
         connection.execute_batch(
             "CREATE TABLE IF NOT EXISTS metadata (
                 key TEXT PRIMARY KEY,
@@ -164,41 +156,18 @@ impl Database {
                 metrics BLOB,
                 variables BLOB NOT NULL DEFAULT X'7B7D',
                 secrets BLOB,
-                size_bytes INTEGER NOT NULL
+                size_bytes INTEGER NOT NULL,
+                owner TEXT,
+                volume TEXT
             );
             CREATE INDEX IF NOT EXISTS tasks_created ON tasks(created_at_ms DESC);
             CREATE INDEX IF NOT EXISTS tasks_finished ON tasks(finished_at_ms);
-            CREATE INDEX IF NOT EXISTS tasks_status ON tasks(status);",
-        )?;
-        if !column_exists(&connection, "tasks", "variables")? {
-            connection.execute(
-                "ALTER TABLE tasks ADD COLUMN variables BLOB NOT NULL DEFAULT X'7B7D'",
-                [],
-            )?;
-        }
-        if !column_exists(&connection, "tasks", "secrets")? {
-            connection.execute("ALTER TABLE tasks ADD COLUMN secrets BLOB", [])?;
-        }
-        if column_exists(&connection, "tasks", "environment")? {
-            connection.execute("ALTER TABLE tasks DROP COLUMN environment", [])?;
-        }
-        if !column_exists(&connection, "tasks", "owner")? {
-            connection.execute("ALTER TABLE tasks ADD COLUMN owner TEXT", [])?;
-        }
-        connection.execute(
-            "CREATE INDEX IF NOT EXISTS tasks_owner ON tasks(owner, created_at_ms DESC)",
-            [],
-        )?;
-        if !column_exists(&connection, "tasks", "volume")? {
-            connection.execute("ALTER TABLE tasks ADD COLUMN volume TEXT", [])?;
-        }
-        // Every task insert and completion sums size_bytes. Without a covering
-        // index that reads every row, including the large payload and result
-        // blobs stored before size_bytes, and holds the database lock meanwhile.
-        connection.execute(
-            "CREATE INDEX IF NOT EXISTS tasks_storage
-             ON tasks(status, finished_at_ms, created_at_ms, size_bytes)",
-            [],
+            CREATE INDEX IF NOT EXISTS tasks_status ON tasks(status);
+            CREATE INDEX IF NOT EXISTS tasks_owner ON tasks(owner, created_at_ms DESC);
+            -- Every task insert and completion sums size_bytes; this covering index
+            -- keeps that from reading the payload and result blobs.
+            CREATE INDEX IF NOT EXISTS tasks_storage
+                ON tasks(status, finished_at_ms, created_at_ms, size_bytes);",
         )?;
         let database = Self(Arc::new(Mutex::new(connection)));
         database.set_default("retention_ms", DEFAULT_RETENTION_MS)?;
@@ -220,7 +189,7 @@ impl Database {
         Ok(())
     }
 
-    pub fn controller_id(&self, legacy: Option<Uuid>) -> Result<Uuid> {
+    pub fn controller_id(&self) -> Result<Uuid> {
         let connection = self.connection()?;
         if let Some(value) = connection
             .query_row(
@@ -232,7 +201,7 @@ impl Database {
         {
             return Ok(Uuid::parse_str(&value)?);
         }
-        let id = legacy.unwrap_or_else(Uuid::new_v4);
+        let id = Uuid::new_v4();
         connection.execute(
             "INSERT INTO metadata(key, value) VALUES ('controller_id', ?1)",
             [id.to_string()],
@@ -401,14 +370,6 @@ impl Database {
     }
 
     /// Record the pool's owner on older tasks that were stored without one.
-    pub fn backfill_task_owner(&self, pool: &str, owner: &str) -> Result<()> {
-        self.connection()?.execute(
-            "UPDATE tasks SET owner = ?2 WHERE pool = ?1 AND owner IS NULL",
-            params![pool, owner],
-        )?;
-        Ok(())
-    }
-
     pub fn task(&self, id: Uuid) -> Result<Option<Task>> {
         self.connection()?
             .query_row(
@@ -535,25 +496,6 @@ fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         volume: row.get(13)?,
         stop: None,
     })
-}
-
-fn table_exists(connection: &Connection, table: &str) -> Result<bool> {
-    Ok(connection
-        .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
-            [table],
-            |_| Ok(()),
-        )
-        .optional()?
-        .is_some())
-}
-
-fn column_exists(connection: &Connection, table: &str, column: &str) -> Result<bool> {
-    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
-    let columns = statement
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(columns.iter().any(|name| name == column))
 }
 
 fn task_view_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskView> {
@@ -746,9 +688,9 @@ mod tests {
                 .len(),
             1
         );
-        database
-            .backfill_task_owner("python", "plugin:python")
-            .unwrap();
+        let mut owned_task = task(1);
+        owned_task.owner = Some("plugin:python".into());
+        database.insert_task(&owned_task, &[]).unwrap();
         let owned = database
             .list_tasks(None, None, Some("plugin:python"), None)
             .unwrap();
@@ -766,36 +708,6 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        drop(database);
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn migrates_legacy_executions_table() {
-        let path = std::env::temp_dir().join(format!("scraperack-{}.db", Uuid::new_v4()));
-        {
-            let connection = Connection::open(&path).unwrap();
-            connection
-                .execute_batch(
-                    "CREATE TABLE executions (
-                        id TEXT PRIMARY KEY, pool TEXT NOT NULL, node TEXT, status TEXT NOT NULL,
-                        payload BLOB NOT NULL, result BLOB, error TEXT,
-                        created_at_ms INTEGER NOT NULL, started_at_ms INTEGER,
-                        finished_at_ms INTEGER, environment TEXT, metrics BLOB,
-                        size_bytes INTEGER NOT NULL
-                    );
-                    CREATE INDEX executions_created ON executions(created_at_ms DESC);
-                    INSERT INTO executions(id, pool, status, payload, created_at_ms,
-                        environment, size_bytes)
-                    VALUES ('6f1c1b9e-58a4-4f2b-9d36-3f1f5f0b7f10', 'python', 'queued', X'7B7D', 1,
-                        '6f1c1b9e-58a4-4f2b-9d36-3f1f5f0b7f11', 2);",
-                )
-                .unwrap();
-        }
-        let database = Database::open(&path).unwrap();
-        let tasks = database.load_active_tasks().unwrap();
-        assert_eq!(tasks.len(), 1);
-        assert_eq!(tasks[0].pool, "python");
         drop(database);
         std::fs::remove_file(path).unwrap();
     }

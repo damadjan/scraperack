@@ -33,16 +33,13 @@ use uuid::Uuid;
 
 use crate::cluster::{
     Cluster, Disk, HostMemory, Image, ImageKind, JoinToken, MicroVm, NODE_ONLINE_MS, Node,
-    NodeStatus, Pool, PoolDisk, StopMode, Task, TaskMetrics, TaskStatus, TaskView, VmStatus,
-    Volume, Work,
+    NodeStatus, Pool, StopMode, Task, TaskMetrics, TaskStatus, TaskView, VmStatus, Volume, Work,
 };
 use crate::keys;
 use crate::plugins::{self, Plugins};
 use crate::storage::{Database, SecretCipher, StorageSettings, StorageView};
 
 const JOIN_TOKEN_TTL_MS: u64 = 10 * 60 * 1000;
-/// Mount point of the legacy Python environment disk inside the guest.
-const LEGACY_ENVIRONMENT_MOUNT: &str = "/tmp/environment";
 
 #[derive(Clone)]
 pub struct App {
@@ -118,81 +115,6 @@ async fn authenticated_node(app: &App, headers: &HeaderMap) -> ApiResult<Uuid> {
         .ok_or_else(|| error(StatusCode::UNAUTHORIZED, "invalid node credential"))
 }
 
-/// Hand built-in Python environments over to the Python plugin.
-///
-/// Their pools keep running unchanged: each environment artifact becomes a
-/// generic disk, the pool names its executor explicitly, and the environment
-/// ID and name stay valid as pool aliases. The environment definitions are
-/// written into the Python plugin's data directory for it to adopt.
-async fn migrate_environments(cluster: &mut Cluster, data_dir: &Path) -> Result<()> {
-    let legacy_dir = data_dir.join("environments");
-    if cluster.environments.is_empty() {
-        if legacy_dir.exists() {
-            fs::remove_dir_all(&legacy_dir).await.ok();
-        }
-        return Ok(());
-    }
-    let mut adopted = Vec::new();
-    for environment in cluster.environments.values() {
-        let mut disks = Vec::new();
-        if let (Some(key), Some(sha256)) = (&environment.artifact, &environment.sha256) {
-            let source = legacy_dir.join(key);
-            let target = data_dir.join("disks").join(key);
-            if source.exists() && !target.exists() {
-                fs::rename(&source, &target).await?;
-            }
-            cluster.disks.insert(
-                key.clone(),
-                Disk {
-                    key: key.clone(),
-                    sha256: sha256.clone(),
-                    size: environment.size,
-                    owner: Some("python".into()),
-                },
-            );
-            disks.push(PoolDisk {
-                key: key.clone(),
-                mount: LEGACY_ENVIRONMENT_MOUNT.into(),
-            });
-        }
-        let executor = if disks.is_empty() {
-            vec!["/opt/scraperack/executors/python".to_owned()]
-        } else {
-            vec![
-                format!("{LEGACY_ENVIRONMENT_MOUNT}/bin/python"),
-                "/opt/scraperack/executors/python".to_owned(),
-            ]
-        };
-        if let Some(pool) = cluster.pools.get_mut(&environment.pool) {
-            pool.managed_by = Some("plugin:python".into());
-            pool.disks = disks;
-            pool.executor = executor;
-            pool.aliases = vec![environment.id.to_string(), environment.name.clone()];
-            pool.display_name = Some(environment.name.clone());
-            pool.environment_artifact = None;
-        }
-        adopted.push(environment.clone());
-    }
-    for node in cluster.nodes.values_mut() {
-        let cached = std::mem::take(&mut node.environments);
-        node.disks.extend(cached);
-    }
-    let plugin_data = data_dir.join("plugins").join("python").join("data");
-    fs::create_dir_all(&plugin_data).await?;
-    fs::write(
-        plugin_data.join("migrated-environments.json"),
-        serde_json::to_vec_pretty(&adopted)?,
-    )
-    .await?;
-    cluster.environments.clear();
-    fs::remove_dir_all(&legacy_dir).await.ok();
-    tracing::info!(
-        count = adopted.len(),
-        "migrated Python environments to plugin pools"
-    );
-    Ok(())
-}
-
 pub async fn save(app: &App, cluster: &Cluster) -> ApiResult<()> {
     app.database.save_cluster(cluster).map_err(internal_error)
 }
@@ -216,45 +138,13 @@ pub async fn serve(
     fs::create_dir_all(data_dir.join("plugins")).await?;
     fs::create_dir_all(data_dir.join("working-dirs")).await?;
     let database = Database::open(&data_dir.join("scraperack.db"))?;
-    let secrets_key = data_dir.join("task-secrets.key");
-    let legacy_secrets_key = data_dir.join("execution-secrets.key");
-    if !secrets_key.exists() && legacy_secrets_key.exists() {
-        fs::rename(&legacy_secrets_key, &secrets_key).await?;
-    }
-    let secrets = SecretCipher::load(&secrets_key)?;
-    let controller_id_path = data_dir.join("controller-id");
-    let legacy_controller_id = match fs::read_to_string(&controller_id_path).await {
-        Ok(id) => Some(Uuid::parse_str(id.trim())?),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error.into()),
-    };
-    let controller_id = database.controller_id(legacy_controller_id)?;
-    let state_path = data_dir.join("state.json");
-    let stored_cluster = database.load_cluster()?;
-    let fresh = stored_cluster.is_none();
-    let mut cluster = match stored_cluster {
-        Some(cluster) => cluster,
-        None => match fs::read(&state_path).await {
-            Ok(bytes) => serde_json::from_slice(&bytes)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Cluster::default(),
-            Err(error) => return Err(error.into()),
-        },
-    };
-    migrate_environments(&mut cluster, &data_dir).await?;
-    for pool in cluster.pools.values() {
-        if let Some(owner) = &pool.managed_by {
-            database.backfill_task_owner(&pool.name, owner)?;
-        }
-    }
+    let secrets = SecretCipher::load(&data_dir.join("task-secrets.key"))?;
+    let controller_id = database.controller_id()?;
+    let mut cluster = database.load_cluster()?.unwrap_or_default();
     for task in database.load_active_tasks()? {
         cluster.tasks.insert(task.id, task);
     }
     database.save_cluster(&cluster)?;
-    if fresh {
-        fs::remove_file(state_path).await.ok();
-        fs::remove_file(controller_id_path).await.ok();
-        fs::remove_dir_all(data_dir.join("executions")).await.ok();
-    }
     let plugin_records = cluster.plugins.values().cloned().collect::<Vec<_>>();
     let app = App {
         cluster: Arc::new(RwLock::new(cluster)),
@@ -281,7 +171,6 @@ pub async fn serve(
     });
     let router = router(app.clone());
     app.plugins.set_router(router.clone());
-    plugins::backfill_guest_digests(&app).await;
     let plugins = app.plugins.clone();
     tokio::spawn(async move { plugins.start_all(plugin_records).await });
 
@@ -343,7 +232,6 @@ fn router(app: App) -> Router {
             "/v1/images/{key}",
             axum::routing::patch(update_image).delete(delete_image),
         )
-        .route("/v1/images/{id}/artifact", get(download_image))
         .route(
             "/v1/working-dirs/{digest}",
             axum::routing::head(working_dir_exists).put(upload_working_dir),
@@ -406,6 +294,11 @@ fn router(app: App) -> Router {
         .route("/v1/tasks/{id}/result", get(get_task_result))
         .route("/v1/tasks/{id}/logs", get(get_task_logs))
         .route("/v1/tasks/{id}/stop", post(stop_task))
+        .route("/internal/images", get(node_images))
+        .route("/internal/images/{id}/artifact", get(download_image))
+        .route("/internal/disks", get(node_disks))
+        .route("/internal/pools", get(node_pools))
+        .route("/internal/volumes", get(node_volumes))
         .route("/internal/nodes/register", post(register_node))
         .route("/internal/identity", get(controller_identity))
         .route("/internal/join", post(join_cluster))
@@ -1272,6 +1165,30 @@ async fn update_image(
     Ok(Json(image))
 }
 
+// What nodes sync, behind their node credential.
+async fn node_images(
+    State(app): State<App>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Vec<ImageView>>> {
+    authenticated_node(&app, &headers).await?;
+    Ok(list_images(State(app)).await)
+}
+
+async fn node_disks(State(app): State<App>, headers: HeaderMap) -> ApiResult<Json<Vec<DiskView>>> {
+    authenticated_node(&app, &headers).await?;
+    Ok(list_disks(State(app)).await)
+}
+
+async fn node_pools(State(app): State<App>, headers: HeaderMap) -> ApiResult<Json<Vec<PoolView>>> {
+    authenticated_node(&app, &headers).await?;
+    Ok(list_pools(State(app)).await)
+}
+
+async fn node_volumes(State(app): State<App>, headers: HeaderMap) -> ApiResult<Json<Vec<Volume>>> {
+    authenticated_node(&app, &headers).await?;
+    Ok(list_volumes(State(app)).await)
+}
+
 async fn download_image(
     State(app): State<App>,
     headers: HeaderMap,
@@ -1572,7 +1489,6 @@ async fn create_pool(
 ) -> ApiResult<(StatusCode, Json<Pool>)> {
     let mut cluster = app.cluster.write().await;
     pool.managed_by = owner_of(&caller);
-    pool.environment = None;
     pool.revision = 0;
     if cluster.pools.contains_key(&pool.name) {
         return Err(error(StatusCode::CONFLICT, "pool already exists"));
@@ -1633,7 +1549,6 @@ async fn update_pool(
     check_owner(&old, &owner_of(&caller))?;
     pool.name = name.clone();
     pool.managed_by = old.managed_by.clone();
-    pool.environment = old.environment;
     pool.revision = old.revision + u64::from(recycles_vms(&old, &pool));
     validate_pool(&cluster, &pool, Some(&old))?;
     cluster.pools.insert(name, pool.clone());
@@ -2598,7 +2513,6 @@ async fn register_node(
         used_cpu_millis: 0,
         used_memory_mib: 0,
         images: Default::default(),
-        environments: Default::default(),
         disks: Default::default(),
         idle_instances: Default::default(),
         vms: Default::default(),
@@ -3384,18 +3298,22 @@ mod tests {
             StatusCode::UNAUTHORIZED
         );
 
-        // Nodes read core state with their own credential, but cannot change it.
+        // Nodes sync through /internal with their own credential, never through /v1.
         app.cluster
             .write()
             .await
             .node_credentials
             .insert(Uuid::new_v4(), secret_hash("node-secret"));
         assert_eq!(
-            status(&public, "GET", "/v1/pools", Some("node-secret")).await,
+            status(&public, "GET", "/internal/pools", Some("node-secret")).await,
             StatusCode::OK
         );
         assert_eq!(
-            status(&public, "POST", "/v1/pools", Some("node-secret")).await,
+            status(&public, "GET", "/internal/pools", None).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            status(&public, "GET", "/v1/pools", Some("node-secret")).await,
             StatusCode::UNAUTHORIZED
         );
     }
@@ -3529,71 +3447,6 @@ mod tests {
             .unwrap_err();
         assert_eq!(unknown.0, StatusCode::BAD_REQUEST);
         fs::remove_dir_all(app.data_dir).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn migrates_python_environments_to_plugin_pools() {
-        let app = app().await;
-        let data_dir = app.data_dir.clone();
-        fs::create_dir_all(data_dir.join("environments"))
-            .await
-            .unwrap();
-        fs::create_dir_all(data_dir.join("disks")).await.unwrap();
-        fs::write(data_dir.join("environments").join("abc"), b"disk")
-            .await
-            .unwrap();
-        let id = Uuid::new_v4();
-        let image = Uuid::new_v4();
-        let mut cluster = Cluster::default();
-        let mut legacy = pool("environment-x", image);
-        legacy.managed_by = Some("python-executor".into());
-        legacy.environment = Some(id);
-        legacy.environment_artifact = Some("abc".into());
-        cluster.pools.insert(legacy.name.clone(), legacy);
-        cluster.environments.insert(
-            id,
-            crate::cluster::Environment {
-                id,
-                name: "jobsites".into(),
-                image,
-                packages: vec!["requests==2.0".into()],
-                preload: Vec::new(),
-                artifact: Some("abc".into()),
-                sha256: Some("f00".into()),
-                size: 4,
-                pool: "environment-x".into(),
-                warm_instances: 1,
-                max_instances: None,
-                cpu_millis: 250,
-                memory_mib: 256,
-                disk_mib: 1024,
-                timeout_secs: 60,
-                idle_timeout_secs: 30,
-                reuse: true,
-                network: true,
-            },
-        );
-        migrate_environments(&mut cluster, &data_dir).await.unwrap();
-        assert!(cluster.environments.is_empty());
-        assert!(data_dir.join("disks").join("abc").exists());
-        let pool = cluster.find_pool("jobsites").unwrap();
-        assert_eq!(pool.name, "environment-x");
-        assert!(cluster.find_pool(&id.to_string()).is_some());
-        assert_eq!(pool.managed_by.as_deref(), Some("plugin:python"));
-        assert_eq!(pool.disks[0].mount, LEGACY_ENVIRONMENT_MOUNT);
-        assert_eq!(pool.executor[0], "/tmp/environment/bin/python");
-        assert_eq!(cluster.disks["abc"].owner.as_deref(), Some("python"));
-        let adopted = fs::read(
-            data_dir
-                .join("plugins")
-                .join("python")
-                .join("data")
-                .join("migrated-environments.json"),
-        )
-        .await
-        .unwrap();
-        assert!(String::from_utf8_lossy(&adopted).contains("jobsites"));
-        fs::remove_dir_all(data_dir).await.unwrap();
     }
 
     #[tokio::test]

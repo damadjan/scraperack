@@ -284,7 +284,6 @@ impl VmState {
                     .as_ref()
                     .map(|network| network.ports.clone())
                     .unwrap_or_default(),
-                environment: vm.pool.environment,
                 volume: None,
             })
             .chain(self.running.values().cloned())
@@ -600,7 +599,6 @@ pub async fn run(
     let address = advertise_address.unwrap_or(detect_address()?);
     fs::create_dir_all(data_dir.join("images")).await?;
     fs::create_dir_all(data_dir.join("disks")).await?;
-    migrate_environment_disks(&data_dir).await?;
     fs::create_dir_all(data_dir.join("working-dirs")).await?;
     fs::create_dir_all(data_dir.join("logs")).await?;
     fs::create_dir_all(data_dir.join("snapshots")).await?;
@@ -859,7 +857,7 @@ pub async fn run(
 
 async fn sync_images(client: &Client, controller: &str, node: Uuid, data_dir: &Path) -> Result<()> {
     let images = client
-        .get(format!("{controller}/v1/images"))
+        .get(format!("{controller}/internal/images"))
         .send()
         .await?
         .error_for_status()?
@@ -879,7 +877,7 @@ async fn sync_images(client: &Client, controller: &str, node: Uuid, data_dir: &P
             if !path.exists() || hash(&path).await? != image.sha256 {
                 download(
                     client,
-                    &format!("{controller}/v1/images/{}/artifact", image.id),
+                    &format!("{controller}/internal/images/{}/artifact", image.id),
                     &path,
                 )
                 .await?;
@@ -920,22 +918,6 @@ async fn sync_images(client: &Client, controller: &str, node: Uuid, data_dir: &P
     Ok(())
 }
 
-/// Move pre-plugin environment artifacts into the generic disk cache.
-async fn migrate_environment_disks(data_dir: &Path) -> Result<()> {
-    let legacy = data_dir.join("environments");
-    let Ok(mut entries) = fs::read_dir(&legacy).await else {
-        return Ok(());
-    };
-    while let Some(entry) = entries.next_entry().await? {
-        let target = data_dir.join("disks").join(entry.file_name());
-        if !target.exists() {
-            fs::rename(entry.path(), target).await?;
-        }
-    }
-    fs::remove_dir_all(legacy).await?;
-    Ok(())
-}
-
 fn valid_disk_key(key: &str) -> bool {
     !key.is_empty()
         && key.len() <= 128
@@ -946,7 +928,7 @@ fn valid_disk_key(key: &str) -> bool {
 
 async fn sync_disks(client: &Client, controller: &str, node: Uuid, data_dir: &Path) -> Result<()> {
     let disks = client
-        .get(format!("{controller}/v1/disks"))
+        .get(format!("{controller}/internal/disks"))
         .send()
         .await?
         .error_for_status()?
@@ -1254,7 +1236,6 @@ async fn run_task(
                 .as_ref()
                 .map(|network| network.ports.clone())
                 .unwrap_or_default(),
-            environment: work.pool.environment,
             volume: work.volume.as_ref().map(|volume| volume.name.clone()),
         },
     );
@@ -1459,7 +1440,7 @@ async fn sync_snapshots(
     lock: &Mutex<()>,
 ) -> Result<Vec<Pool>> {
     let pools = client
-        .get(format!("{controller}/v1/pools"))
+        .get(format!("{controller}/internal/pools"))
         .send()
         .await?
         .error_for_status()?
@@ -1835,11 +1816,9 @@ async fn restore_in_steps(
         }
     }
     if !pool.preload.is_empty() {
-        // "modules" is the name executors written before "preload" read.
         let preload = json!({
             "encoding": "scraperack-preload",
             "preload": &pool.preload,
-            "modules": &pool.preload,
         });
         let preloaded =
             tokio::time::timeout(Duration::from_secs(30), guest_request(vsock, &preload))
@@ -1977,48 +1956,34 @@ async fn ensure_snapshot(
 }
 
 fn snapshot_key(pool: &Pool) -> String {
-    let guest = if pool.preload.is_empty()
-        && pool.disks.is_empty()
-        && pool.executor.is_empty()
-        && pool.volume_mount.is_none()
-    {
-        String::new()
-    } else {
-        let mut digest = Sha256::new();
-        digest.update(b"v2");
-        for (kind, values) in [
-            ("preload", pool.preload.clone()),
-            (
-                "disks",
-                pool.disks
-                    .iter()
-                    .flat_map(|disk| [disk.key.clone(), disk.mount.clone()])
-                    .collect(),
-            ),
-            ("executor", pool.executor.clone()),
-        ] {
-            digest.update(kind.as_bytes());
-            for value in values {
-                digest.update([0]);
-                digest.update(value.as_bytes());
-            }
-            digest.update([1]);
+    let mut digest = Sha256::new();
+    for (kind, values) in [
+        ("preload", pool.preload.clone()),
+        (
+            "disks",
+            pool.disks
+                .iter()
+                .flat_map(|disk| [disk.key.clone(), disk.mount.clone()])
+                .collect(),
+        ),
+        ("executor", pool.executor.clone()),
+        ("volume", pool.volume_mount.iter().cloned().collect()),
+    ] {
+        digest.update(kind.as_bytes());
+        for value in values {
+            digest.update([0]);
+            digest.update(value.as_bytes());
         }
-        if let Some(mount) = &pool.volume_mount {
-            digest.update(b"volume\0");
-            digest.update(mount.as_bytes());
-            digest.update([1]);
-        }
-        format!("-{}", &hex::encode(digest.finalize())[..16])
-    };
-    // Pools without guest extras keep their pre-plugin key, so upgrades reuse snapshots.
+        digest.update([1]);
+    }
     format!(
-        "{}-{}-{}-{}-base{guest}{}",
+        "{}-{}-{}-{}{}-{}",
         pool.image,
         pool.cpu_millis.div_ceil(1000).max(1),
         pool.memory_mib,
         if pool.network { "net1" } else { "none" },
         if huge_pages(pool) { "-huge" } else { "" },
+        &hex::encode(digest.finalize())[..16],
     )
 }
 
@@ -2265,7 +2230,7 @@ async fn sync_volumes(
     shared: &Arc<Shared>,
 ) -> Result<()> {
     let volumes = client
-        .get(format!("{controller}/v1/volumes"))
+        .get(format!("{controller}/internal/volumes"))
         .send()
         .await?
         .error_for_status()?
@@ -2746,7 +2711,7 @@ mod snapshot_tests {
     use crate::cluster::PoolDisk;
 
     #[test]
-    fn plain_pools_keep_their_pre_plugin_snapshot_key() {
+    fn snapshot_key_follows_the_guest_extras() {
         let mut pool = Pool {
             image: Uuid::nil(),
             cpu_millis: 1000,
@@ -2754,14 +2719,11 @@ mod snapshot_tests {
             network: true,
             ..Default::default()
         };
-        assert_eq!(
-            snapshot_key(&pool),
-            "00000000-0000-0000-0000-000000000000-1-1256-net1-base"
-        );
         let plain = snapshot_key(&pool);
+        assert!(plain.starts_with("00000000-0000-0000-0000-000000000000-1-1256-net1-"));
         pool.disks.push(PoolDisk {
             key: "venv".into(),
-            mount: "/tmp/environment".into(),
+            mount: "/opt/venv".into(),
         });
         let with_disk = snapshot_key(&pool);
         assert_ne!(plain, with_disk);

@@ -15,7 +15,7 @@ pip install scraperack
 ```python
 from scraperack import Cluster
 
-with Cluster("http://controller:7070", api_key="sr_...") as cluster:
+with Cluster("http://controller:7070", "sr_...") as cluster:
     image = next(i for i in cluster.images() if i["name"] == "headless-chromium")
     cluster.create_pool("browsers", image["id"], cpu=1, memory_mib=1024, warm=4,
                         network=True, ports=[{"name": "cdp", "guest_port": 9222,

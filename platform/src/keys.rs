@@ -8,7 +8,7 @@
 use axum::{
     Json,
     extract::{Path as AxumPath, Request, State},
-    http::{HeaderValue, Method, StatusCode, header::AUTHORIZATION, header::WWW_AUTHENTICATE},
+    http::{HeaderValue, StatusCode, header::AUTHORIZATION, header::WWW_AUTHENTICATE},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -111,17 +111,6 @@ pub async fn require_key(State(app): State<App>, mut request: Request, next: Nex
     let now = now_ms();
     let (id, name, touch) = {
         let cluster = app.cluster.read().await;
-        // Nodes read the cluster's images, disks, pools and volumes with their own credential.
-        if scope == CORE_SCOPE
-            && matches!(*request.method(), Method::GET | Method::HEAD)
-            && cluster
-                .node_credentials
-                .values()
-                .any(|expected| same_hash(expected, &hash))
-        {
-            drop(cluster);
-            return next.run(request).await;
-        }
         let Some(key) = cluster
             .api_keys
             .values()

@@ -19,7 +19,7 @@ Before a pool's snapshot is taken, the guest agent:
 
 `preload` is a list of strings the core passes through untouched; what they mean is up to
 the executor (the Python plugin imports them as modules, the browsers plugin starts a
-browser). The same list is also sent as `modules`, the name older executors read.
+browser).
 
 All of it, preload included, must finish within 3 minutes. Whatever the executor has
 started by then (a browser, a whole desktop) is in the snapshot and already running in

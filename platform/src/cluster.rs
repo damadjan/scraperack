@@ -65,10 +65,6 @@ pub struct Pool {
     #[serde(default)]
     pub managed_by: Option<String>,
     #[serde(default)]
-    pub environment: Option<Uuid>,
-    #[serde(default, skip_serializing)]
-    pub environment_artifact: Option<String>,
-    #[serde(default)]
     pub preload: Vec<String>,
     /// Bumped whenever VM-affecting settings change; stale VMs are recycled.
     #[serde(default)]
@@ -188,29 +184,6 @@ pub struct PluginRecord {
     pub installed_at_ms: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Environment {
-    pub id: Uuid,
-    pub name: String,
-    pub image: Uuid,
-    pub packages: Vec<String>,
-    #[serde(default)]
-    pub preload: Vec<String>,
-    pub artifact: Option<String>,
-    pub sha256: Option<String>,
-    pub size: u64,
-    pub pool: String,
-    pub warm_instances: u32,
-    pub max_instances: Option<u32>,
-    pub cpu_millis: u32,
-    pub memory_mib: u32,
-    pub disk_mib: u32,
-    pub timeout_secs: u64,
-    pub idle_timeout_secs: u64,
-    pub reuse: bool,
-    pub network: bool,
-}
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum PortProtocol {
@@ -274,8 +247,6 @@ pub struct MicroVm {
     pub guest_ip: Option<Ipv4Addr>,
     #[serde(default)]
     pub ports: Vec<PublishedPort>,
-    #[serde(default)]
-    pub environment: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub volume: Option<String>,
 }
@@ -301,8 +272,6 @@ pub struct Node {
     pub used_cpu_millis: u32,
     pub used_memory_mib: u32,
     pub images: HashSet<Uuid>,
-    #[serde(default, skip_serializing)]
-    pub environments: HashSet<String>,
     #[serde(default)]
     pub disks: HashSet<String>,
     #[serde(default)]
@@ -437,9 +406,6 @@ pub struct Cluster {
     pub nodes: HashMap<Uuid, Node>,
     #[serde(default, skip_serializing)]
     pub tasks: HashMap<Uuid, Task>,
-    /// Legacy Python environments, migrated to the Python plugin on startup.
-    #[serde(default, skip_serializing)]
-    pub environments: HashMap<Uuid, Environment>,
     #[serde(default)]
     pub disks: HashMap<String, Disk>,
     #[serde(default)]
@@ -982,7 +948,6 @@ mod tests {
             used_cpu_millis: 0,
             used_memory_mib: 0,
             images: HashSet::from([image]),
-            environments: HashSet::new(),
             disks: HashSet::new(),
             idle_instances: HashMap::new(),
             vms: Vec::new(),
@@ -1015,8 +980,6 @@ mod tests {
                 network: false,
                 ports: Vec::new(),
                 managed_by: None,
-                environment: None,
-                environment_artifact: None,
                 preload: Vec::new(),
                 ..Default::default()
             },
@@ -1101,8 +1064,6 @@ mod tests {
                 network: false,
                 ports: Vec::new(),
                 managed_by: None,
-                environment: None,
-                environment_artifact: None,
                 preload: Vec::new(),
                 ..Default::default()
             },
@@ -1175,8 +1136,6 @@ mod tests {
                 network: false,
                 ports: Vec::new(),
                 managed_by: None,
-                environment: None,
-                environment_artifact: None,
                 preload: Vec::new(),
                 ..Default::default()
             },
@@ -1233,8 +1192,6 @@ mod tests {
                 network: false,
                 ports: Vec::new(),
                 managed_by: None,
-                environment: None,
-                environment_artifact: None,
                 preload: Vec::new(),
                 ..Default::default()
             },

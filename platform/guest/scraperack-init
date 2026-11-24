@@ -208,9 +208,8 @@ def executor_request(payload):
 
 
 def preload_request(preload):
-    """The pool's preload list, handed to the executor as is; its meaning is the executor's.
-    "modules" is the name executors written before "preload" read."""
-    return {"encoding": "scraperack-preload", "preload": preload, "modules": preload}
+    """The pool's preload list, handed to the executor as is; its meaning is the executor's."""
+    return {"encoding": "scraperack-preload", "preload": preload}
 
 
 def abandon_executor_request():
