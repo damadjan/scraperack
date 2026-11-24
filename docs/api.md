@@ -1,9 +1,39 @@
 # API reference
 
 The controller serves JSON over HTTP on port 7070. Errors are `{"error": "message"}` with a
-4xx or 5xx status. There is no authentication on the public API: keep port 7070 on a trusted
-network. Plugins reach the same API through their private Unix socket, where requests act
-as the plugin (see `managed_by`).
+4xx or 5xx status. Plugins reach the same API through their private Unix socket, where
+requests act as the plugin (see `managed_by`).
+
+## Authentication
+
+Every request on port 7070 needs an API key:
+
+```sh
+curl -H "Authorization: Bearer sr_..." http://controller:7070/v1/pools
+```
+
+A key has scopes. `core` opens `/v1/*`, a plugin name opens `/plugins/<name>/*`, and `*`
+opens everything, plugins installed later included. A missing, unknown, disabled, or expired
+key gets 401; a key without the path's scope gets 403. `/health` and the node routes under
+`/internal/` need no key; nodes use their own credential. The controller forwards plugin
+requests without the `Authorization` header and with `X-Scraperack-Key: <key name>`.
+
+There is no default key: until you create one, the API on port 7070 refuses every request.
+Create keys in the GUI under **API keys**, or with the routes below.
+
+The controller also listens on an admin address, `127.0.0.1:7071` by default, that serves
+the same API without keys plus key management. The GUI uses it. Keep it private.
+
+| Method and path (admin address only) | Body / query | Result |
+|---|---|---|
+| `GET /v1/keys` | | Keys, without their secret |
+| `POST /v1/keys` | `{name, scopes, expires_at_ms?}` | Key with `key`, shown only here |
+| `PATCH /v1/keys/{id}` | `{name?, scopes?, enabled?, expires_at_ms?}` | Key; `expires_at_ms: null` removes the expiry |
+| `POST /v1/keys/{id}/rotate` | `{grace_minutes?}` | Key with the new `key`; the old one works for `grace_minutes` |
+| `DELETE /v1/keys/{id}` | | 204 |
+
+A key is `{id, name, prefix, scopes, enabled, created_at_ms, expires_at_ms, last_used_at_ms,
+previous_expires_at_ms}`. Only a hash of each key is stored.
 
 The Python client [`scraperack`](sdk.md) wraps all of these.
 

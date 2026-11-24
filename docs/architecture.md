@@ -6,8 +6,9 @@ moves opaque payloads to them. Plugins give the payloads a meaning.
 
 ```text
                ┌───────────────────────────── controller host ─────────────────────────────┐
-  clients ───▶ │  controller :7070  ──  SQLite (cluster state, tasks)                       │
-  GUI :8080 ─▶ │      │   └── plugins (supervised processes, one Unix socket each)          │
+  clients ───▶ │  controller :7070 (API key)  ──  SQLite (cluster state, tasks)             │
+  GUI :8080 ─▶ │  controller 127.0.0.1:7071 (admin, no key)                                 │
+               │      │   └── plugins (supervised processes, one Unix socket each)          │
                └──────┼────────────────────────────────────────────────────────────────────┘
                       │ HTTP (node credential)
           ┌───────────┴────────────┐
@@ -23,7 +24,8 @@ moves opaque payloads to them. Plugins give the payloads a meaning.
 ## Pieces
 
 **Controller** (`scraperack controller`) holds cluster state: images, pools, disks, nodes,
-plugins, and tasks. It schedules tasks onto nodes, serves the API on port 7070, distributes
+plugins, and tasks. It schedules tasks onto nodes, serves the API on port 7070 (API keys
+required, see [API](api.md#authentication)) and on a private admin address, distributes
 images and disks, and supervises plugins. State lives in
 `/var/lib/scraperack-controller/scraperack.db`.
 
@@ -38,8 +40,9 @@ PID 1. It mounts the pool's extra disks, starts the pool's executor or the image
 entrypoint, configures networking, and relays each task payload to the executor over a
 Unix socket. See [Executors](executors.md).
 
-**GUI** (`platform/gui`, port 8080) is a NiceGUI console over the same API. Plugins add
-their own pages to its sidebar.
+**GUI** (`platform/gui`, port 8080) is a NiceGUI console over the controller's admin address,
+so it needs no API key. It has no login yet: keep it on a trusted network. Plugins add their
+own pages to its sidebar, and API keys are managed there.
 
 **Plugins** are separate programs, in any language, that add a workload type: they create
 pools, upload disks, ship an executor, and give tasks a meaning. The Python plugin turns

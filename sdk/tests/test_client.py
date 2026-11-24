@@ -2,6 +2,7 @@ import hashlib
 import json
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 import httpx
@@ -41,6 +42,23 @@ class ClusterTests(unittest.TestCase):
         self.assertEqual([r[1] for r in requests[1:4]],
                          ["/v1/tasks/t1/wait", "/v1/tasks/t1/wait", "/v1/tasks/t1/result"])
         self.assertEqual(requests[-1][2], "limit=5&pool=a%2Cb&owner=plugin%3Apython")
+
+    def test_api_key_is_sent_as_a_bearer_token(self):
+        seen = []
+
+        def handler(request):
+            seen.append(request.headers.get("Authorization"))
+            return httpx.Response(200, json=[])
+
+        transport = httpx.MockTransport(handler)
+        with Cluster("http://controller", api_key="sr_test",
+                     client=httpx.Client(base_url="http://controller", transport=transport)) as cluster:
+            cluster.pools()
+        with unittest.mock.patch.dict("os.environ", {"SCRAPERACK_API_KEY": "sr_env"}):
+            with Cluster("http://controller",
+                         client=httpx.Client(base_url="http://controller", transport=transport)) as cluster:
+                cluster.pools()
+        self.assertEqual(seen, ["Bearer sr_test", "Bearer sr_env"])
 
     def test_errors_carry_the_controller_message(self):
         with cluster_with(lambda request: httpx.Response(

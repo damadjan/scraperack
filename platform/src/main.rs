@@ -1,6 +1,7 @@
 mod api;
 mod cluster;
 mod join;
+mod keys;
 mod node;
 mod plugins;
 mod storage;
@@ -24,8 +25,16 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     Controller {
+        /// Public API; every request needs an API key.
         #[arg(long, default_value = "0.0.0.0:7070")]
         listen: SocketAddr,
+        /// GUI and key management, without keys; keep it on a private address.
+        #[arg(
+            long,
+            env = "SCRAPERACK_ADMIN_LISTEN",
+            default_value = "127.0.0.1:7071"
+        )]
+        admin_listen: SocketAddr,
         #[arg(long, default_value = "data/controller")]
         data_dir: PathBuf,
         /// Allow installing plugins through the API and GUI.
@@ -82,9 +91,10 @@ async fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Controller {
             listen,
+            admin_listen,
             data_dir,
             allow_plugin_install,
-        } => api::serve(listen, data_dir, allow_plugin_install).await,
+        } => api::serve(listen, admin_listen, data_dir, allow_plugin_install).await,
         Command::Node {
             controller,
             name,

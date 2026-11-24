@@ -70,6 +70,9 @@ impl Manifest {
         if !name_ok {
             return Err("plugin name must be 1-32 lowercase letters, digits, or dashes".into());
         }
+        if self.name == crate::keys::CORE_SCOPE {
+            return Err("plugin name core is reserved for the core API scope".into());
+        }
         let version_ok = !self.version.is_empty()
             && self.version.len() <= 32
             && self
@@ -1264,6 +1267,15 @@ pub async fn proxy(
     request
         .headers_mut()
         .insert(HOST, HeaderValue::from_static("plugin"));
+    // Tell the plugin which API key the public listener accepted, and nothing a client sent.
+    let key_name = request
+        .extensions()
+        .get::<crate::keys::KeyName>()
+        .and_then(|crate::keys::KeyName(name)| HeaderValue::from_str(name).ok());
+    request.headers_mut().remove("x-scraperack-key");
+    if let Some(name) = key_name {
+        request.headers_mut().insert("x-scraperack-key", name);
+    }
     if let Ok(prefix) = HeaderValue::from_str(&format!("/plugins/{name}")) {
         request.headers_mut().insert("x-forwarded-prefix", prefix);
     }
@@ -1334,6 +1346,7 @@ mod tests {
         assert!(manifest.validate().is_ok());
         for (name, version, guest) in [
             ("Python", "0.1.0", None),
+            ("core", "0.1.0", None),
             ("python", "0.1 0", None),
             ("python", "0.1.0", Some("../escape")),
             ("python", "0.1.0", Some("/abs")),

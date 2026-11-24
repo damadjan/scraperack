@@ -451,6 +451,8 @@ pub struct Cluster {
     #[serde(default)]
     pub node_credentials: HashMap<Uuid, String>,
     #[serde(default)]
+    pub api_keys: HashMap<Uuid, crate::keys::ApiKey>,
+    #[serde(default)]
     round_robin: usize,
 }
 

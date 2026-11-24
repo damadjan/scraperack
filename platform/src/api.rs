@@ -36,6 +36,7 @@ use crate::cluster::{
     NodeStatus, Pool, PoolDisk, StopMode, Task, TaskMetrics, TaskStatus, TaskView, VmStatus,
     Volume, Work,
 };
+use crate::keys;
 use crate::plugins::{self, Plugins};
 use crate::storage::{Database, SecretCipher, StorageSettings, StorageView};
 
@@ -84,15 +85,15 @@ pub fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn secret() -> String {
+pub(crate) fn secret() -> String {
     format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
 }
 
-fn secret_hash(secret: &str) -> String {
+pub(crate) fn secret_hash(secret: &str) -> String {
     hex::encode(Sha256::digest(secret.as_bytes()))
 }
 
-fn same_hash(left: &str, right: &str) -> bool {
+pub(crate) fn same_hash(left: &str, right: &str) -> bool {
     left.len() == right.len()
         && left
             .bytes()
@@ -206,6 +207,7 @@ pub fn internal_error(cause: impl std::fmt::Display) -> (StatusCode, Json<Value>
 
 pub async fn serve(
     listen: std::net::SocketAddr,
+    admin_listen: std::net::SocketAddr,
     data_dir: PathBuf,
     allow_plugin_install: bool,
 ) -> Result<()> {
@@ -283,13 +285,47 @@ pub async fn serve(
     let plugins = app.plugins.clone();
     tokio::spawn(async move { plugins.start_all(plugin_records).await });
 
-    tracing::info!(%listen, "controller listening");
-    axum::serve(
-        TcpListener::bind(listen).await?,
-        router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .await?;
+    // The public listener needs an API key; the admin listener serves the GUI
+    // and key management without one, so keep it on a private address.
+    let public = public_router(app.clone(), router.clone());
+    let admin = router.merge(admin_router(app));
+    let public_listener = TcpListener::bind(listen).await?;
+    let admin_listener = TcpListener::bind(admin_listen).await?;
+    tracing::info!(%listen, %admin_listen, "controller listening");
+    tokio::try_join!(
+        async {
+            axum::serve(
+                public_listener,
+                public.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+        },
+        async {
+            axum::serve(
+                admin_listener,
+                admin.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+        },
+    )?;
     Ok(())
+}
+
+/// The controller API behind the API key check.
+fn public_router(app: App, router: Router) -> Router {
+    router.layer(axum::middleware::from_fn_with_state(app, keys::require_key))
+}
+
+/// Routes only the admin listener serves.
+fn admin_router(app: App) -> Router {
+    Router::new()
+        .route("/v1/keys", get(keys::list_keys).post(keys::create_key))
+        .route(
+            "/v1/keys/{id}",
+            axum::routing::patch(keys::update_key).delete(keys::delete_key),
+        )
+        .route("/v1/keys/{id}/rotate", post(keys::rotate_key))
+        .with_state(app)
 }
 
 fn router(app: App) -> Router {
@@ -3252,6 +3288,116 @@ mod tests {
             imports: Arc::default(),
             transfers: Arc::default(),
         }
+    }
+
+    async fn status(router: &Router, method: &str, path: &str, token: Option<&str>) -> StatusCode {
+        use tower::ServiceExt;
+        let mut request = axum::http::Request::builder().method(method).uri(path);
+        if let Some(token) = token {
+            request = request.header(AUTHORIZATION, format!("Bearer {token}"));
+        }
+        router
+            .clone()
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn public_listener_requires_a_key_with_the_right_scope() {
+        let app = app().await;
+        let public = public_router(app.clone(), router(app.clone()));
+        assert_eq!(
+            status(&public, "GET", "/health", None).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            status(&public, "GET", "/v1/pools", None).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            status(&public, "GET", "/v1/pools", Some("sr_wrong")).await,
+            StatusCode::UNAUTHORIZED
+        );
+
+        let created = keys::create_key(
+            State(app.clone()),
+            Json(serde_json::from_value(json!({"name": "ci", "scopes": ["core"]})).unwrap()),
+        )
+        .await
+        .unwrap()
+        .0;
+        let key = serde_json::to_value(&created).unwrap()["key"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(
+            !app.cluster
+                .read()
+                .await
+                .api_keys
+                .values()
+                .any(|stored| stored.key_hash == key)
+        );
+        assert_eq!(
+            status(&public, "GET", "/v1/pools", Some(&key)).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            status(&public, "GET", "/plugins/proxies/api/stats", Some(&key)).await,
+            StatusCode::FORBIDDEN
+        );
+        // Key management exists only on the admin listener.
+        assert_eq!(
+            status(&public, "GET", "/v1/keys", Some(&key)).await,
+            StatusCode::NOT_FOUND
+        );
+        let admin = router(app.clone()).merge(admin_router(app.clone()));
+        assert_eq!(
+            status(&admin, "GET", "/v1/keys", None).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            status(&admin, "GET", "/v1/pools", None).await,
+            StatusCode::OK
+        );
+
+        let id = app
+            .cluster
+            .read()
+            .await
+            .api_keys
+            .keys()
+            .next()
+            .copied()
+            .unwrap();
+        app.cluster
+            .write()
+            .await
+            .api_keys
+            .get_mut(&id)
+            .unwrap()
+            .enabled = false;
+        assert_eq!(
+            status(&public, "GET", "/v1/pools", Some(&key)).await,
+            StatusCode::UNAUTHORIZED
+        );
+
+        // Nodes read core state with their own credential, but cannot change it.
+        app.cluster
+            .write()
+            .await
+            .node_credentials
+            .insert(Uuid::new_v4(), secret_hash("node-secret"));
+        assert_eq!(
+            status(&public, "GET", "/v1/pools", Some("node-secret")).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            status(&public, "POST", "/v1/pools", Some("node-secret")).await,
+            StatusCode::UNAUTHORIZED
+        );
     }
 
     fn pool(name: &str, image: Uuid) -> Pool {

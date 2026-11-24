@@ -152,6 +152,7 @@ NAV_ICONS = {
     "settings": _stroke_icon('<path d="M4 6.5h8.5M16.5 6.5H20M4 12h2.5M10.5 12H20M4 17.5h10M18 17.5h2"/>'
                              '<circle cx="14.5" cy="6.5" r="2"/><circle cx="8.5" cy="12" r="2"/>'
                              '<circle cx="16" cy="17.5" r="2"/>'),
+    "keys": _stroke_icon('<circle cx="8" cy="15" r="4.5"/><path d="m11.2 11.8 8.3-8.3M16.5 6.5l2.5 2.5M14 9l2 2"/>'),
     "plugin": _stroke_icon('<path d="M20.5 7.5 12 3 3.5 7.5v9L12 21l8.5-4.5z"/>'
                            '<path d="M3.5 7.5 12 12l8.5-4.5M12 12v9"/>'),
 }
@@ -196,6 +197,7 @@ def shell(active, plugins=()):
             ]),
             ("Infrastructure", [
                 ("nodes", "/nodes", NAV_ICONS["nodes"], "Nodes"),
+                ("keys", "/keys", NAV_ICONS["keys"], "API keys"),
                 ("settings", "/settings", NAV_ICONS["settings"], "Settings"),
             ]),
         ]
@@ -1061,6 +1063,197 @@ async def vms_page():
 
     await refresh()
     ui.timer(1, refresh)
+
+
+KEY_EXPIRY = {"Never": None, "30 days": 30, "90 days": 90, "1 year": 365}
+
+
+def key_status(key):
+    if not key["enabled"]:
+        return "disabled"
+    if key.get("expires_at_ms") and key["expires_at_ms"] <= time.time() * 1000:
+        return "expired"
+    return "active"
+
+
+def scope_label(scope, plugins):
+    if scope == "*":
+        return "Everything"
+    if scope == "core":
+        return "Core"
+    label = scope.replace("-", " ").title()
+    return label if scope in plugins else f"{label} (removed)"
+
+
+def scope_picker(plugins, selected=()):
+    """Checkboxes for a key's scopes; returns a function that reads the choice."""
+    selected = set(selected)
+    everything = ui.checkbox("Everything: the core and every plugin, including ones installed later",
+                             value="*" in selected)
+    with ui.column().classes("gap-0 pl-6") as specific:
+        boxes = {"core": ui.checkbox("Core API (/v1)", value="core" in selected)}
+        for name in sorted(set(plugins) | (selected - {"*", "core"})):
+            boxes[name] = ui.checkbox(f'{scope_label(name, plugins)} plugin (/plugins/{name})',
+                                      value=name in selected)
+    specific.bind_visibility_from(everything, "value", backward=lambda value: not value)
+    return lambda: ["*"] if everything.value else [name for name, box in boxes.items() if box.value]
+
+
+def show_new_key(key, title):
+    """The full key is shown once; the controller keeps only its hash."""
+    with ui.dialog().props("persistent") as dialog, ui.card().classes("detail-dialog"):
+        ui.label(title).classes("section-title")
+        ui.label("Copy it now. It is not shown again.").classes("text-sm muted")
+        ui.input("API key", value=key["key"]).props("readonly").classes("w-full mono")
+        example = (f'curl -H "Authorization: Bearer {key["key"]}" '
+                   f'{(PUBLIC_CONTROLLER or "http://<controller>:7070").rstrip("/")}/v1/pools')
+        ui.code(example, language="bash").classes("json-code w-full")
+        with ui.row().classes("w-full justify-end"):
+            ui.button("Copy key", icon="content_copy",
+                      on_click=lambda: ui.clipboard.write(key["key"])).props("outline no-caps")
+            ui.button("Done", on_click=dialog.close).props("unelevated no-caps color=primary")
+    dialog.open()
+
+
+@ui.page("/keys")
+async def keys_page():
+    with await layout("keys"):
+        with ui.row().classes("items-center w-full"):
+            ui.label("API keys").classes("section-title")
+            ui.space()
+            create_button = ui.button("Create key", icon="add").props("unelevated no-caps color=primary")
+        ui.label("Every call to the public API needs a key: Authorization: Bearer <key>. "
+                 "A key opens the core API, chosen plugins, or everything. Click a key to manage it.") \
+            .classes("text-sm muted")
+        keys = table([
+            {"headerName": "Name", "field": "name", "minWidth": 160},
+            {"headerName": "Key", "field": "shown", "minWidth": 150},
+            {"headerName": "Access", "field": "access", "minWidth": 220},
+            {"headerName": "Status", "field": "status", "maxWidth": 130, ":cellRenderer": "statusRenderer"},
+            {"headerName": "Last used", "field": "last_used", "minWidth": 150},
+            {"headerName": "Expires", "field": "expires", "minWidth": 190},
+            {"headerName": "Created", "field": "created", "minWidth": 190},
+        ], selection=True, row_key="id")
+    state = {"keys": [], "plugins": []}
+
+    async def refresh():
+        try:
+            state["keys"], plugins = await asyncio.gather(
+                request("GET", "/v1/keys"), request("GET", "/v1/plugins"))
+            state["plugins"] = [plugin["name"] for plugin in plugins]
+            set_rows(keys, [{
+                "id": key["id"], "name": key["name"], "shown": f'{key["prefix"]}…',
+                "access": ", ".join(scope_label(scope, state["plugins"]) for scope in key["scopes"]),
+                "status": key_status(key),
+                "last_used": ago(key["last_used_at_ms"]) if key.get("last_used_at_ms") else "Never",
+                "expires": stamp(key["expires_at_ms"]) if key.get("expires_at_ms") else "Never",
+                "created": stamp(key["created_at_ms"]),
+            } for key in state["keys"]])
+        except Exception as error:
+            notify_error(error)
+
+    def create():
+        with ui.dialog() as dialog, ui.card().classes("detail-dialog"):
+            with ui.row().classes("items-center w-full"):
+                ui.label("Create API key").classes("section-title")
+                ui.space()
+                ui.button(icon="close", on_click=dialog.close).props("flat round")
+            name = ui.input("Name", placeholder="jobsites scraper").classes("w-full")
+            expiry = ui.select(list(KEY_EXPIRY), value="Never", label="Expires").classes("w-48")
+            ui.label("Access").classes("section-title")
+            scopes = scope_picker(state["plugins"])
+
+            async def submit():
+                expires = KEY_EXPIRY[expiry.value]
+                try:
+                    key = await request("POST", "/v1/keys", json={
+                        "name": name.value or "",
+                        "scopes": scopes(),
+                        "expires_at_ms": int((time.time() + expires * 86400) * 1000) if expires else None,
+                    })
+                except Exception as error:
+                    return notify_error(error)
+                dialog.close()
+                show_new_key(key, f'Created {key["name"]}')
+                await refresh()
+
+            with ui.row().classes("w-full justify-end"):
+                ui.button("Cancel", on_click=dialog.close).props("flat no-caps")
+                ui.button("Create", on_click=submit).props("unelevated no-caps color=primary")
+        dialog.open()
+
+    async def manage(event):
+        row = event.args.get("data")
+        key = next((item for item in state["keys"] if row and item["id"] == row["id"]), None)
+        if not key:
+            return
+        path = f'/v1/keys/{key["id"]}'
+        with ui.dialog() as dialog, ui.card().classes("detail-dialog"):
+            with ui.row().classes("items-center w-full"):
+                ui.label(key["name"]).classes("section-title")
+                ui.label(key_status(key)).classes(f"status-pill status-{key_status(key)}")
+                ui.space()
+                ui.button(icon="close", on_click=dialog.close).props("flat round")
+            ui.label(f'{key["prefix"]}… · created {stamp(key["created_at_ms"])}').classes("mono text-sm muted")
+            if key.get("previous_expires_at_ms"):
+                ui.label(f'The previous key still works until {stamp(key["previous_expires_at_ms"])}.') \
+                    .classes("text-sm muted")
+            name = ui.input("Name", value=key["name"]).classes("w-full")
+            enabled = ui.switch("Enabled", value=key["enabled"])
+            ui.label("Access").classes("section-title")
+            scopes = scope_picker(state["plugins"], key["scopes"])
+            with ui.row().classes("items-end w-full"):
+                grace = ui.number("Old key keeps working for", value=0, min=0, step=5, precision=0,
+                                  suffix="minutes").classes("w-64")
+                rotate_button = ui.button("Rotate", icon="autorenew").props("outline no-caps")
+
+            async def save_key():
+                try:
+                    await request("PATCH", path, json={
+                        "name": name.value or "", "scopes": scopes(), "enabled": enabled.value})
+                    dialog.close()
+                    ui.notify(f'Saved {name.value}', type="positive")
+                    await refresh()
+                except Exception as error:
+                    notify_error(error)
+
+            async def rotate():
+                if not await confirm(f'Rotate {key["name"]}?',
+                                     "Programs using this key need the new one.", "Rotate"):
+                    return
+                try:
+                    rotated = await request("POST", f"{path}/rotate",
+                                            json={"grace_minutes": int(grace.value or 0)})
+                except Exception as error:
+                    return notify_error(error)
+                dialog.close()
+                show_new_key(rotated, f'Rotated {rotated["name"]}')
+                await refresh()
+
+            async def delete():
+                if not await confirm(f'Delete {key["name"]}?',
+                                     "Programs using this key stop working at once.", "Delete"):
+                    return
+                try:
+                    await request("DELETE", path)
+                    dialog.close()
+                    ui.notify(f'Deleted {key["name"]}', type="positive")
+                    await refresh()
+                except Exception as error:
+                    notify_error(error)
+
+            rotate_button.on_click(rotate)
+            with ui.row().classes("w-full items-center"):
+                ui.button("Delete", icon="delete", color="negative", on_click=delete).props("outline no-caps")
+                ui.space()
+                ui.button("Cancel", on_click=dialog.close).props("flat no-caps")
+                ui.button("Save", on_click=save_key).props("unelevated no-caps color=primary")
+        dialog.open()
+
+    create_button.on_click(create)
+    keys.on("cellClicked", manage, ["data"])
+    await refresh()
+    ui.timer(5, refresh)
 
 
 @ui.page("/settings")
