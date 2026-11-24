@@ -13,7 +13,7 @@ from fastapi import Request
 from fastapi.responses import Response
 from nicegui import app, ui
 
-from capacity import capacity_html
+from home import home_html
 
 CONTROLLER = os.getenv("SCRAPERACK_URL", "http://127.0.0.1:7070").rstrip("/")
 PUBLIC_CONTROLLER = os.getenv("SCRAPERACK_PUBLIC_URL", "")
@@ -188,7 +188,7 @@ def shell(active, plugins=()):
                          plugin["name"].replace("-", " ").title())
                         for plugin in plugins if plugin.get("gui") and plugin.get("enabled")]
         groups = [
-            (None, [("dashboard", "/", NAV_ICONS["home"], "Capacity")]),
+            (None, [("dashboard", "/", NAV_ICONS["home"], "Home")]),
             ("Plugins", [*plugin_links, ("plugins", "/plugins", NAV_ICONS["plugins"], "Manage plugins")]),
             ("Virtualization", [
                 ("vms", "/vms", NAV_ICONS["vms"], "MicroVMs"),
@@ -263,27 +263,27 @@ def set_rows(element, rows):
 async def dashboard():
     await ui.context.client.connected()
     with await layout("dashboard"):
-        with ui.column().classes("capacity-page"):
-            with ui.row().classes("cap-header"):
-                ui.label("Capacity").classes("cap-title")
-                status = ui.label("Connecting").classes("cap-feed").props('role="status"')
-            warning = ui.label().classes("cap-warning")
+        with ui.column().classes("home-page"):
+            with ui.row().classes("home-header"):
+                ui.label("Home").classes("home-title")
+                status = ui.label("Connecting").classes("home-feed").props('role="status"')
+            warning = ui.label().classes("home-warning")
             warning.set_visibility(False)
             sections = [ui.html("", sanitize=False).classes("w-full") for _ in range(3)]
 
     async def refresh():
         try:
-            dashboard = capacity_html(await request("GET", "/v1/capacity"))
-            for section, rendered in zip(sections, dashboard):
-                if rendered != section.content:
-                    section.set_content(rendered)
+            rendered = home_html(await request("GET", "/v1/capacity"))
+            for section, html in zip(sections, rendered):
+                if html != section.content:
+                    section.set_content(html)
             warning.set_visibility(False)
             status.text = "Live"
             status.classes(add="connected")
         except Exception as error:
             status.text = "Stale" if sections[0].content else "Offline"
             status.classes(remove="connected")
-            warning.text = f"Capacity feed unavailable. {error}"
+            warning.text = f"Cluster feed unavailable. {error}"
             warning.set_visibility(True)
 
     await refresh()

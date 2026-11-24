@@ -103,7 +103,7 @@ See [Tasks](tasks.md).
 |---|---|---|
 | `GET /v1/vms` | | Live microVMs with node, IP, published ports, current task |
 | `GET /v1/nodes` | | Nodes with capacity, usage, images, disks, VMs |
-| `GET /v1/capacity` | | Worker, VM pool, and plugin capacity for the homepage |
+| `GET /v1/capacity` | | Worker usage, VM pools, and plugin capacity reports for the homepage |
 | `PUT /v1/nodes/{id}` | `{vm_start_concurrency}` | Node |
 | `DELETE /v1/nodes/{id}` | | 204; 409 while it runs tasks |
 | `POST /v1/join-tokens` | | `{id, token, expires_at_ms, status}`; single-use, 10 minutes |
@@ -129,27 +129,42 @@ See [Tasks](tasks.md).
 
 ### Capacity reports
 
-Plugins can send a complete snapshot with `PUT /v1/capacity` over
+The homepage draws each plugin as a funnel: what it draws from (other plugins,
+its VM pools, its own resources) on the left, what it delivers on the right. The
+most strained stage is its bottleneck, listed under **Scale next**.
+
+Plugins send a complete snapshot with `PUT /v1/capacity` over
 `SCRAPERACK_CORE_SOCKET`. The core identifies the sender from its socket and
 returns 204. Send on startup and refresh periodically (for example, every 10
 seconds). Reports expire after 30 seconds and are cleared when a plugin stops.
 
 ```json
 {
-  "dependencies": ["storage"],
-  "resources": [{"label": "Worker slots", "used": 12, "total": 16, "unit": "slots"}],
+  "output": {"label": "Bundles ready", "ready": 4, "target": 6, "unit": "bundles"},
+  "dependencies": ["proxies"],
+  "resources": [{"label": "Browsers", "used": 2, "total": 2, "hint": "Raise max_browsers"}],
   "queued": 3
 }
 ```
 
-All top-level fields are optional. Dependencies name other plugins and link to
-them on the Capacity page when installed. Each resource requires a label and a
-nonnegative integer `used`. Omit `total` for a count without a capacity limit.
-Reports can contain up to 12 dependencies and 12 resources and are limited to
-16 KiB. The core shows plugin status and managed VM pools even when a plugin
-doesn't send reports.
+All top-level fields are optional.
 
-Worker RAM comes from the worker's `MemTotal` and `MemAvailable` readings.
-VM reservations are shown separately.
+- `output` is what the plugin delivers: `ready` now, out of an optional
+  `target`. A shortfall against the target shows the funnel as filling up.
+- `dependencies` name other plugins. Their output and bottleneck appear as the
+  first stages of this funnel.
+- `resources` are the plugin's own limits, in the order work flows through
+  them. Each requires a label and a nonnegative integer `used`; at 85 % of
+  `total` a resource counts as strained, at 100 % as exhausted. Omit `total`
+  for a count without a limit. `hint` (up to 160 characters) says what to
+  change when it runs out.
+- `queued` is work waiting for the plugin.
+
+The core adds the plugin's managed VM pools as stages by itself and shows
+plugin status even when a plugin doesn't send reports. Reports can contain up
+to 12 dependencies and 12 resources and are limited to 16 KiB.
+
+Workers report host CPU use, RAM (`MemTotal`, `MemAvailable`) and the free
+space of the filesystem that holds their data directory.
 
 `/internal/...` routes are used by nodes and are not part of the public API.

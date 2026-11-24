@@ -126,6 +126,9 @@ struct CapacityReport {
     #[serde(default)]
     resources: Vec<CapacityResource>,
     queued: Option<u64>,
+    /// What the plugin delivers, drawn at the end of its funnel on the homepage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    output: Option<CapacityOutput>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -133,6 +136,19 @@ struct CapacityResource {
     label: String,
     used: u64,
     total: Option<u64>,
+    unit: Option<String>,
+    /// What to change when this resource runs out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hint: Option<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct CapacityOutput {
+    label: String,
+    /// How many are ready now.
+    ready: u64,
+    /// How many the plugin aims to keep ready, if it has a target.
+    target: Option<u64>,
     unit: Option<String>,
 }
 
@@ -712,6 +728,12 @@ pub async fn report_capacity(
             resource.label.trim().is_empty()
                 || resource.label.len() > 80
                 || resource.unit.as_ref().is_some_and(|unit| unit.len() > 24)
+                || resource.hint.as_ref().is_some_and(|hint| hint.len() > 160)
+        })
+        || report.output.as_ref().is_some_and(|output| {
+            output.label.trim().is_empty()
+                || output.label.len() > 80
+                || output.unit.as_ref().is_some_and(|unit| unit.len() > 24)
         })
         || report
             .dependencies
@@ -729,7 +751,7 @@ pub async fn report_capacity(
     {
         return Err(error(
             StatusCode::BAD_REQUEST,
-            "invalid capacity resources or dependencies",
+            "invalid capacity output, resources or dependencies",
         ));
     }
     let mut runtimes = app.plugins.runtimes.lock().expect("plugin state poisoned");

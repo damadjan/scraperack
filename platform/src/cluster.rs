@@ -257,6 +257,19 @@ pub struct HostMemory {
     pub available_kib: u64,
 }
 
+/// Host CPU and disk usage a node measures for the homepage.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HostUsage {
+    /// Busy share of all host CPUs since the previous heartbeat, in permille.
+    #[serde(default)]
+    pub cpu_busy_permille: Option<u16>,
+    /// Size and free space of the filesystem that holds the node's data directory.
+    #[serde(default)]
+    pub disk_total_bytes: Option<u64>,
+    #[serde(default)]
+    pub disk_available_bytes: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Node {
     pub id: Uuid,
@@ -265,6 +278,8 @@ pub struct Node {
     pub memory_mib: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_memory: Option<HostMemory>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_usage: Option<HostUsage>,
     #[serde(default)]
     pub vm_start_concurrency: Option<usize>,
     #[serde(default)]
@@ -943,6 +958,7 @@ mod tests {
             cpu_millis: 1000,
             memory_mib: 512,
             host_memory: None,
+            host_usage: None,
             vm_start_concurrency: None,
             address: None,
             used_cpu_millis: 0,

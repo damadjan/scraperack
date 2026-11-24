@@ -28,8 +28,8 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::cluster::{
-    Disk, HostMemory, Image, MicroVm, Pool, PortProtocol, PublishedPort, StopMode, TaskMetricPoint,
-    TaskMetrics, VmStatus, Volume, Work,
+    Disk, HostMemory, HostUsage, Image, MicroVm, Pool, PortProtocol, PublishedPort, StopMode,
+    TaskMetricPoint, TaskMetrics, VmStatus, Volume, Work,
 };
 use crate::uffd;
 
@@ -181,6 +181,7 @@ struct Registration<'a> {
     cpu_millis: u32,
     memory_mib: u32,
     host_memory: Option<HostMemory>,
+    host_usage: HostUsage,
     vm_start_concurrency: usize,
     address: IpAddr,
     reset_idle: bool,
@@ -205,6 +206,43 @@ async fn host_memory() -> Option<HostMemory> {
         total_kib,
         available_kib,
     })
+}
+
+/// CPU counters from the previous heartbeat: (busy, total) jiffies.
+static CPU_SAMPLE: std::sync::Mutex<Option<(u64, u64)>> = std::sync::Mutex::new(None);
+
+async fn host_usage(data_dir: &Path) -> HostUsage {
+    let mut usage = HostUsage::default();
+    if let Ok(stat) = fs::read_to_string("/proc/stat").await
+        && let Some(line) = stat.lines().find(|line| line.starts_with("cpu "))
+    {
+        let fields: Vec<u64> = line
+            .split_whitespace()
+            .skip(1)
+            .filter_map(|value| value.parse().ok())
+            .collect();
+        // user nice system idle iowait irq softirq steal; guest time is already in user.
+        let total: u64 = fields.iter().take(8).sum();
+        let idle = fields.get(3).copied().unwrap_or(0) + fields.get(4).copied().unwrap_or(0);
+        let busy = total.saturating_sub(idle);
+        let mut previous = CPU_SAMPLE.lock().expect("cpu sample poisoned");
+        if let Some((last_busy, last_total)) = *previous
+            && total > last_total
+        {
+            let permille = busy.saturating_sub(last_busy) * 1000 / (total - last_total);
+            usage.cpu_busy_permille = Some(permille.min(1000) as u16);
+        }
+        *previous = Some((busy, total));
+    }
+    if let Ok(path) = std::ffi::CString::new(data_dir.as_os_str().as_encoded_bytes()) {
+        let mut stats: libc::statvfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statvfs(path.as_ptr(), &mut stats) } == 0 {
+            let block = stats.f_frsize as u64;
+            usage.disk_total_bytes = Some(stats.f_blocks as u64 * block);
+            usage.disk_available_bytes = Some(stats.f_bavail as u64 * block);
+        }
+    }
+    usage
 }
 
 #[derive(Deserialize, Serialize)]
@@ -656,6 +694,7 @@ pub async fn run(
             cpu_millis,
             memory_mib,
             host_memory: host_memory().await,
+            host_usage: host_usage(&data_dir).await,
             vm_start_concurrency: local_vm_start_concurrency,
             address,
             reset_idle: true,
@@ -728,6 +767,7 @@ pub async fn run(
                     cpu_millis,
                     memory_mib,
                     host_memory: host_memory().await,
+                    host_usage: host_usage(&data_dir).await,
                     vm_start_concurrency: local_vm_start_concurrency,
                     address,
                     reset_idle: false,
