@@ -172,6 +172,7 @@ impl Database {
         let database = Self(Arc::new(Mutex::new(connection)));
         database.set_default("retention_ms", DEFAULT_RETENTION_MS)?;
         database.set_default("max_storage_bytes", DEFAULT_STORAGE_BYTES)?;
+        database.set_default("timezone", "UTC")?;
         Ok(database)
     }
 
@@ -181,7 +182,7 @@ impl Database {
             .map_err(|_| anyhow::anyhow!("database lock poisoned"))
     }
 
-    fn set_default(&self, key: &str, value: u64) -> Result<()> {
+    fn set_default(&self, key: &str, value: impl ToString) -> Result<()> {
         self.connection()?.execute(
             "INSERT OR IGNORE INTO metadata(key, value) VALUES (?1, ?2)",
             params![key, value.to_string()],
@@ -418,6 +419,23 @@ impl Database {
         connection.execute(
             "UPDATE metadata SET value = ?1 WHERE key = 'max_storage_bytes'",
             [settings.max_storage_bytes.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// The cluster's display timezone (an IANA name) that the GUI and plugins show times in.
+    pub fn timezone(&self) -> Result<String> {
+        Ok(self.connection()?.query_row(
+            "SELECT value FROM metadata WHERE key = 'timezone'",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn set_timezone(&self, timezone: &str) -> Result<()> {
+        self.connection()?.execute(
+            "UPDATE metadata SET value = ?1 WHERE key = 'timezone'",
+            [timezone],
         )?;
         Ok(())
     }

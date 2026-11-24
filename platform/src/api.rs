@@ -285,6 +285,10 @@ fn router(app: App) -> Router {
             "/v1/settings/storage",
             get(get_storage_settings).put(update_storage_settings),
         )
+        .route(
+            "/v1/settings/timezone",
+            get(get_timezone).put(update_timezone),
+        )
         .route("/v1/join-tokens", post(create_join_token))
         .route("/v1/join-tokens/{id}", get(get_join_token))
         .route("/v1/vms", get(list_vms))
@@ -2107,6 +2111,32 @@ async fn update_storage_settings(
     get_storage_settings(State(app)).await
 }
 
+#[derive(Serialize, Deserialize)]
+struct TimezoneSetting {
+    timezone: String,
+}
+
+async fn get_timezone(State(app): State<App>) -> ApiResult<Json<TimezoneSetting>> {
+    let timezone = app.database.timezone().map_err(internal_error)?;
+    Ok(Json(TimezoneSetting { timezone }))
+}
+
+async fn update_timezone(
+    State(app): State<App>,
+    Json(setting): Json<TimezoneSetting>,
+) -> ApiResult<Json<TimezoneSetting>> {
+    if setting.timezone.parse::<chrono_tz::Tz>().is_err() {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "timezone must be an IANA name such as Europe/Sofia or UTC",
+        ));
+    }
+    app.database
+        .set_timezone(&setting.timezone)
+        .map_err(internal_error)?;
+    get_timezone(State(app)).await
+}
+
 #[derive(Deserialize)]
 struct CreateTask {
     pool: String,
@@ -3249,6 +3279,32 @@ mod tests {
             .await
             .unwrap()
             .status()
+    }
+
+    #[tokio::test]
+    async fn timezone_defaults_to_utc_and_rejects_unknown_names() {
+        let app = app().await;
+        assert_eq!(
+            get_timezone(State(app.clone())).await.unwrap().0.timezone,
+            "UTC"
+        );
+        let set = |timezone: &str| {
+            update_timezone(
+                State(app.clone()),
+                Json(TimezoneSetting {
+                    timezone: timezone.to_owned(),
+                }),
+            )
+        };
+        assert!(set("Mars/Olympus").await.is_err());
+        assert_eq!(
+            set("Europe/Sofia").await.unwrap().0.timezone,
+            "Europe/Sofia"
+        );
+        assert_eq!(
+            get_timezone(State(app)).await.unwrap().0.timezone,
+            "Europe/Sofia"
+        );
     }
 
     #[tokio::test]

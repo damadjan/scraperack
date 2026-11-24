@@ -110,6 +110,8 @@ See [Tasks](tasks.md).
 | `GET /v1/join-tokens/{id}` | | Whether the token was used |
 | `GET /v1/settings/storage` | | `{retention_hours, max_storage_bytes, used_storage_bytes}` |
 | `PUT /v1/settings/storage` | `{retention_hours, max_storage_bytes}` | Same |
+| `GET /v1/settings/timezone` | | `{timezone}`, an IANA name; `UTC` on a new cluster |
+| `PUT /v1/settings/timezone` | `{timezone}` | Same; 400 for an unknown name |
 | `GET /health` | | `{"ok": true}` |
 
 ## Plugins
@@ -126,6 +128,22 @@ See [Tasks](tasks.md).
 | `DELETE /v1/plugins/{name}` | | 204; removes its pools and disks; 409 while its tasks are active |
 | `ANY /plugins/{name}/api/...` | | Proxied to the plugin |
 | `ANY /plugins/{name}/gui/...` | | Proxied to the plugin |
+
+### Display timezone
+
+The cluster has one display timezone, chosen under **Settings** in the GUI. Plugins
+never keep their own: anything a plugin shows (its GUI page, times it formats on
+the server) uses this one.
+
+- Plugin services read it with `GET /v1/settings/timezone` over
+  `SCRAPERACK_CORE_SOCKET`.
+- Plugin pages fetch `/v1/settings/timezone` from their own origin (the core GUI
+  serves it without an API key) and format with it:
+
+```js
+const {timezone} = await (await fetch("/v1/settings/timezone")).json();
+const when = ms => ms ? new Date(ms).toLocaleString(undefined, {timeZone: timezone}) : "—";
+```
 
 ### Capacity reports
 

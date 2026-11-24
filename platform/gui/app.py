@@ -24,6 +24,30 @@ HOP_HEADERS = {"connection", "keep-alive", "transfer-encoding", "content-length"
                "content-encoding"}
 
 
+# The cluster's display timezone lives in the controller; this is the GUI's cached copy.
+display = {"timezone": "UTC"}
+
+
+async def refresh_timezone():
+    while True:
+        try:
+            display["timezone"] = (await client.get("/v1/settings/timezone")).raise_for_status()                 .json()["timezone"]
+        except Exception:
+            pass
+        await asyncio.sleep(30)
+
+
+app.on_startup(lambda: asyncio.create_task(refresh_timezone()))
+
+
+@app.get("/v1/settings/timezone", include_in_schema=False)
+async def timezone_setting():
+    """Plugin pages read the display timezone from here (same origin, no API key)."""
+    response = await client.get("/v1/settings/timezone")
+    return Response(response.content, status_code=response.status_code,
+                    media_type=response.headers.get("content-type"))
+
+
 @app.api_route("/plugins/{name}/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
                include_in_schema=False)
 async def plugin_proxy(name: str, path: str, request: Request):
@@ -97,8 +121,7 @@ def notify_error(error):
 
 
 def stamp(value):
-    zone = app.storage.general.get("timezone", "UTC")
-    return datetime.fromtimestamp(value / 1000, ZoneInfo(zone)).strftime("%Y-%m-%d %H:%M:%S %Z") if value else "—"
+    return datetime.fromtimestamp(value / 1000, ZoneInfo(display["timezone"])).strftime("%Y-%m-%d %H:%M:%S %Z") if value else "—"
 
 
 def ago(value):
@@ -1365,18 +1388,28 @@ async def settings_page():
             ui.timer(1, token_status)
         with ui.card().classes("panel"):
             ui.label("Display timezone").classes("section-title")
-            ui.label("All absolute dates and times in the GUI use this timezone.").classes("text-sm muted")
-            zone = ui.select(sorted(available_timezones()), value=app.storage.general.get("timezone", "UTC"),
+            ui.label("Every date and time in the GUI and in plugin pages uses this timezone.")                 .classes("text-sm muted")
+            try:
+                display.update(await request("GET", "/v1/settings/timezone"))
+            except Exception as error:
+                notify_error(error)
+            zone = ui.select(sorted(available_timezones()), value=display["timezone"],
                              label="Timezone", with_input=True).classes("w-80")
             clock = ui.label().classes("text-sm mono")
 
             def update_clock():
-                clock.text = datetime.now(ZoneInfo(zone.value)).strftime("%Y-%m-%d %H:%M:%S %Z")
+                clock.text = datetime.now(ZoneInfo(display["timezone"])).strftime("%Y-%m-%d %H:%M:%S %Z")
 
-            def save_timezone():
-                app.storage.general["timezone"] = zone.value
+            async def save_timezone():
+                if not zone.value or zone.value == display["timezone"]:
+                    return
+                try:
+                    display.update(await request("PUT", "/v1/settings/timezone",
+                                                 json={"timezone": zone.value}))
+                    ui.notify(f"Timezone set to {zone.value}", type="positive")
+                except Exception as error:
+                    notify_error(error)
                 update_clock()
-                ui.notify(f"Timezone set to {zone.value}", type="positive")
 
             zone.on_value_change(save_timezone)
             update_clock()
