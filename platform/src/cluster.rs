@@ -280,6 +280,9 @@ pub struct Node {
     pub host_memory: Option<HostMemory>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_usage: Option<HostUsage>,
+    /// Pools whose snapshot the node can't prepare, with the error.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub pool_errors: HashMap<String, String>,
     #[serde(default)]
     pub vm_start_concurrency: Option<usize>,
     #[serde(default)]
@@ -959,6 +962,7 @@ mod tests {
             memory_mib: 512,
             host_memory: None,
             host_usage: None,
+            pool_errors: HashMap::new(),
             vm_start_concurrency: None,
             address: None,
             used_cpu_millis: 0,

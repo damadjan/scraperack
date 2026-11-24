@@ -1969,8 +1969,17 @@ async fn capacity(State(app): State<App>) -> Json<Value> {
             } else {
                 None
             };
+            // Nodes that keep failing to prepare the pool's snapshot: its VMs crash on start.
+            let failing = ready
+                .iter()
+                .filter_map(|node| node.pool_errors.get(&pool.name))
+                .collect::<Vec<_>>();
+            let failing = failing.first().map(
+                |error| json!({ "workers": failing.len(), "of": ready.len(), "error": error }),
+            );
             json!({
                 "name": pool.name, "label": pool.display_name.as_deref().unwrap_or(&pool.name),
+                "failing": failing,
                 "owner": pool.managed_by.as_deref().and_then(|owner| owner.strip_prefix("plugin:")),
                 "limit": pool.max_instances,
                 "active": active, "idle": idle, "queued": queued, "placement": placement,
@@ -2467,6 +2476,8 @@ struct RegisterNode {
     #[serde(default)]
     host_usage: Option<HostUsage>,
     #[serde(default)]
+    pool_errors: HashMap<String, String>,
+    #[serde(default)]
     vm_start_concurrency: Option<usize>,
     address: Option<IpAddr>,
     #[serde(default)]
@@ -2513,6 +2524,7 @@ async fn register_node(
         memory_mib: request.memory_mib,
         host_memory: None,
         host_usage: None,
+        pool_errors: HashMap::new(),
         vm_start_concurrency: None,
         address: request.address,
         used_cpu_millis: 0,
@@ -2530,6 +2542,12 @@ async fn register_node(
     node.host_memory = request
         .host_memory
         .filter(|memory| memory.total_kib > 0 && memory.available_kib <= memory.total_kib);
+    node.pool_errors = request
+        .pool_errors
+        .into_iter()
+        .take(64)
+        .map(|(pool, error)| (pool, error.chars().take(200).collect()))
+        .collect();
     node.host_usage = request.host_usage.map(|mut usage| {
         usage.cpu_busy_permille = usage.cpu_busy_permille.filter(|busy| *busy <= 1000);
         if usage.disk_total_bytes.unwrap_or(0) == 0
@@ -3569,6 +3587,7 @@ mod tests {
             memory_mib: 4096,
             host_memory: None,
             host_usage: None,
+            pool_errors: HashMap::new(),
             vm_start_concurrency: None,
             address: None,
             reset_idle: false,
