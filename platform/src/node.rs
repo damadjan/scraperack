@@ -74,6 +74,8 @@ struct Shared {
     attached: std::sync::Mutex<HashSet<String>>,
     /// Volume moves this node is sending or receiving.
     moving: std::sync::Mutex<HashSet<String>>,
+    /// Pools whose snapshot this node can't prepare, with the last line of the error.
+    pool_errors: std::sync::Mutex<HashMap<String, String>>,
 }
 
 /// Marks a volume attached for as long as it lives.
@@ -187,6 +189,7 @@ struct Registration<'a> {
     reset_idle: bool,
     vms: Vec<MicroVm>,
     tasks: Option<Vec<Uuid>>,
+    pool_errors: HashMap<String, String>,
 }
 
 async fn host_memory() -> Option<HostMemory> {
@@ -700,6 +703,7 @@ pub async fn run(
             reset_idle: true,
             vms: Vec::new(),
             tasks: Some(Vec::new()),
+            pool_errors: HashMap::new(),
         })
         .send()
         .await?
@@ -731,6 +735,7 @@ pub async fn run(
         &kernel,
         &data_dir,
         &snapshot_lock,
+        &shared.pool_errors,
     )
     .await?;
     maintain_vms(
@@ -759,6 +764,11 @@ pub async fn run(
                 .iter()
                 .copied()
                 .collect();
+            let pool_errors = shared
+                .pool_errors
+                .lock()
+                .expect("pool errors lock poisoned")
+                .clone();
             node = client
                 .post(format!("{controller}/internal/nodes/register"))
                 .json(&Registration {
@@ -773,6 +783,7 @@ pub async fn run(
                     reset_idle: false,
                     vms: reports,
                     tasks: Some(working),
+                    pool_errors,
                 })
                 .send()
                 .await?
@@ -809,6 +820,7 @@ pub async fn run(
                 &kernel,
                 &data_dir,
                 &snapshot_lock,
+                &shared.pool_errors,
             )
             .await?;
             maintain_vms(
@@ -1471,6 +1483,17 @@ fn redact_completion(completion: &mut Completion, secrets: &HashMap<String, Stri
     }
 }
 
+/// The last non-empty line of an error, where a guest traceback names what went wrong.
+fn last_line(error: &str) -> String {
+    let line = error
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("unknown error");
+    line.chars().take(200).collect()
+}
+
 async fn sync_snapshots(
     client: &Client,
     controller: &str,
@@ -1478,6 +1501,7 @@ async fn sync_snapshots(
     kernel: &Path,
     data_dir: &Path,
     lock: &Mutex<()>,
+    errors: &std::sync::Mutex<HashMap<String, String>>,
 ) -> Result<Vec<Pool>> {
     let pools = client
         .get(format!("{controller}/internal/pools"))
@@ -1488,14 +1512,17 @@ async fn sync_snapshots(
         .await?;
     let wanted = pools.iter().map(snapshot_key).collect::<HashSet<_>>();
     let mut ready = Vec::new();
+    let mut failed = HashMap::new();
     for pool in pools {
         match ensure_snapshot(firecracker, kernel, data_dir, &pool, lock).await {
             Ok(_) => ready.push(pool),
             Err(error) => {
-                tracing::error!(pool = %pool.name, %error, "failed to prepare pool snapshot")
+                tracing::error!(pool = %pool.name, %error, "failed to prepare pool snapshot");
+                failed.insert(pool.name.clone(), last_line(&error.to_string()));
             }
         }
     }
+    *errors.lock().expect("pool errors lock poisoned") = failed;
     let mut entries = fs::read_dir(data_dir.join("snapshots")).await?;
     while let Some(entry) = entries.next_entry().await? {
         let name = entry.file_name();

@@ -30,9 +30,10 @@ def count(value, total=None, unit=None):
 
 
 class Stage:
-    def __init__(self, label, value, fill, strain, note="", hint="", link=None, kind=""):
+    def __init__(self, label, value, fill, strain, note="", hint="", link=None, kind="", problem=""):
         self.label, self.value, self.fill, self.strain = label, value, fill, strain
         self.note, self.hint, self.link, self.kind = note, hint, link, kind
+        self.problem = problem  # plain text for Scale next when the stage is broken, not just full
 
 
 def pool_stage(pool):
@@ -40,6 +41,13 @@ def pool_stage(pool):
     notes = [f'{pool["idle"]:,} warm']
     if queued:
         notes.append(f"{queued:,} waiting")
+    failing = pool.get("failing")
+    if failing:
+        where = "every worker" if failing["workers"] >= failing["of"] else f'{failing["workers"]} of {failing["of"]} workers'
+        return Stage(pool["label"], count(active, limit, "VMs"), 1, 1.5,
+                     f'VMs fail to start on {where}: {escape(failing["error"])}',
+                     "Its VMs crash on start: check the pool's image and the plugin's guest code", kind="pool",
+                     problem=f"VMs fail to start: {failing['error']}")
     if pool["placement"]:
         return Stage(pool["label"], count(active, limit, "VMs"), 1, 1.5, pool["placement"],
                      "Fix the pool's image, disks or size, or add a worker", kind="pool")
@@ -103,6 +111,7 @@ class Funnel:
                 strain = max(strain, output_shortfall(output))
             else:
                 value, fill, note = escape(other.state or "running"), 1, "No output reported"
+            strain = min(strain, HOT)  # this plugin is limited by it; the broken one is listed itself
             bottleneck = other.bottleneck()
             hint = f"Scale {title(dep)}: {bottleneck.label}" if bottleneck and strain >= WARM else ""
             self.stages.append(Stage(title(dep), value, min(fill, 1), strain, note, hint,
@@ -168,6 +177,8 @@ def funnel_html(funnel):
                    for index, stage in enumerate(stages))
     if funnel.down:
         verdict, level = f"{escape(funnel.state)}", "hot"
+    elif bottleneck and bottleneck.strain > HOT:
+        verdict, level = f"Failing: {escape(bottleneck.label)}", "hot"
     elif bottleneck:
         verdict, level = f"Limited by {escape(bottleneck.label)}", tone(bottleneck.strain)
     elif output.strain:
@@ -276,7 +287,8 @@ def home_html(data):
             continue
         stage = funnel.bottleneck()
         if stage and stage.kind != "plugin":  # a dependency's own funnel already lists it
-            alerts.append((stage.strain, title(funnel.name), stage.label, stage.hint))
+            what = f"{stage.label}: {stage.problem}" if stage.problem else stage.label
+            alerts.append((stage.strain, title(funnel.name), what, stage.hint))
     alerts.sort(key=lambda alert: -alert[0])
     if alerts:
         items = "".join(

@@ -160,7 +160,9 @@ All top-level fields are optional.
   change when it runs out.
 - `queued` is work waiting for the plugin.
 
-The core adds the plugin's managed VM pools as stages by itself and shows
+The core adds the plugin's managed VM pools as stages by itself. A pool whose
+VMs can't be placed, or whose snapshot a worker keeps failing to prepare (its
+VMs crash on start), shows as failing with the error. The core also shows
 plugin status even when a plugin doesn't send reports. Reports can contain up
 to 12 dependencies and 12 resources and are limited to 16 KiB.
 
