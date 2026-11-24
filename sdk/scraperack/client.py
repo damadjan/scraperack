@@ -6,6 +6,7 @@ Language plugins ship their own SDKs on top of this one; for Python code see
 import asyncio
 import hashlib
 import io
+import os
 from pathlib import Path
 from typing import Any, BinaryIO, Mapping, Sequence
 from urllib.parse import quote
@@ -31,6 +32,14 @@ from .types import (
 )
 
 DEFAULT_URL = "http://127.0.0.1:7070"
+API_KEY_ENV = "SCRAPERACK_API_KEY"
+
+
+def _authorize(client: httpx.Client | httpx.AsyncClient, api_key: str | None) -> None:
+    """Send ``api_key``, or ``$SCRAPERACK_API_KEY``, as a bearer token on every request."""
+    key = api_key if api_key is not None else os.environ.get(API_KEY_ENV)
+    if key and "Authorization" not in client.headers:
+        client.headers["Authorization"] = f"Bearer {key}"
 
 
 class APIError(RuntimeError):
@@ -139,9 +148,11 @@ def _task_query(limit: int | None, pool: str | Sequence[str] | None, owner: str 
 class Cluster:
     """Synchronous client for a Scraperack controller."""
 
-    def __init__(self, url: str = DEFAULT_URL, *, client: httpx.Client | None = None) -> None:
+    def __init__(self, url: str = DEFAULT_URL, *, api_key: str | None = None,
+                 client: httpx.Client | None = None) -> None:
         self.url = url.rstrip("/")
         self.client = client or httpx.Client(base_url=self.url, timeout=60)
+        _authorize(self.client, api_key)
 
     def __enter__(self) -> "Cluster":
         return self
@@ -276,9 +287,11 @@ class Cluster:
 class AsyncCluster:
     """Asynchronous client for a Scraperack controller."""
 
-    def __init__(self, url: str = DEFAULT_URL, *, client: httpx.AsyncClient | None = None) -> None:
+    def __init__(self, url: str = DEFAULT_URL, *, api_key: str | None = None,
+                 client: httpx.AsyncClient | None = None) -> None:
         self.url = url.rstrip("/")
         self.client = client or httpx.AsyncClient(base_url=self.url, timeout=60)
+        _authorize(self.client, api_key)
 
     async def __aenter__(self) -> "AsyncCluster":
         return self

@@ -75,7 +75,8 @@ The installer writes these files (mode 0600). Edit them and restart the matching
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `SCRAPERACK_LISTEN` | `0.0.0.0:7070` | Controller API address |
+| `SCRAPERACK_LISTEN` | `0.0.0.0:7070` | Controller API address; every request needs an API key |
+| `SCRAPERACK_ADMIN_LISTEN` | `127.0.0.1:7071` | Admin address for the GUI and key management, no keys; keep it private |
 | `SCRAPERACK_ALLOW_PLUGIN_INSTALL` | `true` | Allow installing plugins from the API and GUI |
 
 `/etc/scraperack/node.env`
@@ -94,10 +95,19 @@ Installer options: `--role all|control-plane|worker`, `--yes`, and `--help`. The
 
 Installer-time overrides: `SCRAPERACK_NODE_CPU_MILLIS`, `SCRAPERACK_NODE_MEMORY_MIB`,
 `SCRAPERACK_NODE_VM_START_CONCURRENCY`, `SCRAPERACK_NODE_NAME`, `SCRAPERACK_LISTEN`,
+`SCRAPERACK_ADMIN_LISTEN`,
 `SCRAPERACK_GUI_PORT`, `SCRAPERACK_PUBLIC_URL`, `SCRAPERACK_USER`, `SCRAPERACK_REPOSITORY`.
 
-`/etc/scraperack/gui.env`: `SCRAPERACK_URL` (controller), `SCRAPERACK_PUBLIC_URL` (URL shown
-in join commands), `SCRAPERACK_GUI_PORT` (`8080`).
+`/etc/scraperack/gui.env`: `SCRAPERACK_URL` (the controller's admin address),
+`SCRAPERACK_PUBLIC_URL` (URL shown in join commands and key examples), `SCRAPERACK_GUI_PORT`
+(`8080`).
+
+## API keys
+
+The API on port 7070 refuses every request until you create a key. Open **API keys** in the
+GUI, choose what the key opens (the core API, single plugins, or everything), and copy the
+key; it is shown once. Programs send it as `Authorization: Bearer <key>`, and the SDKs read
+it from `SCRAPERACK_API_KEY`. See [API](api.md#authentication).
 
 ## Services
 
@@ -112,8 +122,9 @@ in join commands), `SCRAPERACK_GUI_PORT` (`8080`).
 
 | Port / range | Where | Use |
 |---|---|---|
-| 7070/tcp | controller | API, plugin APIs (`/plugins/<name>/api/`), node traffic |
-| 8080/tcp | controller | GUI |
+| 7070/tcp | controller | API and plugin APIs (`/plugins/<name>/api/`) with API keys, node traffic |
+| 7071/tcp | controller, `127.0.0.1` | Admin API for the GUI, no keys |
+| 8080/tcp | controller | GUI, no login yet |
 | 30000–49999 | nodes | Host ports published for microVMs |
 | `10.240.0.0/16` | nodes | MicroVM addresses, one `/30` per VM, NAT to the outside |
 

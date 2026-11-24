@@ -16,7 +16,7 @@ cargo run -- controller --data-dir data/controller
 cargo run -- node --controller http://127.0.0.1:7070 --name node-1 --kernel /path/to/vmlinux
 cd ..
 pip install -e platform/gui
-SCRAPERACK_URL=http://127.0.0.1:7070 python platform/gui/app.py
+SCRAPERACK_URL=http://127.0.0.1:7071 python platform/gui/app.py
 ```
 
 Nodes need Linux, KVM, and Firecracker (`sudo ./platform/deploy/install-firecracker.sh`).

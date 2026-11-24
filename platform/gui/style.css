@@ -200,3 +200,6 @@ html, body, #app, .q-layout, .q-page-container { background: var(--base); color:
 @media (max-width: 620px) {
   .cap-overview, .cap-grid, .cap-inputs { grid-template-columns: minmax(0, 1fr); }
 }
+.status-active { color: #6ee7b7; border-color: #166534; background: #052e1b; }
+.status-disabled { color: #d4d4d4; border-color: #525252; background: #262626; }
+.status-expired { color: #fca5a5; border-color: #991b1b; background: #450a0a; }

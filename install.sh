@@ -261,12 +261,15 @@ fi
 
 if [ -n "$has_control" ]; then
     allow_plugins=$(sed -n 's/^SCRAPERACK_ALLOW_PLUGIN_INSTALL=//p' /etc/scraperack/controller.env 2>/dev/null || true)
+    admin_listen=${SCRAPERACK_ADMIN_LISTEN:-$(sed -n 's/^SCRAPERACK_ADMIN_LISTEN=//p' /etc/scraperack/controller.env 2>/dev/null || true)}
+    admin_listen=${admin_listen:-127.0.0.1:7071}
     cat > /etc/scraperack/controller.env <<EOF
 SCRAPERACK_LISTEN=${SCRAPERACK_LISTEN:-0.0.0.0:7070}
+SCRAPERACK_ADMIN_LISTEN=$admin_listen
 SCRAPERACK_ALLOW_PLUGIN_INSTALL=${SCRAPERACK_ALLOW_PLUGIN_INSTALL:-${allow_plugins:-true}}
 EOF
     cat > /etc/scraperack/gui.env <<EOF
-SCRAPERACK_URL=http://127.0.0.1:7070
+SCRAPERACK_URL=http://127.0.0.1:${admin_listen##*:}
 SCRAPERACK_PUBLIC_URL=${SCRAPERACK_PUBLIC_URL:-}
 SCRAPERACK_GUI_PORT=${SCRAPERACK_GUI_PORT:-8080}
 EOF
@@ -304,7 +307,7 @@ case "$role" in
     all)
         systemctl enable --now scraperack-controller scraperack-dns scraperack-node scraperack-gui
         attempt=0
-        until [ "$(curl -fsS http://127.0.0.1:7070/v1/nodes 2>/dev/null)" != "[]" ] && \
+        until [ "$(curl -fsS "http://127.0.0.1:${admin_listen##*:}/v1/nodes" 2>/dev/null)" != "[]" ] && \
               curl -fsS http://127.0.0.1:8080/ >/dev/null; do
             attempt=$((attempt + 1))
             [ "$attempt" -lt 30 ] || {
@@ -346,11 +349,13 @@ case "$role" in
         echo "Scraperack is running"
         echo "Controller: http://$address:7070"
         echo "GUI:        http://$address:8080"
+        echo "The API needs a key: create one in the GUI under API keys"
         ;;
     control-plane)
         echo "Scraperack control plane is running"
         echo "Controller: http://$address:7070"
         echo "GUI:        http://$address:8080"
+        echo "The API needs a key: create one in the GUI under API keys"
         ;;
     worker)
         if [ -n "$credential" ]; then
