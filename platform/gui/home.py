@@ -144,22 +144,24 @@ def stage_html(stage, index, total, bottleneck):
         label = f'<a href="#{escape(stage.link)}">{label}</a>'
     flag = '<em>Bottleneck</em>' if stage is bottleneck else ""
     note = f"<p>{stage.note}</p>" if stage.note else ""
-    hint = f'<p class="home-hint">{escape(stage.hint)}</p>' if stage is bottleneck and stage.hint else ""
     return (f'<div class="{classes}" style="--clip:{clip};--fill:{stage.fill * 100:.1f}%">'
             f'<div class="home-stage-body">{flag}<h4>{label}</h4>'
-            f'<div class="home-stage-value">{stage.value}</div>{note}{hint}</div></div>')
+            f'<div class="home-stage-value">{stage.value}</div>{note}</div></div>')
 
 
 def funnel_html(funnel):
     stages = funnel.stages + [funnel.output()]
     body = "".join(stage_html(stage, index, len(stages), funnel.bottleneck)
                    for index, stage in enumerate(stages))
+    hint = ""
     if funnel.bottleneck:
         verdict, level = f"Bottleneck: {escape(funnel.bottleneck.label)}", "hot"
+        if funnel.bottleneck.hint:
+            hint = f'<p class="home-hint hot">{escape(funnel.bottleneck.hint)}</p>'
     else:
         verdict, level = "Healthy", "ok"
     return (f'<article class="home-funnel" id="home-{escape(funnel.name)}"><header>'
-            f'<h3>{escape(title(funnel.name))}</h3><span class="home-verdict {level}">{verdict}</span></header>'
+            f'<h3>{escape(title(funnel.name))}</h3>{hint}<span class="home-verdict {level}">{verdict}</span></header>'
             f'<div class="home-track" style="--stages:{len(stages)}">{body}</div></article>')
 
 
