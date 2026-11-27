@@ -149,6 +149,16 @@ struct CapacityResource {
     /// The plugin's own call: this is what limits it now.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     bottleneck: bool,
+    /// Colours the stage: green when fine, red when not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    state: Option<StageState>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum StageState {
+    Ok,
+    Bad,
 }
 
 #[derive(Deserialize, Serialize)]

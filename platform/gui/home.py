@@ -36,6 +36,7 @@ class Stage:
     def __init__(self, label, value, fill, note="", link=None, kind=""):
         self.label, self.value, self.fill = label, value, fill
         self.note, self.link, self.kind = note, link, kind
+        self.state = ""  # "ok" or "hot": a colour the plugin set
 
 
 def worker_shares(node):
@@ -137,8 +138,12 @@ def dependency_stage(name, plugin, funnel):
 def resource_stage(resource):
     used, total = resource["used"], resource.get("total")
     fill = min(used / total, 1) if total else 0
-    return Stage(resource["label"], count(used, total, resource.get("unit")), fill,
-                 escape(resource.get("note") or ""))
+    stage = Stage(resource["label"], count(used, total, resource.get("unit")), fill,
+                  escape(resource.get("note") or ""))
+    stage.state = {"ok": "ok", "bad": "hot"}.get(resource.get("state"), "")
+    if stage.state:
+        stage.fill = 1  # the colour is the message: fill the whole stage
+    return stage
 
 
 def stage_html(stage, index, total, bottleneck):
@@ -149,7 +154,7 @@ def stage_html(stage, index, total, bottleneck):
     if stage.kind == "output":  # a shortfall against the target: half empty is already serious
         level = "hot" if stage.shortfall >= .5 else "warm" if stage.shortfall > 0 else "ok" if stage.fill else ""
     else:
-        level = "hot" if stage is bottleneck else ""
+        level = "hot" if stage is bottleneck else stage.state
     classes = f"home-stage {stage.kind} {level}" + (" bottleneck" if stage is bottleneck else "")
     label = escape(stage.label)
     if stage.link:

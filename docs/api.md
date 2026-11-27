@@ -183,7 +183,8 @@ All top-level fields are optional.
   warm, waiting) and the tightest physical CPU, RAM or disk use on any worker.
 - `resources` are the stages of the plugin's own flow, in order. Each requires
   a label and a nonnegative integer `used`; `total` draws it as a share. `note`
-  (up to 160 characters) is a line under the value.
+  (up to 160 characters) is a line under the value. `state` colours the stage:
+  `"ok"` green, `"bad"` red.
 - The plugin decides its bottleneck by its own fixed rules: it sets
   `"bottleneck": true` on that resource. The homepage doesn't infer one from
   how full things are.
