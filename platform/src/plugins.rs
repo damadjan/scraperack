@@ -129,6 +129,12 @@ struct CapacityReport {
     /// What the plugin delivers, drawn at the end of its funnel on the homepage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     output: Option<CapacityOutput>,
+    /// Draw the plugin's microVMs and the workers' hardware as stages.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    vms: bool,
+    /// Where the funnel goes on the homepage, lowest first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    position: Option<u32>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -137,9 +143,6 @@ struct CapacityResource {
     used: u64,
     total: Option<u64>,
     unit: Option<String>,
-    /// What to change when this resource runs out.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    hint: Option<String>,
     /// A short line under the value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     note: Option<String>,
@@ -734,7 +737,6 @@ pub async fn report_capacity(
             resource.label.trim().is_empty()
                 || resource.label.len() > 80
                 || resource.unit.as_ref().is_some_and(|unit| unit.len() > 24)
-                || resource.hint.as_ref().is_some_and(|hint| hint.len() > 160)
                 || resource.note.as_ref().is_some_and(|note| note.len() > 160)
         })
         || report.output.as_ref().is_some_and(|output| {

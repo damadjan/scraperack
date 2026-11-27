@@ -147,10 +147,11 @@ const when = ms => ms ? new Date(ms).toLocaleString(undefined, {timeZone: timezo
 
 ### Capacity reports
 
-The homepage draws a funnel for every plugin that reports capacity: what it draws
-from (other plugins, its VM pools, its own resources) on the left, what it
-delivers on the right. Plugins that don't report get no funnel. Funnels are
-ordered so a plugin comes after the plugins it draws from.
+The homepage shows the workers' hardware, then a funnel for every plugin that
+reports capacity: what it draws from (other plugins, its microVMs, its own
+resources) on the left, what it delivers on the right. Plugins that don't report
+get no funnel. Funnels are never per project, and a stage is flagged only as
+the funnel's bottleneck chip.
 
 Plugins send a complete snapshot with `PUT /v1/capacity` over
 `SCRAPERACK_CORE_SOCKET`. The core identifies the sender from its socket and
@@ -159,12 +160,13 @@ seconds). Reports expire after 30 seconds and are cleared when a plugin stops.
 
 ```json
 {
+  "position": 10,
   "output": {"label": "Trusted proxies", "ready": 150, "unit": "proxies"},
   "dependencies": [],
   "resources": [
     {"label": "Untested", "used": 77645, "unit": "proxies"},
     {"label": "Test rate", "used": 2, "total": 8, "unit": "conn/s", "bottleneck": true,
-     "note": "77,645 proxies wait for a test", "hint": "Raise test_rate_max"}
+     "note": "Capped at 2/s"}
   ],
   "queued": 3
 }
@@ -172,24 +174,27 @@ seconds). Reports expire after 30 seconds and are cleared when a plugin stops.
 
 All top-level fields are optional.
 
+- `position` places the funnel: lowest first, then by name (default 1000).
 - `output` is what the plugin delivers: `ready` now, out of an optional
   `target`.
 - `dependencies` name other plugins. Their output appears as the first stages
   of this funnel.
+- `vms: true` adds two stages: all the plugin's microVMs together (running,
+  warm, waiting) and the tightest physical CPU, RAM or disk use on any worker.
 - `resources` are the stages of the plugin's own flow, in order. Each requires
   a label and a nonnegative integer `used`; `total` draws it as a share. `note`
   (up to 160 characters) is a line under the value.
 - The plugin decides its bottleneck by its own fixed rules: it sets
-  `"bottleneck": true` on that resource, and `hint` (up to 160 characters) says
-  what to change. The homepage doesn't infer one from how full things are.
+  `"bottleneck": true` on that resource. The homepage doesn't infer one from
+  how full things are.
 - `queued` is work waiting for the plugin.
 
-The core adds the plugin's managed VM pools as stages by itself. A pool whose
-VMs can't be placed, or whose snapshot a worker keeps failing to prepare (its
-VMs crash on start), is the bottleneck. So is the busiest pool while a worker is
-physically out of CPU, RAM or disk (90 %). A pool's configured VM limit never
-is. Reports can contain up to 12 dependencies and 12 resources and are limited
-to 16 KiB.
+The bottleneck is, in this order: the plugin's microVMs when a pool can't place
+them or they fail to start (the microVMs stage then appears even without
+`vms`); the resource the plugin flags; with `vms`, the hardware stage when a
+worker is at 90 % CPU, RAM or disk. Configured limits, such as a pool's VM
+limit, never are. Reports can contain up to 12 dependencies and 12 resources and
+are limited to 16 KiB.
 
 Workers report host CPU use, RAM (`MemTotal`, `MemAvailable`) and the free
 space of the filesystem that holds their data directory.
