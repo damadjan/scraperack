@@ -746,34 +746,14 @@ async def images_page():
 @ui.page("/pools")
 async def pools_page():
     with await layout("pools"):
-        images_data = []
-        try:
-            images_data = await request("GET", "/v1/images")
-        except Exception as error:
-            notify_error(error)
-        with ui.card().classes("panel"):
-            ui.label("Create VM pool").classes("section-title")
-            with ui.row().classes("w-full items-end gap-2"):
-                name = ui.input("Name").classes("w-48")
-                image = ui.select({item["id"]: item["name"] for item in images_data
-                                   if item["ready"]}, label="Image").classes("w-64")
-                cpu = ui.number("CPU cores", value=1, min=0.01, step=0.05).classes("w-32")
-                memory = ui.number("Memory MiB", value=256, min=64, step=64).classes("w-32")
-                disk = ui.number("Disk MiB", value=1024, min=64, step=64).classes("w-32")
-                timeout = ui.number("Timeout sec", value=30, min=1).classes("w-32")
-                idle_timeout = ui.number("Idle timeout sec", value=30, min=0).classes("w-36")
-                warm = ui.number("Warm instances", value=0, min=0).classes("w-36")
-                maximum = ui.number("Max instances", value=8, min=1).classes("w-32")
-                reuse = ui.switch("Reuse VMs", value=True)
-                networking = ui.switch("Networking", value=True)
-                ports = ui.input("Ports", placeholder="vnc=5900, cdp=9222").classes("w-72")
-                create_button = ui.button("Create", icon="add").props("unelevated no-caps color=primary")
         with ui.row().classes("items-center w-full"):
             ui.label("VM Pools").classes("section-title")
             ui.space()
             delete_button = ui.button("Delete", icon="delete", color="negative").props("outline no-caps")
+            create_button = ui.button("Create pool", icon="add").props("unelevated no-caps")
         pools = table([
-            {"headerName": "Name", "field": "name", "minWidth": 140},
+            {"headerName": "Name", "field": "label", "minWidth": 180},
+            {"headerName": "Owner", "field": "owner", "minWidth": 130},
             {"headerName": "Image", "field": "image_name", "minWidth": 140},
             {"headerName": "CPU", "field": "cpu", "maxWidth": 90},
             {"headerName": "Memory MiB", "field": "memory_mib", "maxWidth": 125},
@@ -781,55 +761,115 @@ async def pools_page():
             {"headerName": "Timeout", "field": "timeout_secs", "maxWidth": 100},
             {"headerName": "Idle timeout", "field": "idle_timeout_secs", "maxWidth": 120},
             {"headerName": "Warm", "field": "warm_instances", "maxWidth": 90},
+            {"headerName": "Max", "field": "max_instances", "maxWidth": 80},
             {"headerName": "Reuse", "field": "reuse", "maxWidth": 90},
             {"headerName": "Network", "field": "network", "maxWidth": 100},
+            {"headerName": "Huge pages", "field": "huge_pages", "maxWidth": 120},
             {"headerName": "Ports", "field": "display_ports", "minWidth": 180},
-            {"headerName": "Max", "field": "max_instances", "maxWidth": 80},
-        ], selection=True)
+            {"headerName": "Revision", "field": "revision", "maxWidth": 110},
+            {"headerName": "Ready", "field": "ready", "maxWidth": 90},
+            {"headerName": "Pool name", "field": "name", "cellClass": "mono", "minWidth": 200},
+        ], selection=True, row_key="name")
+    # Dialogs must not be built inside the grid element.
+    dialogs = ui.element("div")
+    images_data = []
 
     async def refresh():
-        data = [pool for pool in await request("GET", "/v1/pools") if not pool.get("managed_by")]
+        nonlocal images_data
+        data, images_data = await asyncio.gather(request("GET", "/v1/pools"), request("GET", "/v1/images"))
         image_names = {item["id"]: item["name"] for item in images_data}
-        set_rows(pools, [{**pool, "image_name": image_names.get(pool["image"], pool["image"][:8]),
+        set_rows(pools, [{**pool, "label": pool.get("display_name") or pool["name"],
+                          "owner": owner_label(pool["managed_by"]) if pool.get("managed_by") else "Manual",
+                          "image_name": image_names.get(pool["image"], pool["image"][:8]),
                           "cpu": pool["cpu_millis"] / 1000,
                           "display_ports": ", ".join(
                               f'{port["name"]}={port["host_port"] or "*"}:{port["guest_port"]}/{port["protocol"]}'
-                              for port in pool.get("ports", [])) or "—"} for pool in data])
+                              for port in pool.get("ports", [])) or "—"}
+                         for pool in sorted(data, key=lambda pool: (bool(pool.get("managed_by")),
+                                                                    pool.get("managed_by") or "",
+                                                                    pool.get("display_name") or pool["name"]))])
 
-    async def create():
-        if not name.value or not image.value:
-            return ui.notify("Name and image are required", type="warning")
+    async def safe_refresh():
         try:
-            await request("POST", "/v1/pools", json={
-                "name": name.value, "image": image.value, "warm_instances": int(warm.value),
-                "max_instances": int(maximum.value), "cpu_millis": round(float(cpu.value) * 1000),
-                "memory_mib": int(memory.value), "disk_mib": int(disk.value),
-                "timeout_secs": int(timeout.value), "idle_timeout_secs": int(idle_timeout.value),
-                "reuse": reuse.value, "network": networking.value,
-                "ports": parse_ports(ports.value),
-            })
-            ui.notify(f"Created pool {name.value}", type="positive")
-            name.value = ""
             await refresh()
         except Exception as error:
             notify_error(error)
+
+    def open_create():
+        with dialogs, ui.dialog() as dialog, ui.card().classes("detail-dialog"):
+            with ui.row().classes("items-center w-full"):
+                ui.label("Create VM pool").classes("section-title")
+                ui.space()
+                ui.button(icon="close", on_click=dialog.close).props("flat round")
+            ui.label("A set of identical microVMs from one image. "
+                     "Plugins create and own their pools; use this for pools of your own.") \
+                .classes("text-sm muted")
+            with ui.row().classes("w-full no-wrap"):
+                name = ui.input("Name").classes("grow")
+                image = ui.select({item["id"]: item["name"] for item in images_data if item["ready"]},
+                                  label="Image").classes("grow")
+            with ui.row().classes("w-full no-wrap"):
+                cpu = ui.number("CPU cores", value=1, min=0.01, step=0.05).classes("grow")
+                memory = ui.number("Memory MiB", value=256, min=64, step=64).classes("grow")
+                disk = ui.number("Disk MiB", value=1024, min=64, step=64).classes("grow")
+            with ui.row().classes("w-full no-wrap"):
+                timeout = ui.number("Timeout sec", value=30, min=1).classes("grow")
+                idle_timeout = ui.number("Idle timeout sec", value=30, min=0).classes("grow")
+            with ui.row().classes("w-full no-wrap"):
+                warm = ui.number("Warm instances", value=0, min=0).classes("grow")
+                maximum = ui.number("Max instances", value=8, min=1).classes("grow")
+            ports = ui.input("Ports", placeholder="vnc=5900, cdp=9222").classes("w-full")
+            with ui.row().classes("w-full"):
+                reuse = ui.switch("Reuse VMs", value=True)
+                networking = ui.switch("Networking", value=True)
+            status = ui.label().classes("text-sm status-error")
+            with ui.row().classes("w-full justify-end"):
+                ui.button("Cancel", on_click=dialog.close).props("flat no-caps")
+                submit = ui.button("Create", icon="add").props("unelevated no-caps")
+
+        async def create():
+            if not name.value or not image.value:
+                return status.set_text("Name and image are required")
+            submit.disable()
+            try:
+                await request("POST", "/v1/pools", json={
+                    "name": name.value, "image": image.value, "warm_instances": int(warm.value),
+                    "max_instances": int(maximum.value), "cpu_millis": round(float(cpu.value) * 1000),
+                    "memory_mib": int(memory.value), "disk_mib": int(disk.value),
+                    "timeout_secs": int(timeout.value), "idle_timeout_secs": int(idle_timeout.value),
+                    "reuse": reuse.value, "network": networking.value,
+                    "ports": parse_ports(ports.value),
+                })
+                dialog.close()
+                ui.notify(f"Created pool {name.value}", type="positive")
+                await safe_refresh()
+            except Exception as error:
+                status.set_text(str(error))
+                submit.enable()
+
+        submit.on_click(create)
+        dialog.on("hide", dialog.delete)
+        dialog.open()
 
     async def delete_selected():
         selected = await pools.get_selected_row()
         if not selected:
             return ui.notify("Select a pool first", type="warning")
+        if selected.get("managed_by"):
+            return ui.notify(f'{selected["label"]} belongs to the {owner_label(selected["managed_by"])}; '
+                             "remove it there", type="warning")
+        with dialogs:
+            if not await confirm("Delete pool", f'Delete {selected["label"]}? This cannot be undone.', "Delete"):
+                return
         try:
             await request("DELETE", f'/v1/pools/{quote(selected["name"], safe="")}')
             await refresh()
         except Exception as error:
             notify_error(error)
 
-    create_button.on_click(create)
+    create_button.on_click(open_create)
     delete_button.on_click(delete_selected)
-    try:
-        await refresh()
-    except Exception as error:
-        notify_error(error)
+    await safe_refresh()
 
 
 async def read_upload(event):
