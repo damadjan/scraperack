@@ -14,7 +14,7 @@ from fastapi import Request
 from fastapi.responses import Response
 from nicegui import app, ui
 
-from home import home_html
+from home import home_html, title
 
 CONTROLLER = os.getenv("SCRAPERACK_URL", "http://127.0.0.1:7070").rstrip("/")
 PUBLIC_CONTROLLER = os.getenv("SCRAPERACK_PUBLIC_URL", "")
@@ -222,7 +222,7 @@ def shell(active, plugins=()):
         ui.separator().classes("mb-1")
         plugin_links = [(f'plugin-{plugin["name"]}', f'/plugin/{quote(plugin["name"], safe="")}',
                          PLUGIN_ICONS.get(plugin["name"], NAV_ICONS["plugin"]),
-                         plugin["name"].replace("-", " ").title())
+                         title(plugin["name"]))
                         for plugin in plugins if plugin.get("gui") and plugin.get("enabled")]
         groups = [
             (None, [("dashboard", "/", NAV_ICONS["home"], "Home")]),
@@ -269,7 +269,7 @@ async def pool_names():
 def owner_label(managed_by):
     if not managed_by:
         return "VM pool"
-    return managed_by.removeprefix("plugin:").replace("-", " ").title() + " plugin"
+    return title(managed_by.removeprefix("plugin:")) + " plugin"
 
 
 def table(columns, rows=None, selection=False, row_key=None):
@@ -306,7 +306,7 @@ async def dashboard():
                 status = ui.label("Connecting").classes("home-feed").props('role="status"')
             warning = ui.label().classes("home-warning")
             warning.set_visibility(False)
-            sections = [ui.html("", sanitize=False).classes("w-full") for _ in range(3)]
+            sections = [ui.html("", sanitize=False).classes("w-full") for _ in range(2)]
 
     async def refresh():
         try:
@@ -1113,7 +1113,7 @@ def scope_label(scope, plugins):
         return "Everything"
     if scope == "core":
         return "Core"
-    label = scope.replace("-", " ").title()
+    label = title(scope)
     return label if scope in plugins else f"{label} (removed)"
 
 

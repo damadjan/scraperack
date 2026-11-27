@@ -140,6 +140,12 @@ struct CapacityResource {
     /// What to change when this resource runs out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     hint: Option<String>,
+    /// A short line under the value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
+    /// The plugin's own call: this is what limits it now.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    bottleneck: bool,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -729,6 +735,7 @@ pub async fn report_capacity(
                 || resource.label.len() > 80
                 || resource.unit.as_ref().is_some_and(|unit| unit.len() > 24)
                 || resource.hint.as_ref().is_some_and(|hint| hint.len() > 160)
+                || resource.note.as_ref().is_some_and(|note| note.len() > 160)
         })
         || report.output.as_ref().is_some_and(|output| {
             output.label.trim().is_empty()

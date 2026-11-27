@@ -1,20 +1,18 @@
-"""The homepage: what limits the platform right now, drawn as one funnel per plugin.
+"""The homepage: one funnel per plugin that reports capacity, then the workers' hardware.
 
 Each funnel runs left to right: what the plugin draws from (other plugins, its VM pools,
-its own resources) narrows into what it delivers. Every stage has a strain from 0 (idle)
-to 1 (exhausted); the most strained stage of a funnel is its bottleneck.
+its own resources) narrows into what it delivers. The page doesn't guess what limits a
+plugin from how full things are. A stage is the bottleneck when the plugin says so, when a
+pool is broken, or when a busy pool's workers are physically out of CPU, RAM or disk.
 """
 from html import escape
 
-WARM, HOT = .85, 1.0
-
-
-def tone(strain):
-    return "hot" if strain >= HOT else "warm" if strain >= WARM else ""
+FULL = .9  # a worker's CPU, RAM or disk at 90 % is out of room
+ACRONYMS = {"mcp", "api", "vm", "vms"}
 
 
 def title(name):
-    return name.replace("-", " ").title()
+    return " ".join(word.upper() if word in ACRONYMS else word.title() for word in name.split("-"))
 
 
 def size(value, unit="B"):
@@ -29,11 +27,82 @@ def count(value, total=None, unit=None):
     return text + (f" <small>{escape(unit)}</small>" if unit else "")
 
 
+def tone(share):
+    return "hot" if share >= 1 else "warm" if share >= FULL else ""
+
+
 class Stage:
-    def __init__(self, label, value, fill, strain, note="", hint="", link=None, kind="", problem=""):
-        self.label, self.value, self.fill, self.strain = label, value, fill, strain
+    def __init__(self, label, value, fill, note="", hint="", link=None, kind=""):
+        self.label, self.value, self.fill = label, value, fill
         self.note, self.hint, self.link, self.kind = note, hint, link, kind
-        self.problem = problem  # plain text for Scale next when the stage is broken, not just full
+
+
+def worker_limits(node):
+    """What a worker is physically out of, as labels: CPU, RAM, Disk."""
+    usage, memory = node.get("host_usage") or {}, node.get("host_memory")
+    out = []
+    if (usage.get("cpu_busy_permille") or 0) >= FULL * 1000:
+        out.append("CPU")
+    if memory and 1 - memory["available_kib"] / memory["total_kib"] >= FULL:
+        out.append("RAM")
+    if usage.get("disk_total_bytes") and 1 - usage["disk_available_bytes"] / usage["disk_total_bytes"] >= FULL:
+        out.append("Disk")
+    return out
+
+
+class Funnel:
+    def __init__(self, name, report, pools):
+        self.name, self.report, self.pools = name, report, pools
+        self.stages, self.bottleneck = [], None
+
+    def build(self, plugins, funnels, starved):
+        for dep in self.report.get("dependencies", []):
+            self.stages.append(dependency_stage(dep, plugins.get(dep), funnels.get(dep)))
+        pools = [(pool, pool_stage(pool)) for pool in self.pools]
+        resources = [(resource, resource_stage(resource)) for resource in self.report.get("resources", [])]
+        self.stages += [stage for _, stage in pools + resources]
+        broken = [stage for _, stage in pools if stage.kind == "pool broken"]
+        declared = [stage for resource, stage in resources if resource.get("bottleneck")]
+        busy = sorted(((pool["active"] + pool["queued"], stage) for pool, stage in pools
+                       if pool["active"] or pool["queued"]), key=lambda item: -item[0])
+        if broken or declared:
+            self.bottleneck = (broken + declared)[0]
+        elif starved and busy:  # config limits never count; workers out of hardware do
+            self.bottleneck = busy[0][1]
+            self.bottleneck.hint = f"Workers out of room ({starved}): add a worker, or free RAM or disk"
+
+    def output(self):
+        output = self.report.get("output")
+        queued = self.report.get("queued")
+        if output:
+            target = output.get("target")
+            note = f"{queued:,} waiting" if queued else ""
+            stage = Stage(output["label"], count(output["ready"], target, output.get("unit")),
+                          min(output["ready"] / target, 1) if target else 1, note, kind="output")
+            stage.shortfall = max(0, 1 - output["ready"] / target) if target else 0
+            return stage
+        stage = Stage("Waiting", count(queued or 0), 0, kind="output")
+        stage.shortfall = 0
+        return stage
+
+
+def dependency_stage(name, plugin, funnel):
+    link = f"home-{name}"
+    if plugin is None:
+        return Stage(title(name), "missing", 0, "Plugin not installed", kind="plugin")
+    if funnel is None:
+        state = "Disabled" if not plugin["enabled"] else plugin["status"].title()
+        return Stage(title(name), "down", 0, escape(state), kind="plugin")
+    output = funnel.report.get("output")
+    if output:
+        value = count(output["ready"], output.get("target"), output.get("unit"))
+        fill = min(output["ready"] / output["target"], 1) if output.get("target") else 1
+        note = escape(output["label"])
+    else:
+        value, fill, note = "running", 1, ""
+    if funnel.bottleneck:
+        note += f" · limited by {escape(funnel.bottleneck.label)}"
+    return Stage(title(name), value, fill, note, link=link, kind="plugin")
 
 
 def pool_stage(pool):
@@ -41,109 +110,23 @@ def pool_stage(pool):
     notes = [f'{pool["idle"]:,} warm']
     if queued:
         notes.append(f"{queued:,} waiting")
+    value = count(active, limit, "VMs")
     failing = pool.get("failing")
     if failing:
         where = "every worker" if failing["workers"] >= failing["of"] else f'{failing["workers"]} of {failing["of"]} workers'
-        return Stage(pool["label"], count(active, limit, "VMs"), 1, 1.5,
-                     f'VMs fail to start on {where}: {escape(failing["error"])}',
-                     "Its VMs crash on start: check the pool's image and the plugin's guest code", kind="pool",
-                     problem=f"VMs fail to start: {failing['error']}")
+        return Stage(pool["label"], value, 1, f'VMs fail to start on {where}: {escape(failing["error"])}',
+                     "Its VMs crash on start: check the pool's image and the plugin's guest code", kind="pool broken")
     if pool["placement"]:
-        return Stage(pool["label"], count(active, limit, "VMs"), 1, 1.5, pool["placement"],
-                     "Fix the pool's image, disks or size, or add a worker", kind="pool")
-    fill = active / limit if limit else 0
-    if queued:  # demand the pool can't serve yet
-        strain = HOT if limit and active >= limit else WARM
-    else:  # busy but keeping up: a full pool with nothing waiting is not a bottleneck
-        strain = min(fill, 1) * .8
-    hint = "Raise the pool's VM limit or add workers" if strain >= WARM else ""
-    return Stage(pool["label"], count(active, limit, "VMs"), min(fill, 1), strain, " · ".join(notes), hint,
-                 kind="pool")
+        return Stage(pool["label"], value, 1, escape(pool["placement"]),
+                     "Fix the pool's image or disks, or add a bigger worker", kind="pool broken")
+    return Stage(pool["label"], value, min(active / limit, 1) if limit else 0, " · ".join(notes), kind="pool")
 
 
 def resource_stage(resource):
     used, total = resource["used"], resource.get("total")
-    if total is None:
-        strain, fill = 0, 0
-    elif total == 0:
-        strain, fill = 1.5, 1  # no capacity at all
-    else:
-        strain, fill = used / total, used / total
-    return Stage(resource["label"], count(used, total, resource.get("unit")), min(fill, 1), strain,
-                 hint=resource.get("hint") or "")
-
-
-def output_shortfall(output):
-    target = output.get("target")
-    if not target:
-        return 0
-    return max(0, 1 - output["ready"] / target)
-
-
-class Funnel:
-    def __init__(self, name, plugin, pools):
-        self.name, self.plugin, self.pools = name, plugin, pools
-        self.report = (plugin or {}).get("report") or {}
-        self.stages, self.state, self.down = [], "", False
-        if plugin is None:
-            self.state, self.down = "Not installed", True
-        elif not plugin["enabled"]:
-            self.state, self.down = "Disabled", True
-        elif plugin["status"] != "running":
-            self.state, self.down = plugin["status"].title(), plugin["status"] != "starting"
-
-    def build(self, funnels):
-        """Stages from source to output; dependencies are read from the other funnels."""
-        for dep in self.report.get("dependencies", []):
-            other = funnels.get(dep)
-            if other is None:
-                self.stages.append(Stage(title(dep), "missing", 0, 1.5, "Plugin not installed",
-                                         f"Install the {title(dep)} plugin", kind="plugin"))
-                continue
-            output = other.report.get("output")
-            strain = other.worst()
-            if other.down:
-                value, fill, note, strain = "down", 0, other.state, 1.5
-            elif output:
-                value = count(output["ready"], output.get("target"), output.get("unit"))
-                fill = output["ready"] / output["target"] if output.get("target") else 1
-                note = escape(output["label"])
-                strain = max(strain, output_shortfall(output))
-            else:
-                value, fill, note = escape(other.state or "running"), 1, "No output reported"
-            strain = min(strain, HOT)  # this plugin is limited by it; the broken one is listed itself
-            bottleneck = other.bottleneck()
-            hint = f"Scale {title(dep)}: {bottleneck.label}" if bottleneck and strain >= WARM else ""
-            self.stages.append(Stage(title(dep), value, min(fill, 1), strain, note, hint,
-                                     link=f"home-{dep}", kind="plugin"))
-        self.stages += [pool_stage(pool) for pool in self.pools]
-        self.stages += [resource_stage(item) for item in self.report.get("resources", [])]
-
-    def own_stages(self):
-        return [stage for stage in self.stages if stage.kind != "plugin"]
-
-    def worst(self):
-        """Strain of the plugin's own stages, for funnels that depend on it."""
-        return max((stage.strain for stage in self.own_stages()), default=0)
-
-    def bottleneck(self):
-        stage = max(self.stages, key=lambda stage: stage.strain, default=None)
-        return stage if stage and stage.strain >= WARM else None
-
-    def output(self):
-        output = self.report.get("output")
-        queued = self.report.get("queued")
-        if self.down:
-            return Stage("Not delivering", escape(self.state), 0, 1.5, kind="output")
-        if output:
-            target = output.get("target")
-            note = f"{queued:,} waiting" if queued else ""
-            return Stage(output["label"], count(output["ready"], target, output.get("unit")),
-                         min(output["ready"] / target, 1) if target else 1,
-                         output_shortfall(output), note, kind="output")
-        if queued is not None:
-            return Stage("Waiting", count(queued), 0, WARM if queued else 0, kind="output")
-        return Stage("Output", "—", 0, 0, "The plugin reports no output", kind="output")
+    fill = min(used / total, 1) if total else 0
+    return Stage(resource["label"], count(used, total, resource.get("unit")), fill,
+                 escape(resource.get("note") or ""), resource.get("hint") or "")
 
 
 def stage_html(stage, index, total, bottleneck):
@@ -151,10 +134,10 @@ def stage_html(stage, index, total, bottleneck):
     top = 28 * index / total
     bottom = 28 * (index + 1) / total
     clip = f"polygon(0 {top:.1f}%,100% {bottom:.1f}%,100% {100 - bottom:.1f}%,0 {100 - top:.1f}%)"
-    if stage.kind == "output":  # a shortfall, not a load: half empty is already serious
-        level = "hot" if stage.strain >= .5 else "warm" if stage.strain > 0 else "ok" if stage.fill else ""
+    if stage.kind == "output":  # a shortfall against the target: half empty is already serious
+        level = "hot" if stage.shortfall >= .5 else "warm" if stage.shortfall > 0 else "ok" if stage.fill else ""
     else:
-        level = tone(stage.strain)
+        level = "hot" if stage is bottleneck else ""
     classes = f"home-stage {stage.kind} {level}" + (" bottleneck" if stage is bottleneck else "")
     label = escape(stage.label)
     if stage.link:
@@ -168,35 +151,21 @@ def stage_html(stage, index, total, bottleneck):
 
 
 def funnel_html(funnel):
-    output = funnel.output()
-    bottleneck = funnel.bottleneck()
-    if funnel.down:
-        bottleneck = None
-    stages = funnel.stages + [output]
-    body = "".join(stage_html(stage, index, len(stages), bottleneck)
+    stages = funnel.stages + [funnel.output()]
+    body = "".join(stage_html(stage, index, len(stages), funnel.bottleneck)
                    for index, stage in enumerate(stages))
-    if funnel.down:
-        verdict, level = f"{escape(funnel.state)}", "hot"
-    elif bottleneck and bottleneck.strain > HOT:
-        verdict, level = f"Failing: {escape(bottleneck.label)}", "hot"
-    elif bottleneck:
-        verdict, level = f"Limited by {escape(bottleneck.label)}", tone(bottleneck.strain)
-    elif output.strain:
-        verdict, level = "Filling up", ""
-    elif not funnel.report and funnel.plugin:
-        verdict, level = "No telemetry", ""
+    if funnel.bottleneck:
+        verdict, level = f"Bottleneck: {escape(funnel.bottleneck.label)}", "hot"
     else:
         verdict, level = "Healthy", "ok"
-    anchor = f' id="home-{escape(funnel.name)}"' if funnel.plugin else ""
-    return (f'<article class="home-funnel"{anchor}><header><h3>{escape(title(funnel.name))}</h3>'
-            f'<span class="home-verdict {level}">{verdict}</span></header>'
+    return (f'<article class="home-funnel" id="home-{escape(funnel.name)}"><header>'
+            f'<h3>{escape(title(funnel.name))}</h3><span class="home-verdict {level}">{verdict}</span></header>'
             f'<div class="home-track" style="--stages:{len(stages)}">{body}</div></article>')
 
 
-def meter(label, used, total, detail, strain=None):
+def meter(label, used, total, detail):
     share = used / total if total else 0
-    strain = share if strain is None else strain
-    return (f'<div class="home-meter {tone(strain)}"><div><span>{label}</span>'
+    return (f'<div class="home-meter {tone(share)}"><div><span>{label}</span>'
             f'<strong>{share * 100:.0f}%</strong></div>'
             f'<i style="--fill:{min(share, 1) * 100:.1f}%"></i><small>{detail}</small></div>')
 
@@ -239,68 +208,41 @@ def node_html(node):
             f'<div class="home-meters">{"".join(meters)}</div></article>')
 
 
-def node_alerts(node):
-    name = node["name"]
-    if not node["online"]:
-        yield 1.5, name, "Offline", "Bring the node back or remove it"
-        return
-    usage = node.get("host_usage") or {}
-    memory = node.get("host_memory")
-    if usage.get("cpu_busy_permille") is not None:
-        yield usage["cpu_busy_permille"] / 1000, name, "CPU busy", "Add a worker or lower pool VM limits"
-    if memory:
-        yield 1 - memory["available_kib"] / memory["total_kib"], name, "RAM used", \
-            "Add RAM or a worker, or fewer warm VMs"
-    if usage.get("disk_total_bytes"):
-        yield 1 - usage["disk_available_bytes"] / usage["disk_total_bytes"], name, "Disk used", \
-            "Grow the disk or delete unused images and snapshots"
+def flow_order(funnels):
+    """A plugin follows what it draws from: start from the plugins that draw on the most."""
+    order, seen = [], set()
+
+    def visit(name):
+        if name in seen or name not in funnels:
+            return
+        seen.add(name)
+        for dep in funnels[name].report.get("dependencies", []):
+            visit(dep)
+        order.append(funnels[name])
+
+    for name in sorted(funnels, key=lambda name: (-len(funnels[name].report.get("dependencies", [])), name)):
+        visit(name)
+    return order
 
 
 def home_html(data):
-    """The page as (summary, hardware, funnels) HTML sections."""
+    """The page as (plugins, hardware) HTML sections."""
     nodes, pools = data["nodes"], data["pools"]
     plugins = {plugin["name"]: plugin for plugin in data["plugins"]}
     owned = {}
     for pool in pools:
         owned.setdefault(pool["owner"], []).append(pool)
-    funnels = {name: Funnel(name, plugin, owned.get(name, [])) for name, plugin in plugins.items()}
-    # Build dependencies after their sources: a plugin's own stages are known before others read them.
-    for funnel in funnels.values():
-        funnel.build({})
-    for funnel in funnels.values():
-        funnel.stages = []
-        funnel.build(funnels)
-    orphans = [pool for pool in pools if pool["owner"] not in plugins]
-    if orphans:
-        funnels[""] = Funnel("VM pools", {"enabled": True, "status": "running", "report": None}, orphans)
-        funnels[""].build({})
+    # Only plugins that report capacity get a funnel.
+    funnels = {name: Funnel(name, plugin["report"], owned.get(name, []))
+               for name, plugin in plugins.items()
+               if plugin.get("report") and plugin["enabled"] and plugin["status"] in ("running", "starting")}
+    starved = ", ".join(f'{node["name"]} {"/".join(out)}' for node in nodes
+                        if node["online"] and (out := worker_limits(node)))
+    order = flow_order(funnels)
+    for funnel in order:  # dependencies first, so their bottleneck is known when others read it
+        funnel.build(plugins, funnels, starved)
 
-    # What to scale: every bottleneck, worst first.
-    alerts = []
-    for node in nodes:
-        for strain, name, what, hint in node_alerts(node):
-            if strain >= WARM:
-                alerts.append((strain, name, what, hint))
-    for name, funnel in funnels.items():
-        if funnel.down and funnel.plugin:
-            alerts.append((1.5, title(funnel.name), funnel.state, "Open Plugins to start it or read its log"))
-            continue
-        stage = funnel.bottleneck()
-        if stage and stage.kind != "plugin":  # a dependency's own funnel already lists it
-            what = f"{stage.label}: {stage.problem}" if stage.problem else stage.label
-            alerts.append((stage.strain, title(funnel.name), what, stage.hint))
-    alerts.sort(key=lambda alert: -alert[0])
-    if alerts:
-        items = "".join(
-            f'<li class="{tone(strain)}"><strong>{escape(who)}</strong><span>{escape(what)}</span>'
-            f'<small>{escape(hint)}</small></li>' for strain, who, what, hint in alerts[:8])
-        summary = f'<section class="home-scale"><h2>Scale next</h2><ol>{items}</ol></section>'
-    else:
-        summary = ('<section class="home-scale ok"><h2>Scale next</h2>'
-                   '<p>Nothing is constrained. Every plugin and worker has headroom.</p></section>')
-
+    body = "".join(map(funnel_html, order)) or '<p class="home-empty">No plugin reports capacity.</p>'
     hardware = "".join(map(node_html, nodes)) or '<p class="home-empty">No workers registered.</p>'
-    hardware = f'<section><h2>Hardware</h2><div class="home-nodes">{hardware}</div></section>'
-    order = sorted(funnels.values(), key=lambda funnel: (funnel.name == "VM pools", funnel.name))
-    body = "".join(funnel_html(funnel) for funnel in order) or '<p class="home-empty">No plugins installed.</p>'
-    return summary, hardware, f'<section><h2>Plugins</h2>{body}</section>'
+    return (f'<section><h2>Plugins</h2>{body}</section>',
+            f'<section><h2>Hardware</h2><div class="home-nodes">{hardware}</div></section>')
