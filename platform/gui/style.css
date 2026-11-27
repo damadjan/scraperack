@@ -147,13 +147,6 @@ html, body, #app, .q-layout, .q-page-container { background: var(--base); color:
 .home-empty { color: #a79fac; font-size: 13px; }
 
 /* Scale next */
-.home-scale ol { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 8px; margin: 0; padding: 0; list-style: none; }
-.home-scale li { display: grid; gap: 2px; padding: 11px 14px; border: 1px solid color-mix(in srgb, var(--signal) 45%, #2c2630);
-  border-left: 4px solid var(--signal); border-radius: 8px; background: color-mix(in srgb, var(--signal) 7%, #121014); }
-.home-scale li strong { font-size: 14px; }
-.home-scale li span { color: var(--signal); font-size: 13px; font-weight: 600; }
-.home-scale li small { color: #bcb3c2; font-size: 12px; }
-.home-scale.ok p { padding: 12px 14px; border: 1px solid #1f4a3a; border-left: 4px solid var(--ok); border-radius: 8px; background: #0d1813; color: #c7eadb; }
 
 /* Hardware */
 .home-nodes { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 420px), 1fr)); gap: 10px; }
